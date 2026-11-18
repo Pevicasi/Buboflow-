@@ -1,0 +1,6 @@
+{
+  "name": "BuboFlow — Gestão de Ofertas & WhatsApp",
+  "description": "Painel completo de gestão de ofertas de afiliados, automação de grupos de WhatsApp, conversão de links, filas de disparo e templates dinâmicos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
