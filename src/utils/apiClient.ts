@@ -1,4 +1,5 @@
 import { Marketplace, PlatformIntegrations } from '../types';
+import { PlatformCategory } from './catalogCategories';
 
 export interface LiveOfferResult {
   id: string;
@@ -16,9 +17,24 @@ export interface LiveOfferResult {
   extraInfo?: string;
 }
 
+export async function fetchPlatformCategoriesApi(platform: string): Promise<{
+  ok: boolean;
+  platform?: string;
+  source?: 'live' | 'catalog';
+  categories: PlatformCategory[];
+  error?: string;
+}> {
+  const res = await fetch(
+    `/api/platforms/categories?platform=${encodeURIComponent(platform || 'Todas as Plataformas')}`
+  );
+  return res.json();
+}
+
 export async function searchPlatformsApi(params: {
   query: string;
   platform: string;
+  category?: string;
+  subcategory?: string;
   credentials: PlatformIntegrations;
   page?: number;
   limit?: number;
@@ -84,6 +100,7 @@ export async function convertLinkApi(params: {
 }): Promise<{
   ok: boolean;
   platform?: Marketplace;
+  originalProductUrl?: string;
   affiliateUrl?: string;
   officialApi?: boolean;
   error?: string;
@@ -92,6 +109,20 @@ export async function convertLinkApi(params: {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),
+  });
+  return res.json();
+}
+
+export async function reconvertProductAffiliatesApi(productId?: string): Promise<{
+  ok: boolean;
+  updatedCount?: number;
+  version?: number;
+  error?: string;
+}> {
+  const res = await fetch('/api/products/reconvert-affiliates', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(productId ? { productId } : {}),
   });
   return res.json();
 }
@@ -242,8 +273,17 @@ export async function getBaileysLiveStatsApi(): Promise<{
   ok: boolean;
   memberEvents: BaileysMemberEvent[];
   capturedTodayByJid: Record<string, number>;
+  cachedGroups?: {
+    remoteJid: string;
+    name: string;
+    membersCount: number;
+    accountId?: string;
+    isOwner?: boolean;
+    isAdmin?: boolean;
+    isOwnerOrAdmin?: boolean;
+  }[];
 }> {
-  const res = await fetch('/api/whatsapp/baileys/live-stats');
+  const res = await fetch('/api/whatsapp/baileys/live-stats', { cache: 'no-store' });
   return res.json();
 }
 
@@ -256,10 +296,20 @@ export async function fetchWhatsAppGroupsApi(params: {
   clientToken?: string;
 }): Promise<{
   ok: boolean;
+  cached?: boolean;
+  reconnecting?: boolean;
   accountId?: string;
   phone?: string | null;
   name?: string | null;
-  groups?: { remoteJid: string; name: string; membersCount: number; capturedToday?: number }[];
+  groups?: {
+    remoteJid: string;
+    name: string;
+    membersCount: number;
+    capturedToday?: number;
+    isOwner?: boolean;
+    isAdmin?: boolean;
+    isOwnerOrAdmin?: boolean;
+  }[];
   error?: string;
 }> {
   const res = await fetch('/api/whatsapp/groups', {
@@ -470,6 +520,20 @@ export async function restoreSessionBackupsApi(payload: StoredSessionBackups): P
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+  });
+  return res.json();
+}
+
+export async function runAutoDispatchNowApi(): Promise<{
+  ok: boolean;
+  sentProductsCount: number;
+  sentGroupsCount: number;
+  titles: string[];
+  error?: string;
+}> {
+  const res = await fetch('/api/auto-dispatch/run-now', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
   });
   return res.json();
 }

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Package,
   Star,
@@ -40,7 +40,14 @@ import {
   getPreviewDomain,
   renderProductMessage,
 } from '../utils/templateEngine';
-import { extractOfferUrlApi, searchPlatformsApi } from '../utils/apiClient';
+import {
+  convertLinkApi,
+  extractOfferUrlApi,
+  fetchPlatformCategoriesApi,
+  searchPlatformsApi,
+} from '../utils/apiClient';
+import { needsAffiliateReconversion } from '../utils/affiliateUrlRules';
+import { FALLBACK_PLATFORM_CATEGORIES, PlatformCategory } from '../utils/catalogCategories';
 
 function getPlatformAccent(platform: Marketplace): string {
   switch (platform) {
@@ -82,6 +89,11 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
 
   const [platformFilter, setPlatformFilter] = useState<string>('Todas as Plataformas');
   const [categoryFilter, setCategoryFilter] = useState<string>('Todas as Categorias');
+  const [subcategoryFilter, setSubcategoryFilter] = useState<string>('Todas as Subcategorias');
+  const [platformCategories, setPlatformCategories] = useState<PlatformCategory[]>(
+    FALLBACK_PLATFORM_CATEGORIES['Todas as Plataformas']
+  );
+  const [isLoadingCategories, setIsLoadingCategories] = useState<boolean>(false);
   const [sortBy, setSortBy] = useState<string>(
     mode === 'vitrine' ? 'Relevância' : 'Ordenar por'
   );
@@ -125,10 +137,48 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
   const [npArtwork, setNpArtwork] = useState<ProductArtworkKey>('sneaker');
   const [npCustomImage, setNpCustomImage] = useState<string>('');
 
+  // Load real platform categories & subcategories whenever Plataforma changes in Vitrine
+  useEffect(() => {
+    if (mode !== 'vitrine') return;
+    let cancelled = false;
+    const immediateFallback =
+      FALLBACK_PLATFORM_CATEGORIES[platformFilter] ||
+      FALLBACK_PLATFORM_CATEGORIES['Todas as Plataformas'];
+    setPlatformCategories(immediateFallback);
+    setIsLoadingCategories(true);
+
+    fetchPlatformCategoriesApi(platformFilter)
+      .then((res) => {
+        if (!cancelled && res.ok && Array.isArray(res.categories) && res.categories.length > 0) {
+          setPlatformCategories(res.categories);
+        }
+      })
+      .catch(() => {
+        // Keep immediate fallback
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoadingCategories(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, platformFilter]);
+
+  const activeSubcategories = useMemo(() => {
+    if (categoryFilter === 'Todas as Categorias') return [];
+    const found = platformCategories.find((c) => c.name === categoryFilter);
+    return found?.subcategories || [];
+  }, [platformCategories, categoryFilter]);
+
+  const searchSeqRef = useRef<number>(0);
+
   const runLiveMarketplaceSearch = useCallback(
     async (options?: {
       customTerm?: string;
       customPlatform?: string;
+      customCategory?: string;
+      customSubcategory?: string;
       page?: number;
       limit?: number;
       forceRefresh?: boolean;
@@ -139,32 +189,40 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
       const rawSearch = (
         options?.customTerm !== undefined ? options.customTerm : searchQuery || globalSearch
       ).trim();
-      const term =
-        rawSearch || (categoryFilter !== 'Todas as Categorias' ? categoryFilter : '');
       const plat =
         options?.customPlatform !== undefined ? options.customPlatform : platformFilter;
+      const cat =
+        options?.customCategory !== undefined ? options.customCategory : categoryFilter;
+      const sub =
+        options?.customSubcategory !== undefined ? options.customSubcategory : subcategoryFilter;
 
       if (targetPage > 1 && !options?.forceRefresh && vitrinePages[targetPage]) {
+        searchSeqRef.current += 1;
         setLiveOffers(vitrinePages[targetPage].offers);
         setCurrentPage(targetPage);
         setSelectedIds([]);
+        setIsSearchingLive(false);
         return;
       }
 
       const cursorForPage =
         targetPage > 1 ? vitrinePages[targetPage - 1]?.nextCursor || null : null;
 
+      const reqSeq = ++searchSeqRef.current;
       setIsSearchingLive(true);
       setLiveWarnings([]);
       try {
         const res = await searchPlatformsApi({
-          query: term,
+          query: rawSearch,
           platform: plat,
+          category: cat,
+          subcategory: sub,
           credentials: integrations,
           page: targetPage,
           limit: targetLimit,
           cursor: cursorForPage,
         });
+        if (reqSeq !== searchSeqRef.current) return;
         if (res.ok && Array.isArray(res.offers)) {
           const mapped: Product[] = res.offers.map((item, idx) => ({
             id: item.id,
@@ -204,18 +262,28 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
           setSelectedIds([]);
           if (res.warnings?.length) setLiveWarnings(res.warnings);
           if (options?.notifyOnResult) {
+            const label =
+              rawSearch ||
+              (sub !== 'Todas as Subcategorias'
+                ? sub
+                : cat !== 'Todas as Categorias'
+                ? cat
+                : '');
             notify(
               `${mapped.length} oferta(s) carregadas na página ${targetPage}!`,
-              term ? `Busca ao vivo para "${term}".` : 'Ofertas ao vivo sincronizadas.'
+              label ? `Filtro aplicado: "${label}".` : 'Ofertas ao vivo sincronizadas.'
             );
           }
         } else if (res.error) {
           notify('Erro ao buscar nas plataformas', res.error, 'error');
         }
       } catch {
+        if (reqSeq !== searchSeqRef.current) return;
         notify('Falha de conexão ao buscar ofertas ao vivo', undefined, 'error');
       } finally {
-        setIsSearchingLive(false);
+        if (reqSeq === searchSeqRef.current) {
+          setIsSearchingLive(false);
+        }
       }
     },
     [
@@ -223,6 +291,7 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
       searchQuery,
       globalSearch,
       categoryFilter,
+      subcategoryFilter,
       platformFilter,
       vitrinePages,
       integrations,
@@ -241,7 +310,7 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
       void runLiveMarketplaceSearch({ page: 1, limit: pageSize, forceRefresh: true });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, platformFilter, categoryFilter, pageSize]);
+  }, [mode, platformFilter, categoryFilter, subcategoryFilter, pageSize]);
 
   const effectiveQuery = (searchQuery || globalSearch).trim().toLowerCase();
 
@@ -257,6 +326,32 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
     }
     return products;
   }, [mode, liveOffers, products]);
+
+  const catalogBaseList = useMemo(() => {
+    if (mode === 'favoritos') {
+      return products.filter((p) => p.isFavorite);
+    }
+    return products;
+  }, [mode, products]);
+
+  const platformCounts = useMemo(() => {
+    const counts: Record<Marketplace, number> = {
+      Shopee: 0,
+      'Mercado Livre': 0,
+      Amazon: 0,
+      Magalu: 0,
+      Netshoes: 0,
+      AliExpress: 0,
+    };
+    for (const p of catalogBaseList) {
+      if (p.platform in counts) {
+        counts[p.platform] += 1;
+      }
+    }
+    return counts;
+  }, [catalogBaseList]);
+
+  const totalCatalogCount = catalogBaseList.length;
 
   const filteredProducts = useMemo(() => {
     let list = [...sourceList];
@@ -459,11 +554,49 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
     }
   };
 
+  const ensureShortAffiliateForModal = async (
+    product: Product,
+    onUpdated: (updated: Product) => void
+  ) => {
+    if (!needsAffiliateReconversion(product, integrations.mercadoLivre.etiqueta)) return;
+    try {
+      const conv = await convertLinkApi({
+        url: product.originalUrl || product.affiliateUrl,
+        credentials: integrations,
+      });
+      if (
+        conv.ok &&
+        conv.affiliateUrl &&
+        !/mercadolivre\.com\.br\/social\//i.test(conv.affiliateUrl)
+      ) {
+        const updated: Product = {
+          ...product,
+          affiliateUrl: conv.affiliateUrl,
+          originalUrl: conv.originalProductUrl || product.originalUrl,
+        };
+        setProducts((prev) => prev.map((p) => (p.id === product.id ? updated : p)));
+        onUpdated(updated);
+      }
+    } catch {
+      // Keep current product if offline
+    }
+  };
+
+  const handleOpenPreviewModal = (product: Product) => {
+    setPreviewProduct(product);
+    void ensureShortAffiliateForModal(product, (updated) => {
+      setPreviewProduct((cur) => (cur?.id === updated.id ? updated : cur));
+    });
+  };
+
   const handleOpenSendModal = (product: Product) => {
     setSendModalProduct(product);
     setSendTiming('now');
     setSelectedSegments([activeSegment]);
     setIsSendingNow(false);
+    void ensureShortAffiliateForModal(product, (updated) => {
+      setSendModalProduct((cur) => (cur?.id === updated.id ? updated : cur));
+    });
   };
 
   const handleConfirmSendModal = async () => {
@@ -651,35 +784,56 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
         </div>
       </div>
 
-      {/* Filters Stack (matching PDF screens 11-14 & 22-25) */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      {/* Filters Stack */}
+      <div
+        className={`grid grid-cols-1 gap-3 ${
+          mode === 'vitrine' ? 'sm:grid-cols-2 lg:grid-cols-4' : 'sm:grid-cols-3'
+        }`}
+      >
         <select
+          aria-label="Plataforma"
           value={platformFilter}
-          onChange={(e) => setPlatformFilter(e.target.value)}
+          onChange={(e) => {
+            setPlatformFilter(e.target.value);
+            setCategoryFilter('Todas as Categorias');
+            setSubcategoryFilter('Todas as Subcategorias');
+          }}
           className="w-full rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-3.5 py-2.5 text-sm text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-600/40"
         >
-          <option value="Todas as Plataformas">Todas as Plataformas</option>
+          <option value="Todas as Plataformas">
+            {mode === 'vitrine'
+              ? 'Todas as Plataformas'
+              : `Todas as Plataformas (${totalCatalogCount})`}
+          </option>
           {MARKETPLACES.map((m) => (
             <option key={m} value={m}>
-              {m}
+              {mode === 'vitrine' ? m : `${m} (${platformCounts[m] || 0})`}
             </option>
           ))}
         </select>
 
         {mode === 'vitrine' ? (
           <select
+            aria-label="Categoria"
             value={categoryFilter}
-            onChange={(e) => setCategoryFilter(e.target.value)}
+            onChange={(e) => {
+              setCategoryFilter(e.target.value);
+              setSubcategoryFilter('Todas as Subcategorias');
+            }}
             className="w-full rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-3.5 py-2.5 text-sm text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-600/40"
           >
-            {VITRINE_CATEGORIES.map((c) => (
-              <option key={c} value={c}>
-                {c}
+            <option value="Todas as Categorias">
+              {isLoadingCategories ? 'Carregando categorias...' : 'Todas as Categorias'}
+            </option>
+            {platformCategories.map((c) => (
+              <option key={c.id} value={c.name}>
+                {c.name}
               </option>
             ))}
           </select>
         ) : (
           <select
+            aria-label="Ordenar por"
             value={sortBy}
             onChange={(e) => setSortBy(e.target.value)}
             className="w-full rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-3.5 py-2.5 text-sm text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-600/40"
@@ -692,8 +846,30 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
           </select>
         )}
 
+        {mode === 'vitrine' && (
+          <select
+            aria-label="Subcategoria"
+            value={subcategoryFilter}
+            disabled={categoryFilter === 'Todas as Categorias' || activeSubcategories.length === 0}
+            onChange={(e) => setSubcategoryFilter(e.target.value)}
+            className="w-full rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-3.5 py-2.5 text-sm text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-600/40 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <option value="Todas as Subcategorias">
+              {categoryFilter === 'Todas as Categorias'
+                ? 'Todas as Subcategorias'
+                : `Todas as Subcategorias (${activeSubcategories.length})`}
+            </option>
+            {activeSubcategories.map((sub) => (
+              <option key={sub.id} value={sub.name}>
+                {sub.name}
+              </option>
+            ))}
+          </select>
+        )}
+
         {mode === 'vitrine' ? (
           <select
+            aria-label="Ordenação"
             value={sortBy}
             onChange={(e) => setSortBy(e.target.value)}
             className="w-full rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-3.5 py-2.5 text-sm text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-600/40"
@@ -706,6 +882,7 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
           </select>
         ) : mode === 'produtos' ? (
           <select
+            aria-label="Prioridade"
             value={priorityFilter}
             onChange={(e) => setPriorityFilter(e.target.value)}
             className="w-full rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-3.5 py-2.5 text-sm text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-600/40"
@@ -892,12 +1069,12 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
               >
                 <div>
                   {/* Image Header */}
-                  <div className="relative">
+                  <div className="relative bg-white dark:bg-slate-900 border-b border-slate-100 dark:border-slate-800">
                     <ProductArtwork
                       artworkKey={product.artworkKey}
                       customImageUrl={product.customImageUrl}
                       alt={product.title}
-                      className="w-full h-56"
+                      className="w-full h-64 p-3"
                     />
 
                     {/* Top Left Checkbox */}
@@ -906,19 +1083,19 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
                       checked={isSelected}
                       onChange={() => toggleSelectOne(product.id)}
                       aria-label={`Selecionar ${product.title}`}
-                      className="absolute top-3 left-3 w-5 h-5 rounded-full border-slate-300 text-[#15803D] focus:ring-emerald-600 cursor-pointer"
+                      className="absolute top-3 left-3 w-5 h-5 rounded-full border-slate-300 text-[#15803D] focus:ring-emerald-600 cursor-pointer bg-white/95"
                     />
 
                     {/* Top Right Discount Tag */}
                     {product.discountPercent > 0 && (
-                      <span className="absolute top-3 right-3 px-2.5 py-0.5 rounded-md bg-[#EF4444] text-white text-xs font-bold tabular-nums">
+                      <span className="absolute top-3 right-3 px-2.5 py-0.5 rounded-md bg-[#EF4444] text-white text-xs font-bold tabular-nums shadow-xs">
                         -{product.discountPercent}% OFF
                       </span>
                     )}
 
                     {/* Bottom Left Marketplace Label */}
                     <span
-                      className={`absolute bottom-3 left-3 px-2.5 py-0.5 rounded-md text-xs font-semibold ${getPlatformAccent(
+                      className={`absolute bottom-3 left-3 px-2.5 py-0.5 rounded-md text-xs font-semibold shadow-xs ${getPlatformAccent(
                         product.platform
                       )}`}
                     >
@@ -930,7 +1107,7 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
                       type="button"
                       onClick={() => toggleFavorite(product.id)}
                       title={product.isFavorite ? 'Remover dos favoritos' : 'Favoritar'}
-                      className="absolute bottom-3 right-3 w-8 h-8 rounded-full bg-white/90 dark:bg-slate-900/90 flex items-center justify-center shadow-xs hover:scale-105 transition-transform"
+                      className="absolute bottom-3 right-3 w-8 h-8 rounded-full bg-white/95 dark:bg-slate-900/95 border border-slate-200/80 dark:border-slate-700/80 flex items-center justify-center shadow-xs hover:scale-105 transition-transform"
                     >
                       <Star
                         className={`w-4 h-4 ${
@@ -989,7 +1166,7 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
                   ) : (
                     <button
                       type="button"
-                      onClick={() => setPreviewProduct(product)}
+                      onClick={() => handleOpenPreviewModal(product)}
                       className="flex-1 py-2 px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs sm:text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap"
                     >
                       <Eye className="w-4 h-4" />
@@ -1119,6 +1296,76 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
               <span>{isSearchingLive ? 'Carregando...' : 'Próximo'}</span>
               <ChevronRight className="w-4 h-4" />
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Bottom Product Counter by Platform (Produtos & Favoritos) */}
+      {mode !== 'vitrine' && (
+        <div
+          data-testid="platform-product-counter"
+          className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 px-4 sm:px-5 py-4 space-y-3"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Package className="w-4 h-4 text-[#15803D] dark:text-emerald-400 shrink-0" />
+              <span className="text-xs sm:text-sm font-bold text-slate-900 dark:text-white">
+                {platformFilter === 'Todas as Plataformas'
+                  ? `Total em todas as plataformas: ${totalCatalogCount} ${
+                      totalCatalogCount === 1 ? 'produto' : 'produtos'
+                    }`
+                  : `${platformFilter}: ${platformCounts[platformFilter as Marketplace] || 0} ${
+                      (platformCounts[platformFilter as Marketplace] || 0) === 1
+                        ? 'produto'
+                        : 'produtos'
+                    }`}
+              </span>
+            </div>
+            <span className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+              {platformFilter === 'Todas as Plataformas'
+                ? 'Clique em uma plataforma abaixo para filtrar'
+                : `Total geral em todas as plataformas: ${totalCatalogCount}`}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 tabular-nums">
+            <button
+              type="button"
+              onClick={() => setPlatformFilter('Todas as Plataformas')}
+              className={`flex items-center justify-between gap-2 px-3 py-2 rounded-xl border text-xs font-semibold transition-colors ${
+                platformFilter === 'Todas as Plataformas'
+                  ? 'border-[#15803D] bg-emerald-50/90 dark:bg-emerald-950/40 text-[#15803D] dark:text-emerald-300'
+                  : 'border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/60'
+              }`}
+            >
+              <span className="truncate">Todas</span>
+              <span className="font-bold">{totalCatalogCount}</span>
+            </button>
+            {MARKETPLACES.map((m) => {
+              const count = platformCounts[m] || 0;
+              const isActive = platformFilter === m;
+              return (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setPlatformFilter(m)}
+                  className={`flex items-center justify-between gap-2 px-3 py-2 rounded-xl border text-xs font-semibold transition-colors ${
+                    isActive
+                      ? 'border-[#15803D] bg-emerald-50/90 dark:bg-emerald-950/40 text-[#15803D] dark:text-emerald-300'
+                      : 'border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/60'
+                  }`}
+                >
+                  <span className="truncate">{m}</span>
+                  <span
+                    className={`font-bold ${
+                      count === 0 ? 'text-slate-400 dark:text-slate-500' : ''
+                    }`}
+                  >
+                    {count}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         </div>
       )}

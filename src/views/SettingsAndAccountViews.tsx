@@ -37,6 +37,7 @@ import {
   Smartphone,
   Unlink,
   Share2,
+  Send,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { Marketplace, NavRoute } from '../types';
@@ -48,6 +49,7 @@ import {
 import {
   disconnectMlExtensionApi,
   fetchMlExtensionPackageApi,
+  runAutoDispatchNowApi,
   getMlExtensionStatusApi,
   MlExtensionStatus,
   testPlatformApi,
@@ -162,12 +164,36 @@ export const SettingsHubView: React.FC = () => {
  * ========================================================================== */
 export const AutoDispatchConfigView: React.FC = () => {
   const { autoDispatch, setAutoDispatch, setRoute, notify } = useApp();
+  const [runningNow, setRunningNow] = useState(false);
 
   const totalPct = Object.values(autoDispatch.distribution).reduce(
     (sum, v) => sum + (Number(v) || 0),
     0
   );
   const validDistribution = totalPct === 100 || totalPct === 0;
+
+  const handleRunAutoDispatchNow = async () => {
+    setRunningNow(true);
+    try {
+      const res = await runAutoDispatchNowApi();
+      if (res.ok && res.sentProductsCount > 0) {
+        notify(
+          `Disparo automático executado!`,
+          `${res.sentProductsCount} oferta(s) enviada(s) para ${res.sentGroupsCount} grupo(s).`
+        );
+      } else {
+        notify(
+          'Não foi possível disparar agora',
+          res.error || 'Verifique se há produtos salvos, WhatsApp conectado e grupos ativos.',
+          'info'
+        );
+      }
+    } catch {
+      notify('Erro ao acionar disparo automático', 'Tente novamente em instantes.', 'error');
+    } finally {
+      setRunningNow(false);
+    }
+  };
 
   return (
     <div className="space-y-6 max-w-3xl">
@@ -191,30 +217,42 @@ export const AutoDispatchConfigView: React.FC = () => {
         </h2>
         <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
           Habilite o disparo automático para enviar os produtos salvos de acordo com as
-          configurações definidas abaixo.
+          configurações definidas abaixo (horário de Brasília).
         </p>
 
-        <div className="flex items-center gap-3 pt-1">
+        <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              role="switch"
+              aria-checked={autoDispatch.enabled}
+              onClick={() =>
+                setAutoDispatch((prev) => ({ ...prev, enabled: !prev.enabled }))
+              }
+              className={`relative inline-flex h-7 w-12 items-center rounded-full transition-colors ${
+                autoDispatch.enabled ? 'bg-[#15803D]' : 'bg-slate-200 dark:bg-slate-700'
+              }`}
+            >
+              <span
+                className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+                  autoDispatch.enabled ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </button>
+            <span className="text-sm font-medium text-slate-800 dark:text-slate-100">
+              Habilitar envio automático diário
+            </span>
+          </div>
+
           <button
             type="button"
-            role="switch"
-            aria-checked={autoDispatch.enabled}
-            onClick={() =>
-              setAutoDispatch((prev) => ({ ...prev, enabled: !prev.enabled }))
-            }
-            className={`relative inline-flex h-7 w-12 items-center rounded-full transition-colors ${
-              autoDispatch.enabled ? 'bg-[#15803D]' : 'bg-slate-200 dark:bg-slate-700'
-            }`}
+            disabled={runningNow}
+            onClick={handleRunAutoDispatchNow}
+            className="px-4 py-2 rounded-xl border border-[#15803D] text-[#15803D] dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 text-xs sm:text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-50"
           >
-            <span
-              className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
-                autoDispatch.enabled ? 'translate-x-6' : 'translate-x-1'
-              }`}
-            />
+            <Send className="w-4 h-4" />
+            <span>{runningNow ? 'Disparando...' : 'Disparar ciclo agora'}</span>
           </button>
-          <span className="text-sm font-medium text-slate-800 dark:text-slate-100">
-            Habilitar envio automático diário
-          </span>
         </div>
       </div>
 
@@ -742,16 +780,34 @@ export const PlatformsConfigView: React.FC = () => {
   const [checkingMlExt, setCheckingMlExt] = useState(false);
   const [mlZipBlob, setMlZipBlob] = useState<Blob | null>(null);
   const [mlZipUrl, setMlZipUrl] = useState<string | null>(null);
-  const [mlPanelUrl, setMlPanelUrl] = useState<string>('');
+  const [mlPanelUrl, setMlPanelUrl] = useState<string>(() =>
+    typeof window !== 'undefined' ? window.location.origin : ''
+  );
   const [preparingZip, setPreparingZip] = useState(false);
+  const [bridgeDetected, setBridgeDetected] = useState(false);
+  const [syncingViaBridge, setSyncingViaBridge] = useState(false);
 
   const refreshMlExtStatus = async (showToast = false) => {
-    const key = integrations.mercadoLivre.extensionKey?.trim();
-    if (!key) return;
+    const key = integrations.mercadoLivre.extensionKey?.trim() || '';
     setCheckingMlExt(true);
     try {
       const status = await getMlExtensionStatusApi(key);
       setMlExtStatus(status);
+      if (
+        status.synced &&
+        status.hasSsid &&
+        status.extensionKey &&
+        status.extensionKey !== key
+      ) {
+        setIntegrations((prev) => ({
+          ...prev,
+          mercadoLivre: {
+            ...prev.mercadoLivre,
+            extensionKey: status.extensionKey || prev.mercadoLivre.extensionKey,
+            etiqueta: prev.mercadoLivre.etiqueta || status.etiqueta || '',
+          },
+        }));
+      }
       if (showToast) {
         if (status.synced && status.hasSsid) {
           notify(
@@ -767,7 +823,7 @@ export const PlatformsConfigView: React.FC = () => {
         } else {
           notify(
             'Extensão ainda não sincronizada',
-            'Baixe o .zip, instale no Lemur Browser (Android) ou Chrome (PC) e sincronize.',
+            'Verifique se a URL na extensão começa com https:// e bate com a URL do painel abaixo, ou atualize o .zip.',
             'info'
           );
         }
@@ -783,8 +839,69 @@ export const PlatformsConfigView: React.FC = () => {
 
   useEffect(() => {
     void refreshMlExtStatus(false);
+    const interval = setInterval(() => {
+      void refreshMlExtStatus(false);
+    }, 4000);
+    const onFocusOrSync = () => {
+      void refreshMlExtStatus(false);
+    };
+    const onExtMessage = (event: MessageEvent) => {
+      if (event.source !== window) return;
+      const data = event.data;
+      if (!data || data.source !== 'buboflow-extension') return;
+      if (data.type === 'EXTENSION_READY') {
+        setBridgeDetected(true);
+      }
+      if (data.type === 'ML_SYNC_RESULT') {
+        setSyncingViaBridge(false);
+        void refreshMlExtStatus(false);
+        if (data.ok && data.hasSsid) {
+          notify(
+            'Extensão sincronizada!',
+            `Sessão Mercado Livre conectada (${data.cookiesCount || 0} cookies).`
+          );
+        } else if (data.ok && !data.hasSsid) {
+          notify(
+            'Conectado ao painel, falta login no ML',
+            'Abra o Mercado Livre Afiliados neste navegador, entre na conta e sincronize.',
+            'info'
+          );
+        } else if (data.error) {
+          notify('Falha ao sincronizar extensão', String(data.error), 'error');
+        }
+      }
+    };
+
+    window.addEventListener('focus', onFocusOrSync);
+    window.addEventListener('buboflow:ml-synced', onFocusOrSync);
+    window.addEventListener('message', onExtMessage);
+    window.postMessage({ source: 'buboflow-panel', type: 'EXTENSION_PING' }, '*');
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('focus', onFocusOrSync);
+      window.removeEventListener('buboflow:ml-synced', onFocusOrSync);
+      window.removeEventListener('message', onExtMessage);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [integrations.mercadoLivre.extensionKey]);
+
+  const handleRequestBridgeSync = () => {
+    setSyncingViaBridge(true);
+    window.postMessage(
+      {
+        source: 'buboflow-panel',
+        type: 'REQUEST_SYNC',
+        extensionKey: integrations.mercadoLivre.extensionKey?.trim() || '',
+        etiqueta: integrations.mercadoLivre.etiqueta?.trim() || '',
+      },
+      '*'
+    );
+    setTimeout(() => {
+      setSyncingViaBridge(false);
+      void refreshMlExtStatus(false);
+    }, 3500);
+  };
 
   useEffect(() => {
     let active = true;
@@ -941,10 +1058,15 @@ export const PlatformsConfigView: React.FC = () => {
   };
 
   const addShopeeSubId = () => {
-    if (!newSubId.trim() || integrations.shopee.subIds.length >= 5) return;
+    const clean = newSubId
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-zA-Z0-9]/g, '')
+      .slice(0, 50);
+    if (!clean || integrations.shopee.subIds.length >= 5) return;
     setIntegrations((prev) => ({
       ...prev,
-      shopee: { ...prev.shopee, subIds: [...prev.shopee.subIds, newSubId.trim()] },
+      shopee: { ...prev.shopee, subIds: [...prev.shopee.subIds, clean] },
     }));
     setNewSubId('');
   };
@@ -1069,7 +1191,7 @@ export const PlatformsConfigView: React.FC = () => {
               type="text"
               value={newSubId}
               onChange={(e) => setNewSubId(e.target.value)}
-              placeholder="Ex: grupo_vip_2"
+              placeholder="Ex: grupovip2 (apenas letras e números)"
               className="flex-1 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3 py-2 text-xs font-mono"
             />
             <button
@@ -1080,6 +1202,9 @@ export const PlatformsConfigView: React.FC = () => {
               + Adicionar
             </button>
           </div>
+          <p className="text-[11px] text-slate-400 mt-1">
+            A API oficial da Shopee aceita apenas letras e números nos Sub IDs (sem espaços ou underline).
+          </p>
         </div>
 
         <label className="flex items-center gap-2.5 text-sm cursor-pointer">
@@ -1149,18 +1274,31 @@ export const PlatformsConfigView: React.FC = () => {
 
         <div className="rounded-xl bg-slate-50 dark:bg-slate-800/70 p-3.5 space-y-3 text-xs">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="space-y-0.5 font-mono">
+            <div className="space-y-1 font-mono min-w-0">
               <div className="flex items-center gap-2">
-                <span>Chave ativa: {integrations.mercadoLivre.extensionKey}</span>
+                <span className="truncate">Chave ativa: {integrations.mercadoLivre.extensionKey}</span>
                 <button
                   type="button"
                   onClick={() => void handleCopyMlKey()}
-                  className="p-1 rounded-md hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-500"
+                  className="p-1 rounded-md hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-500 shrink-0"
                   title="Copiar chave"
                 >
                   <Copy className="w-3.5 h-3.5" />
                 </button>
               </div>
+              {mlPanelUrl && (
+                <div className="flex items-center gap-2 text-[11px] text-slate-500 dark:text-slate-300">
+                  <span className="truncate">URL do Painel: {mlPanelUrl}</span>
+                  <button
+                    type="button"
+                    onClick={() => void handleCopyPanelUrl()}
+                    className="p-1 rounded-md hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-500 shrink-0"
+                    title="Copiar URL do painel"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
               <div className="text-slate-400">
                 Criada em: {integrations.mercadoLivre.extensionCreatedAt}
               </div>
@@ -1175,14 +1313,25 @@ export const PlatformsConfigView: React.FC = () => {
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
+              {bridgeDetected && (
+                <button
+                  type="button"
+                  disabled={syncingViaBridge}
+                  onClick={handleRequestBridgeSync}
+                  className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold flex items-center gap-1.5 disabled:opacity-50"
+                >
+                  <PlugZap className="w-3.5 h-3.5" />
+                  <span>{syncingViaBridge ? 'Sincronizando...' : 'Sincronizar Extensão Agora'}</span>
+                </button>
+              )}
               {mlZipUrl ? (
                 <a
                   href={mlZipUrl}
                   download="extensao-mercadolivre-afiliados.zip"
                   onClick={() =>
                     notify(
-                      'Iniciando download do .zip...',
-                      'Se o navegador bloquear, toque em "Salvar / Compartilhar .zip" ao lado.'
+                      'Iniciando download do .zip (v1.1.0)...',
+                      'Se já tinha uma versão antiga instalada, remova-a em Extensões e carregue este novo .zip.'
                     )
                   }
                   className="px-3.5 py-2 rounded-xl bg-[#15803D] hover:bg-emerald-800 text-white text-xs font-semibold flex items-center gap-1.5"
@@ -1271,10 +1420,10 @@ export const PlatformsConfigView: React.FC = () => {
           <div className="rounded-lg bg-white/80 dark:bg-slate-900/70 border border-slate-200/80 dark:border-slate-700/80 p-3 space-y-1.5 text-[11px] text-slate-600 dark:text-slate-300">
             <div className="font-semibold flex items-center gap-1.5 text-slate-800 dark:text-slate-100">
               <Smartphone className="w-3.5 h-3.5 text-[#15803D] dark:text-emerald-400" />
-              <span>Como testar direto no celular Android ou no PC (já vem pré-configurada):</span>
+              <span>Como conectar no celular Android (Lemur) ou no PC (v1.1.0 com detecção automática):</span>
             </div>
             <p>
-              <strong>No Celular (Android):</strong> Instale o <strong>Lemur Browser</strong> na Play Store, abra a URL do painel nele, toque em <strong>Baixar Extensão (.zip)</strong>, ative o <em>Modo Desenvolvedor</em> em <em>Extensões</em> no Lemur e carregue o <code>.zip</code>. Depois entre na sua conta do Mercado Livre e toque em <strong>Sincronizar Sessão Agora</strong> na extensão.
+              <strong>No Celular (Android — Lemur Browser):</strong> Baixe o novo <strong>.zip (v1.1.0)</strong>, remova a versão antiga em <em>Extensões</em> se já tiver instalado antes, ative o <em>Modo Desenvolvedor</em> e carregue o novo <code>.zip</code>. Ao voltar para esta aba, a extensão detecta automaticamente a URL <code>https://</code> e a Chave ativa e sincroniza sua sessão!
             </p>
             <p>
               <strong>No PC (Chrome):</strong> Descompacte o <code>.zip</code>, acesse <code>chrome://extensions</code>, ative o <em>Modo do desenvolvedor</em> e clique em <strong>Carregar sem compactação</strong>.

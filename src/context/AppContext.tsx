@@ -38,8 +38,10 @@ import {
   INITIAL_TEMPLATES,
 } from '../data/initialData';
 import { renderProductMessage } from '../utils/templateEngine';
+import { needsAffiliateReconversion } from '../utils/affiliateUrlRules';
 import {
   clearAllLocalSessionBackups,
+  convertLinkApi,
   fetchWhatsAppGroupsApi,
   getPanelStateApi,
   getSessionBackupsApi,
@@ -49,7 +51,6 @@ import {
   saveLocalSessionBackups,
   savePanelStateApi,
 } from '../utils/apiClient';
-import { renderArtworkFallbackDataUrl } from '../utils/artworkToImage';
 
 const STORAGE_KEY = 'buboflow_panel_state_v1';
 const SERVER_MIGRATED_KEY = 'buboflow_server_synced_v6';
@@ -127,6 +128,14 @@ function dedupeDispatchGroups(list: DispatchGroup[]): DispatchGroup[] {
         activeForOffers: Boolean(existing.activeForOffers || normalized.activeForOffers),
         isPriorityCapture: Boolean(existing.isPriorityCapture || normalized.isPriorityCapture),
         isChannel: Boolean(existing.isChannel || normalized.isChannel),
+        isOwner: normalized.isOwner ?? existing.isOwner,
+        isAdmin: normalized.isAdmin ?? existing.isAdmin,
+        isOwnerOrAdmin:
+          normalized.isOwnerOrAdmin ??
+          existing.isOwnerOrAdmin ??
+          (normalized.isOwner || normalized.isAdmin || existing.isOwner || existing.isAdmin
+            ? true
+            : undefined),
         inviteUrl:
           normalized.inviteUrl && normalized.inviteUrl !== 'https://chat.whatsapp.com/'
             ? normalized.inviteUrl
@@ -316,6 +325,9 @@ function sanitizePersistedState(
       inviteUrl: g.inviteUrl || prev.inviteUrl,
       isChannel: g.isChannel ?? prev.isChannel,
       isPriorityCapture: Boolean(prev.isPriorityCapture || g.isPriorityCapture),
+      isOwner: g.isOwner ?? prev.isOwner,
+      isAdmin: g.isAdmin ?? prev.isAdmin,
+      isOwnerOrAdmin: g.isOwnerOrAdmin ?? prev.isOwnerOrAdmin,
     };
   }
 
@@ -326,6 +338,8 @@ function sanitizePersistedState(
     merged.savedGroupPrefs[key] = {
       ...prev,
       monitored: Boolean(prev.monitored || m.monitored),
+      useGroupImage: m.useGroupImage ?? prev.useGroupImage ?? false,
+      allowedMarketplaces: m.allowedMarketplaces ?? prev.allowedMarketplaces,
     };
   }
 
@@ -504,7 +518,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           cur.segment !== g.segment ||
           cur.inviteUrl !== g.inviteUrl ||
           cur.isChannel !== g.isChannel ||
-          cur.isPriorityCapture !== g.isPriorityCapture
+          cur.isPriorityCapture !== g.isPriorityCapture ||
+          cur.isOwner !== g.isOwner ||
+          cur.isAdmin !== g.isAdmin ||
+          cur.isOwnerOrAdmin !== g.isOwnerOrAdmin
         ) {
           next[key] = {
             ...cur,
@@ -513,6 +530,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             inviteUrl: g.inviteUrl,
             isChannel: g.isChannel,
             isPriorityCapture: g.isPriorityCapture,
+            isOwner: g.isOwner,
+            isAdmin: g.isAdmin,
+            isOwnerOrAdmin: g.isOwnerOrAdmin,
           };
           changed = true;
         }
@@ -521,8 +541,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const key = canonicalGroupKey(m.channel, m.remoteJid);
         if (!key) continue;
         const cur = next[key] || {};
-        if (cur.monitored !== m.monitored) {
-          next[key] = { ...cur, monitored: m.monitored };
+        const nextMarkets = m.allowedMarketplaces;
+        const marketsChanged =
+          JSON.stringify(cur.allowedMarketplaces || null) !== JSON.stringify(nextMarkets || null);
+        if (
+          cur.monitored !== m.monitored ||
+          Boolean(cur.useGroupImage) !== Boolean(m.useGroupImage) ||
+          marketsChanged
+        ) {
+          next[key] = {
+            ...cur,
+            monitored: m.monitored,
+            useGroupImage: Boolean(m.useGroupImage),
+            allowedMarketplaces: nextMarkets,
+          };
           changed = true;
         }
       }
@@ -607,6 +639,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           const sessionsList = sessRes.ok && Array.isArray(sessRes.sessions) ? sessRes.sessions : [];
           const sessionMap = new Map(sessionsList.map((s) => [s.accountId, s]));
           const openBaileysSessions = sessionsList.filter((s) => s.connected);
+          const activeOrReconnectingBaileys = sessionsList.filter(
+            (s) => s.connected || s.status === 'connecting'
+          );
 
           // Update accounts list accurately when we got a valid sessions response
           if (sessRes.ok) {
@@ -625,7 +660,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 if (
                   acc.id === 'acc-wa-1' &&
                   !sessionMap.has('acc-wa-1') &&
-                  openBaileysSessions.length > 0
+                  activeOrReconnectingBaileys.length > 0
                 ) {
                   continue;
                 }
@@ -645,14 +680,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 });
               }
 
-              for (const liveSess of openBaileysSessions) {
+              for (const liveSess of activeOrReconnectingBaileys) {
                 if (!updated.some((a) => a.id === liveSess.accountId)) {
                   updated.push({
                     id: liveSess.accountId,
                     name: liveSess.name || liveSess.phone || 'WhatsApp Conectado',
                     channel: 'WhatsApp',
-                    phoneOrHandle: liveSess.phone || 'Conectado via Baileys',
-                    connected: true,
+                    phoneOrHandle:
+                      liveSess.phone ||
+                      (liveSess.connected ? 'Conectado via Baileys' : 'Reconectando WhatsApp...'),
+                    connected: Boolean(liveSess.connected),
                     provider: 'baileys',
                   });
                 }
@@ -662,7 +699,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             });
           }
 
-          // Collect all active WhatsApp sources to query
+          // Collect all active WhatsApp sources to query (including briefly reconnecting Baileys sessions)
           type WaSource = {
             id: string;
             name: string;
@@ -675,7 +712,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
           const sourcesMap = new Map<string, WaSource>();
 
-          for (const s of openBaileysSessions) {
+          for (const s of activeOrReconnectingBaileys) {
             const matchingAcc = accountsRef.current.find((a) => a.id === s.accountId);
             sourcesMap.set(s.accountId, {
               id: s.accountId,
@@ -723,10 +760,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
           const sources = Array.from(sourcesMap.values());
 
-          // If ZERO WhatsApp sessions are connected, hide WhatsApp groups from UI while preserving savedGroupPrefs
+          // If ZERO WhatsApp sessions exist (neither open nor reconnecting), hide WhatsApp groups while preserving savedGroupPrefs
           if (sources.length === 0) {
-            setDispatchGroups((prev) => prev.filter((g) => g.channel !== 'WhatsApp'));
-            setMonitoringGroups((prev) => prev.filter((m) => m.channel !== 'WhatsApp'));
+            if (sessRes.ok) {
+              setDispatchGroups((prev) => prev.filter((g) => g.channel !== 'WhatsApp'));
+              setMonitoringGroups((prev) => prev.filter((m) => m.channel !== 'WhatsApp'));
+            }
             return {
               ok: false,
               count: 0,
@@ -743,6 +782,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               capturedToday: number;
               accountId: string;
               accountName: string;
+              isOwner?: boolean;
+              isAdmin?: boolean;
+              isOwnerOrAdmin?: boolean;
             }
           >();
 
@@ -795,6 +837,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                   capturedToday: grp.capturedToday || 0,
                   accountId: resolvedAccId,
                   accountName: resolvedAccName,
+                  isOwner: grp.isOwner,
+                  isAdmin: grp.isAdmin,
+                  isOwnerOrAdmin: grp.isOwnerOrAdmin,
                 });
               } else {
                 // Deduplicate strictly across sessions: 1 unique group entry per @g.us
@@ -803,6 +848,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                   name: grp.name || existing.name,
                   membersCount: Math.max(existing.membersCount || 0, grp.membersCount || 0),
                   capturedToday: Math.max(existing.capturedToday || 0, grp.capturedToday || 0),
+                  isOwner: grp.isOwner ?? existing.isOwner,
+                  isAdmin: grp.isAdmin ?? existing.isAdmin,
+                  isOwnerOrAdmin: grp.isOwnerOrAdmin ?? existing.isOwnerOrAdmin,
                 });
               }
             }
@@ -848,6 +896,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 maxCapacity: 1024,
                 inviteUrl: saved?.inviteUrl || prevLive?.inviteUrl || 'https://chat.whatsapp.com/',
                 segment: saved?.segment || prevLive?.segment || activeSegmentRef.current || 'Geral',
+                isOwner: grp.isOwner ?? saved?.isOwner ?? prevLive?.isOwner,
+                isAdmin: grp.isAdmin ?? saved?.isAdmin ?? prevLive?.isAdmin,
+                isOwnerOrAdmin:
+                  grp.isOwnerOrAdmin ?? saved?.isOwnerOrAdmin ?? prevLive?.isOwnerOrAdmin,
               };
             });
 
@@ -875,6 +927,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 accountName: grp.accountName,
                 remoteJid: grp.remoteJid,
                 monitored: saved?.monitored ?? prevMon?.monitored ?? false,
+                useGroupImage: saved?.useGroupImage ?? prevMon?.useGroupImage ?? false,
+                allowedMarketplaces:
+                  saved?.allowedMarketplaces ?? prevMon?.allowedMarketplaces,
                 capturedToday: grp.capturedToday,
               };
             });
@@ -1067,53 +1122,73 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return nextAccounts;
       });
 
-      // Merge dispatchGroups prefs onto currently visible live groups
+      // Merge dispatchGroups prefs onto currently visible live groups (or hydrate persisted real WA groups on first load)
       setDispatchGroups((prev) => {
         const serverPrefs = cleaned.savedGroupPrefs || {};
-        const serverWaByJid = new Map(
-          (cleaned.dispatchGroups || [])
-            .filter((g) => g.channel === 'WhatsApp' && g.remoteJid)
-            .map((g) => [normalizeGroupJid(g.remoteJid), g])
+        const serverWaList = (cleaned.dispatchGroups || []).filter(
+          (g) => g.channel === 'WhatsApp' && g.remoteJid
         );
-        const liveWa = prev
-          .filter((g) => g.channel === 'WhatsApp')
-          .map((g) => {
-            const norm = normalizeGroupJid(g.remoteJid);
-            const pref = serverPrefs[`wa:${norm}`];
-            const srv = serverWaByJid.get(norm);
-            return {
-              ...g,
-              activeForOffers: pref?.activeForOffers ?? srv?.activeForOffers ?? g.activeForOffers,
-              isPriorityCapture: pref?.isPriorityCapture ?? srv?.isPriorityCapture ?? g.isPriorityCapture,
-              isChannel: pref?.isChannel ?? srv?.isChannel ?? g.isChannel,
-              segment: pref?.segment || srv?.segment || g.segment,
-              inviteUrl: pref?.inviteUrl || srv?.inviteUrl || g.inviteUrl,
-            };
-          });
-        const nonWaFromServer = (cleaned.dispatchGroups || []).filter((g) => g.channel !== 'WhatsApp');
+        const serverWaByJid = new Map(
+          serverWaList.map((g) => [normalizeGroupJid(g.remoteJid), g])
+        );
+        const prevWa = prev.filter((g) => g.channel === 'WhatsApp');
+        const liveWa =
+          prevWa.length > 0
+            ? prevWa.map((g) => {
+                const norm = normalizeGroupJid(g.remoteJid);
+                const pref = serverPrefs[`wa:${norm}`];
+                const srv = serverWaByJid.get(norm);
+                return {
+                  ...g,
+                  membersCount: Math.max(g.membersCount || 0, srv?.membersCount || 0),
+                  activeForOffers: pref?.activeForOffers ?? srv?.activeForOffers ?? g.activeForOffers,
+                  isPriorityCapture:
+                    pref?.isPriorityCapture ?? srv?.isPriorityCapture ?? g.isPriorityCapture,
+                  isChannel: pref?.isChannel ?? srv?.isChannel ?? g.isChannel,
+                  segment: pref?.segment || srv?.segment || g.segment,
+                  inviteUrl: pref?.inviteUrl || srv?.inviteUrl || g.inviteUrl,
+                  isOwner: g.isOwner ?? srv?.isOwner ?? pref?.isOwner,
+                  isAdmin: g.isAdmin ?? srv?.isAdmin ?? pref?.isAdmin,
+                  isOwnerOrAdmin:
+                    g.isOwnerOrAdmin ?? srv?.isOwnerOrAdmin ?? pref?.isOwnerOrAdmin,
+                };
+              })
+            : serverWaList;
+        const nonWaFromServer = (cleaned.dispatchGroups || []).filter(
+          (g) => g.channel !== 'WhatsApp'
+        );
         return [...nonWaFromServer, ...liveWa];
       });
 
-      // Merge monitoringGroups flags & capturedToday onto currently visible live groups
+      // Merge monitoringGroups flags & capturedToday onto currently visible live groups (or hydrate on first load)
       setMonitoringGroups((prev) => {
         const serverPrefs = cleaned.savedGroupPrefs || {};
-        const serverMonByJid = new Map(
-          (cleaned.monitoringGroups || [])
-            .filter((m) => m.channel === 'WhatsApp' && m.remoteJid)
-            .map((m) => [normalizeGroupJid(m.remoteJid), m])
+        const serverMonList = (cleaned.monitoringGroups || []).filter(
+          (m) => m.channel === 'WhatsApp' && m.remoteJid
         );
-        const liveWa = prev
-          .filter((m) => m.channel === 'WhatsApp')
-          .map((m) => {
-            const norm = normalizeGroupJid(m.remoteJid);
-            const pref = serverPrefs[`wa:${norm}`];
-            const srv = serverMonByJid.get(norm);
-            return {
-              ...m,
-              monitored: pref?.monitored ?? srv?.monitored ?? m.monitored,
-              capturedToday: Math.max(m.capturedToday || 0, srv?.capturedToday || 0),
-            };
-          });
+        const serverMonByJid = new Map(
+          serverMonList.map((m) => [normalizeGroupJid(m.remoteJid), m])
+        );
+        const prevMonWa = prev.filter((m) => m.channel === 'WhatsApp');
+        const liveWa =
+          prevMonWa.length > 0
+            ? prevMonWa.map((m) => {
+                const norm = normalizeGroupJid(m.remoteJid);
+                const pref = serverPrefs[`wa:${norm}`];
+                const srv = serverMonByJid.get(norm);
+                return {
+                  ...m,
+                  monitored: pref?.monitored ?? srv?.monitored ?? m.monitored,
+                  useGroupImage:
+                    pref?.useGroupImage ?? srv?.useGroupImage ?? m.useGroupImage ?? false,
+                  allowedMarketplaces:
+                    pref?.allowedMarketplaces ??
+                    srv?.allowedMarketplaces ??
+                    m.allowedMarketplaces,
+                  capturedToday: Math.max(m.capturedToday || 0, srv?.capturedToday || 0),
+                };
+              })
+            : serverMonList;
         const nonWaFromServer = (cleaned.monitoringGroups || []).filter(
           (m) => m.channel !== 'WhatsApp'
         );
@@ -1295,6 +1370,55 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     profile,
   ]);
 
+  // Publish live panel config to the Mercado Livre browser extension bridge (auto-sync URL & key)
+  useEffect(() => {
+    if (typeof document === 'undefined' || typeof window === 'undefined') return;
+    const key = integrations.mercadoLivre.extensionKey?.trim() || '';
+    const tag = integrations.mercadoLivre.etiqueta?.trim() || '';
+    document.documentElement.dataset.buboflowPanel = '1';
+    document.documentElement.dataset.buboflowMlKey = key;
+    document.documentElement.dataset.buboflowMlTag = tag;
+
+    window.postMessage(
+      {
+        source: 'buboflow-panel',
+        type: 'PANEL_CONFIG',
+        serverUrl: window.location.origin,
+        extensionKey: key,
+        etiqueta: tag,
+      },
+      '*'
+    );
+  }, [integrations.mercadoLivre.extensionKey, integrations.mercadoLivre.etiqueta]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== window) return;
+      const data = event.data;
+      if (!data || data.source !== 'buboflow-extension') return;
+
+      if (data.type === 'ML_SYNC_RESULT' && data.ok) {
+        if (data.extensionKey && typeof data.extensionKey === 'string') {
+          setIntegrations((prev) =>
+            prev.mercadoLivre.extensionKey === data.extensionKey
+              ? prev
+              : {
+                  ...prev,
+                  mercadoLivre: {
+                    ...prev.mercadoLivre,
+                    extensionKey: data.extensionKey,
+                  },
+                }
+          );
+        }
+        window.dispatchEvent(new CustomEvent('buboflow:ml-synced', { detail: data }));
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
+
   const toggleDarkMode = () => setDarkMode((prev) => !prev);
 
   const addSegment = (name: string) => {
@@ -1474,8 +1598,34 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     product: Product,
     targetSegments: string[] = [activeSegment]
   ): Promise<{ ok: boolean; sentCount: number; message: string; error?: string }> => {
-    const tpl = getTemplateForPlatform(product.platform);
-    const rendered = renderProductMessage(product, tpl, integrations);
+    let effectiveProduct = product;
+    if (needsAffiliateReconversion(product, integrations.mercadoLivre.etiqueta)) {
+      try {
+        const conv = await convertLinkApi({
+          url: product.originalUrl || product.affiliateUrl,
+          credentials: integrations,
+        });
+        if (
+          conv.ok &&
+          conv.affiliateUrl &&
+          !/mercadolivre\.com\.br\/social\//i.test(conv.affiliateUrl)
+        ) {
+          effectiveProduct = {
+            ...product,
+            affiliateUrl: conv.affiliateUrl,
+            originalUrl: conv.originalProductUrl || product.originalUrl,
+          };
+          setProducts((prev) =>
+            prev.map((p) => (p.id === product.id ? effectiveProduct : p))
+          );
+        }
+      } catch {
+        // Proceed with existing link if offline
+      }
+    }
+
+    const tpl = getTemplateForPlatform(effectiveProduct.platform);
+    const rendered = renderProductMessage(effectiveProduct, tpl, integrations);
     const activeGroups = dispatchGroups.filter(
       (g) =>
         g.activeForOffers &&
@@ -1491,9 +1641,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { ok: false, sentCount: 0, message: rendered, error: errMsg };
     }
 
-    const resolvedImageUrl =
-      product.customImageUrl?.trim() ||
-      (await renderArtworkFallbackDataUrl(product.artworkKey));
+    const resolvedImageUrl = effectiveProduct.customImageUrl?.trim() || undefined;
 
     const delivery = await sendToConnectedApis({
       targetGroups: activeGroups,
@@ -1518,19 +1666,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     const newLog: SentLog = {
       id: `sent-${Date.now()}`,
-      title: product.title,
+      title: effectiveProduct.title,
       message: rendered,
-      platform: product.platform,
+      platform: effectiveProduct.platform,
       groupsNames: groupNames,
       sentAt: nowFormatted,
       sentAtIso: now.toISOString(),
-      artworkKey: product.artworkKey,
-      customImageUrl: product.customImageUrl,
-      affiliateUrl: product.affiliateUrl,
+      artworkKey: effectiveProduct.artworkKey,
+      customImageUrl: effectiveProduct.customImageUrl,
+      affiliateUrl: effectiveProduct.affiliateUrl,
     };
 
     setSentLogs((prev) => [newLog, ...prev]);
     setTotalSentCount((prev) => prev + delivery.sentCount);
+    setProducts((prev) => prev.filter((p) => p.id !== effectiveProduct.id));
 
     return { ok: true, sentCount: delivery.sentCount, message: rendered };
   };

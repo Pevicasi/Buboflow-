@@ -31,9 +31,17 @@ import {
   PlugZap,
   Smartphone,
   LogOut,
+  MoreVertical,
+  Check,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
-import { ChannelAccount, DispatchGroup, DispatchQueue } from '../types';
+import {
+  ChannelAccount,
+  DispatchGroup,
+  DispatchQueue,
+  Marketplace,
+  MonitoringGroup,
+} from '../types';
 import { WhatsAppMockup } from '../components/WhatsAppMockup';
 import { renderProductMessage } from '../utils/templateEngine';
 import {
@@ -1940,6 +1948,66 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
   const [newIsChannel, setNewIsChannel] = useState(false);
   const [syncingGroups, setSyncingGroups] = useState(false);
 
+  const MONITORING_MARKETPLACES: Marketplace[] = [
+    'Shopee',
+    'Amazon',
+    'Mercado Livre',
+    'Netshoes',
+    'Magalu',
+    'AliExpress',
+  ];
+  const [editingMonGroup, setEditingMonGroup] = useState<MonitoringGroup | null>(null);
+  const [editUseGroupImage, setEditUseGroupImage] = useState(false);
+  const [editMarketplaces, setEditMarketplaces] = useState<Marketplace[]>(MONITORING_MARKETPLACES);
+
+  const openMonitoringConfigModal = (group: MonitoringGroup) => {
+    setEditingMonGroup(group);
+    setEditUseGroupImage(Boolean(group.useGroupImage));
+    setEditMarketplaces(
+      group.allowedMarketplaces && group.allowedMarketplaces.length > 0
+        ? [...group.allowedMarketplaces]
+        : [...MONITORING_MARKETPLACES]
+    );
+  };
+
+  const toggleEditMarketplace = (marketplace: Marketplace) => {
+    setEditMarketplaces((prev) =>
+      prev.includes(marketplace)
+        ? prev.filter((m) => m !== marketplace)
+        : [...prev, marketplace]
+    );
+  };
+
+  const handleSaveMonitoringConfig = () => {
+    if (!editingMonGroup) return;
+    if (editMarketplaces.length === 0) {
+      notify(
+        'Selecione ao menos um marketplace',
+        'Escolha pelo menos uma plataforma para monitorar neste grupo.',
+        'error'
+      );
+      return;
+    }
+    setMonitoringGroups((prev) =>
+      prev.map((m) =>
+        m.id === editingMonGroup.id
+          ? {
+              ...m,
+              useGroupImage: editUseGroupImage,
+              allowedMarketplaces: editMarketplaces,
+            }
+          : m
+      )
+    );
+    notify(
+      'Configuração do grupo salva!',
+      `${editingMonGroup.name}: ${editMarketplaces.join(', ')}${
+        editUseGroupImage ? ' • Foto do grupo ativada' : ''
+      }`
+    );
+    setEditingMonGroup(null);
+  };
+
   const maxLimit = 5;
 
   // Automatically pull real groups whenever opening Grupos de Envio or Monitoramento
@@ -2458,6 +2526,9 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
     if (platformFilter !== 'Todas as Plataformas' && g.channel !== platformFilter) {
       return false;
     }
+    if (accountFilter !== 'Todas as Contas' && !accountFilter.includes(g.accountName)) {
+      return false;
+    }
     if (search.trim() && !g.name.toLowerCase().includes(search.trim().toLowerCase())) {
       return false;
     }
@@ -2563,13 +2634,14 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                 <th className="py-3.5 px-3">App</th>
                 <th className="py-3.5 px-3">Conta</th>
                 <th className="py-3.5 px-3 text-right">Links Hoje</th>
-                <th className="py-3.5 px-4 text-right">Monitorar</th>
+                <th className="py-3.5 px-3 text-right">Monitorar</th>
+                <th className="py-3.5 px-3 text-right">Config.</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-sm">
               {filteredMon.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="py-14 px-6 text-center">
+                  <td colSpan={6} className="py-14 px-6 text-center">
                     <Users className="w-10 h-10 text-slate-300 dark:text-slate-600 mx-auto mb-2.5" />
                     <div className="font-bold text-sm text-slate-800 dark:text-slate-100">
                       {monitoringGroups.length === 0
@@ -2584,64 +2656,231 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                   </td>
                 </tr>
               ) : (
-                filteredMon.map((g) => (
-                  <tr key={g.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
-                    <td className="py-3.5 px-4 font-medium text-slate-900 dark:text-white">
-                      <div>{g.name}</div>
-                      {g.remoteJid && (
-                        <div className="text-[11px] font-mono text-emerald-700 dark:text-emerald-400 mt-0.5">
-                          ID: {g.remoteJid}
+                filteredMon.map((g) => {
+                  const activeMarkets =
+                    g.allowedMarketplaces && g.allowedMarketplaces.length > 0
+                      ? g.allowedMarketplaces
+                      : MONITORING_MARKETPLACES;
+                  const marketSummary =
+                    activeMarkets.length === MONITORING_MARKETPLACES.length
+                      ? 'Todos os marketplaces'
+                      : activeMarkets.join(', ');
+                  return (
+                    <tr key={g.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
+                      <td className="py-3.5 px-4 font-medium text-slate-900 dark:text-white">
+                        <div>{g.name}</div>
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
+                          <span>{marketSummary}</span>
+                          {g.useGroupImage && (
+                            <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
+                              • Foto do grupo
+                            </span>
+                          )}
                         </div>
-                      )}
-                    </td>
-                    <td className="py-3.5 px-3">
-                      <MessageCircle className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
-                    </td>
-                    <td className="py-3.5 px-3 font-mono text-xs text-slate-600 dark:text-slate-300 whitespace-nowrap">
-                      {g.accountName}
-                    </td>
-                    <td className="py-3.5 px-3 text-right tabular-nums text-xs font-semibold text-slate-600 dark:text-slate-300">
-                      {g.capturedToday || 0}
-                    </td>
-                    <td className="py-3.5 px-4 text-right">
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={g.monitored}
-                        onClick={() => {
-                          if (!g.monitored && monitoredCount >= maxLimit) {
-                            notify(
-                              'Limite atingido',
-                              `Máximo de ${maxLimit} grupos monitorados.`,
-                              'error'
+                        {g.remoteJid && (
+                          <div className="text-[11px] font-mono text-emerald-700/80 dark:text-emerald-400/80 mt-0.5">
+                            ID: {g.remoteJid}
+                          </div>
+                        )}
+                      </td>
+                      <td className="py-3.5 px-3">
+                        <MessageCircle className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
+                      </td>
+                      <td className="py-3.5 px-3 font-mono text-xs text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                        {g.accountName}
+                      </td>
+                      <td className="py-3.5 px-3 text-right tabular-nums text-xs font-semibold text-slate-600 dark:text-slate-300">
+                        {g.capturedToday || 0}
+                      </td>
+                      <td className="py-3.5 px-3 text-right">
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={g.monitored}
+                          onClick={() => {
+                            if (!g.monitored && monitoredCount >= maxLimit) {
+                              notify(
+                                'Limite atingido',
+                                `Máximo de ${maxLimit} grupos monitorados.`,
+                                'error'
+                              );
+                              return;
+                            }
+                            setMonitoringGroups((prev) =>
+                              prev.map((m) =>
+                                m.id === g.id ? { ...m, monitored: !m.monitored } : m
+                              )
                             );
-                            return;
-                          }
-                          setMonitoringGroups((prev) =>
-                            prev.map((m) =>
-                              m.id === g.id ? { ...m, monitored: !m.monitored } : m
-                            )
-                          );
-                          notify('Monitoramento atualizado', g.name);
-                        }}
-                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                          g.monitored ? 'bg-[#15803D]' : 'bg-slate-200 dark:bg-slate-700'
-                        }`}
-                      >
-                        <span
-                          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                            g.monitored ? 'translate-x-6' : 'translate-x-1'
+                            notify('Monitoramento atualizado', g.name);
+                          }}
+                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                            g.monitored ? 'bg-[#15803D]' : 'bg-slate-200 dark:bg-slate-700'
                           }`}
-                        />
-                      </button>
-                    </td>
-                  </tr>
-                ))
+                        >
+                          <span
+                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                              g.monitored ? 'translate-x-6' : 'translate-x-1'
+                            }`}
+                          />
+                        </button>
+                      </td>
+                      <td className="py-3.5 px-3 text-right">
+                        <button
+                          type="button"
+                          onClick={() => openMonitoringConfigModal(g)}
+                          aria-label={`Configurar ${g.name}`}
+                          title="Configurar marketplaces e imagem do grupo"
+                          className="p-2 rounded-lg text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                        >
+                          <MoreVertical className="w-4 h-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
         </div>
+
+        <div className="px-4 py-3 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-xs text-slate-500 tabular-nums">
+          <span>{filteredMon.length} Resultado(s)</span>
+          <span>Página 1 de 1</span>
+        </div>
       </div>
+
+      {/* Modal: Configurar Grupo Monitorado */}
+      {editingMonGroup && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs overflow-y-auto"
+          onClick={() => setEditingMonGroup(null)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-2xl overflow-hidden my-auto"
+          >
+            {/* Header */}
+            <div className="px-5 pt-5 pb-3 flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="w-11 h-11 rounded-full bg-emerald-50 dark:bg-emerald-950/70 text-[#15803D] dark:text-emerald-400 flex items-center justify-center shrink-0">
+                  <Pencil className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-lg leading-tight text-slate-900 dark:text-white">
+                    Configurar Grupo Monitorado
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 truncate max-w-[230px]">
+                    {editingMonGroup.name}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingMonGroup(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
+                aria-label="Fechar"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Body */}
+            <div className="px-5 pb-5 space-y-4 max-h-[70vh] overflow-y-auto">
+              {/* Card 1: Usar imagem divulgada pelo grupo */}
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-2.5">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-white">
+                    Usar imagem divulgada pelo grupo?
+                  </span>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={editUseGroupImage}
+                    onClick={() => setEditUseGroupImage((v) => !v)}
+                    className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                      editUseGroupImage
+                        ? 'bg-[#15803D]'
+                        : 'bg-slate-200 dark:bg-slate-700'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                        editUseGroupImage ? 'translate-x-6' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+                <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                  Quando ativado, a imagem original coletada deste grupo será utilizada nas
+                  suas publicações.
+                </p>
+                <p className="text-[11px] italic text-slate-500 dark:text-slate-400 leading-relaxed">
+                  <strong className="font-semibold not-italic">Atenção:</strong> O BuboFlow
+                  não se responsabiliza pelas imagens importadas que contenham marcas d&apos;água
+                  ou elementos visuais associados ao grupo monitorado.
+                </p>
+              </div>
+
+              {/* Card 2: Marketplaces */}
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-3">
+                <div>
+                  <h4 className="font-semibold text-sm text-slate-900 dark:text-white">
+                    Marketplaces
+                  </h4>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                    Defina os marketplaces que serão considerados no monitoramento deste grupo.
+                  </p>
+                </div>
+
+                <div className="space-y-1.5">
+                  {MONITORING_MARKETPLACES.map((mp) => {
+                    const checked = editMarketplaces.includes(mp);
+                    return (
+                      <button
+                        key={mp}
+                        type="button"
+                        onClick={() => toggleEditMarketplace(mp)}
+                        className="w-full flex items-center gap-3 py-2 px-2 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-colors text-left"
+                      >
+                        <span
+                          className={`w-5 h-5 rounded-full flex items-center justify-center border transition-colors shrink-0 ${
+                            checked
+                              ? 'bg-[#15803D] border-[#15803D] text-white'
+                              : 'border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900'
+                          }`}
+                        >
+                          {checked && <Check className="w-3.5 h-3.5 stroke-[3]" />}
+                        </span>
+                        <span className="text-sm font-medium text-slate-800 dark:text-slate-100">
+                          {mp}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="px-5 py-3.5 bg-slate-50 dark:bg-slate-800/60 border-t border-slate-100 dark:border-slate-800 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setEditingMonGroup(null)}
+                className="px-4 py-2 rounded-xl text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-200/60 dark:hover:bg-slate-700/60"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveMonitoringConfig}
+                className="px-5 py-2 rounded-xl bg-[#15803D] hover:bg-emerald-800 text-white text-sm font-semibold"
+              >
+                Salvar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -12,10 +12,6 @@ import {
   Star,
   ExternalLink,
   Upload,
-  Bold,
-  Italic,
-  Strikethrough,
-  Code,
   CheckCircle2,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
@@ -25,43 +21,18 @@ import {
   Product,
   TemplateCondition,
 } from '../types';
-import { MARKETPLACES, TEMPLATE_PRESETS } from '../data/initialData';
+import {
+  DEFAULT_TEMPLATE_CONDITIONS,
+  MARKETPLACES,
+  TEMPLATE_PRESETS,
+} from '../data/initialData';
 import { WhatsAppMockup } from '../components/WhatsAppMockup';
-import { getPreviewDomain, renderProductMessage } from '../utils/templateEngine';
-
-const DEMO_SNEAKER_PRODUCT: Product = {
-  id: 'demo-sneaker',
-  title: 'Tênis Nike Revolution 7 Masculino',
-  ctaHighlight: '💥 Tênis Nike Revolution 7 com leveza pra correr 👟🔥',
-  platform: 'Shopee',
-  category: 'Esportes e Atividades ao Ar Livre',
-  originalPrice: 399.9,
-  discountPrice: 199.9,
-  discountPercent: 50,
-  commissionPercent: 10,
-  commissionValue: 19.99,
-  affiliateUrl: 'https://s.shopee.com.br/9Kx2',
-  originalUrl: 'https://shopee.com.br/nike-revolution-7',
-  couponCode: 'TENIS20',
-  extraInfo: 'Tamanhos 38 ao 43 · Envio Imediato',
-  artworkKey: 'sneaker',
-  isFavorite: false,
-  isPrioritized: true,
-  salesRank: 1,
-  segment: 'Geral',
-  createdAt: '2026-11-17T22:00:00Z',
-};
-
-const VARIABLE_CHIPS: { label: string; token: string; tone: string }[] = [
-  { label: 'Nome do Produto', token: '{{nome}}', tone: 'bg-sky-50 text-sky-800 border-sky-200 dark:bg-sky-950/50 dark:text-sky-300 dark:border-sky-800' },
-  { label: 'Preço Original', token: '{{preco_original}}', tone: 'bg-rose-50 text-rose-800 border-rose-200 dark:bg-rose-950/50 dark:text-rose-300 dark:border-rose-800' },
-  { label: 'Preço com Desconto', token: '{{preco_desconto}}', tone: 'bg-emerald-50 text-emerald-800 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-800' },
-  { label: 'Percentual de Desconto', token: '{{desconto_pct}}', tone: 'bg-amber-50 text-amber-800 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-800' },
-  { label: 'Link do Produto', token: '{{link}}', tone: 'bg-slate-100 text-slate-800 border-slate-200 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-700' },
-  { label: 'Cupons / Código', token: '{{cupom}}', tone: 'bg-amber-50 text-amber-800 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-800' },
-  { label: 'Informação adicional', token: '{{info_extra}}', tone: 'bg-slate-100 text-slate-800 border-slate-200 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-700' },
-  { label: 'CTA por IA', token: '{{cta_ia}}', tone: 'bg-emerald-50 text-emerald-800 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-800' },
-];
+import { TemplateBlockEditor } from '../components/TemplateBlockEditor';
+import {
+  getDemoProductForPlatform,
+  getPreviewDomain,
+  renderProductMessage,
+} from '../utils/templateEngine';
 
 function getMarketplaceBadgeColor(platform: Marketplace): string {
   switch (platform) {
@@ -84,10 +55,11 @@ function getMarketplaceBadgeColor(platform: Marketplace): string {
  * 1. TEMPLATES DE MENSAGEM VIEW (Telas 77–87)
  * ========================================================================== */
 export const TemplatesConfigView: React.FC = () => {
-  const { templates, setTemplates, integrations, setRoute, notify } = useApp();
+  const { templates, setTemplates, products, integrations, setRoute, notify } = useApp();
 
   const [presetsOpen, setPresetsOpen] = useState(false);
   const [selectedPresetId, setSelectedPresetId] = useState(TEMPLATE_PRESETS[0].id);
+  const [presetPlatform, setPresetPlatform] = useState<Marketplace>('Mercado Livre');
 
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -103,19 +75,11 @@ export const TemplatesConfigView: React.FC = () => {
     setTplName('');
     setTplPlatform('Shopee');
     setTplBody(
-      '*💸 Por: {{preco_desconto}}* 🔥 {{desconto_pct}}% OFF\n\n🔗 Compre aqui:\n{{link}}\n{{cupom}}'
+      '💥 [[cond:cond-1]]\n\n[[cond:cond-2]]\n*💸 Por: {{preco_desconto}} 🔥*\n[[cond:cond-3]]\n\n🔗 Compre aqui: {{link}}\n\n{{cupom}}\n\n🎟️ Resgate Cupons:\nhttps://s.shopee.com.br/8AXZEODUrk\n\n⚠️ Promoção sujeita a alteração a qualquer momento.'
     );
     setTplCtaStyle('Padrão');
     setTplLinkPreview(true);
-    setTplConditions([
-      {
-        id: `c-${Date.now()}`,
-        variable: 'cta_ia',
-        operator: 'existe',
-        thenText: '{{cta_ia}}',
-        elseText: '💥 {{nome}}',
-      },
-    ]);
+    setTplConditions(DEFAULT_TEMPLATE_CONDITIONS.map((c) => ({ ...c })));
     setEditorOpen(true);
   };
 
@@ -126,22 +90,13 @@ export const TemplatesConfigView: React.FC = () => {
     setTplBody(tpl.body);
     setTplCtaStyle(tpl.ctaStyle);
     setTplLinkPreview(tpl.enableLinkPreview);
-    setTplConditions(tpl.conditions);
+    setTplConditions(tpl.conditions.map((c) => ({ ...c })));
     setEditorOpen(true);
   };
 
-  const handleAddCondition = () => {
-    setTplConditions((prev) => [
-      ...prev,
-      {
-        id: `cond-${Date.now()}`,
-        variable: 'desconto_pct',
-        operator: 'maior_que',
-        compareValue: 0,
-        thenText: 'De: ~{{preco_original}}~ ❌',
-        elseText: '',
-      },
-    ]);
+  const handleActivateTemplate = (tpl: MessageTemplate) => {
+    setTemplates((prev) => [tpl, ...prev.filter((t) => t.id !== tpl.id)]);
+    notify('Template ativado!', `${tpl.name} agora é o padrão para ${tpl.platform}.`);
   };
 
   const handleSaveTemplate = (e: React.FormEvent) => {
@@ -157,12 +112,12 @@ export const TemplatesConfigView: React.FC = () => {
       conditions: tplConditions,
     };
 
+    // Place saved/created template at the top so getTemplateForPlatform immediately uses it
+    setTemplates((prev) => [record, ...prev.filter((t) => t.id !== record.id)]);
     if (editingId) {
-      setTemplates((prev) => prev.map((t) => (t.id === editingId ? record : t)));
-      notify('Template atualizado!', finalName);
+      notify('Template atualizado e ativo!', `${finalName} (${tplPlatform})`);
     } else {
-      setTemplates((prev) => [...prev, record]);
-      notify('Novo template salvo!', finalName);
+      notify('Novo template salvo e ativo!', `${finalName} (${tplPlatform})`);
     }
     setEditorOpen(false);
   };
@@ -172,28 +127,12 @@ export const TemplatesConfigView: React.FC = () => {
     if (!preset) return;
     setPresetsOpen(false);
     setEditingId(null);
-    setTplName(`Shopee — ${preset.title}`);
-    setTplPlatform('Shopee');
+    setTplName(`${presetPlatform} — ${preset.title}`);
+    setTplPlatform(presetPlatform);
     setTplBody(preset.body);
     setTplCtaStyle('Padrão');
     setTplLinkPreview(true);
-    setTplConditions([
-      {
-        id: 'cond-preset-1',
-        variable: 'cta_ia',
-        operator: 'existe',
-        thenText: '{{cta_ia}}',
-        elseText: '💥 {{nome}}',
-      },
-      {
-        id: 'cond-preset-2',
-        variable: 'desconto_pct',
-        operator: 'maior_que',
-        compareValue: 0,
-        thenText: 'De: ~{{preco_original}}~ ❌',
-        elseText: '',
-      },
-    ]);
+    setTplConditions((preset.conditions || DEFAULT_TEMPLATE_CONDITIONS).map((c) => ({ ...c })));
     setEditorOpen(true);
   };
 
@@ -207,39 +146,36 @@ export const TemplatesConfigView: React.FC = () => {
     conditions: tplConditions,
   };
 
+  const realSampleForEditor: Product | undefined =
+    products.find((p) => p.platform === tplPlatform && p.customImageUrl && p.discountPercent > 0) ||
+    products.find((p) => p.platform === tplPlatform && p.customImageUrl) ||
+    products.find((p) => p.platform === tplPlatform);
+  const editorDemoProduct = getDemoProductForPlatform(tplPlatform, realSampleForEditor);
+
   const previewRendered = renderProductMessage(
-    { ...DEMO_SNEAKER_PRODUCT, platform: tplPlatform },
+    editorDemoProduct,
     draftTemplate,
     integrations
   );
 
+  const realSampleForPreset: Product | undefined =
+    products.find((p) => p.platform === presetPlatform && p.customImageUrl && p.discountPercent > 0) ||
+    products.find((p) => p.platform === presetPlatform && p.customImageUrl) ||
+    products.find((p) => p.platform === presetPlatform);
+  const presetDemoProduct = getDemoProductForPlatform(presetPlatform, realSampleForPreset);
+
   const selectedPreset =
     TEMPLATE_PRESETS.find((p) => p.id === selectedPresetId) || TEMPLATE_PRESETS[0];
   const presetPreviewRendered = renderProductMessage(
-    DEMO_SNEAKER_PRODUCT,
+    presetDemoProduct,
     {
       id: 'preset-preview',
       name: selectedPreset.title,
-      platform: 'Shopee',
+      platform: presetPlatform,
       body: selectedPreset.body,
       ctaStyle: 'Padrão',
       enableLinkPreview: true,
-      conditions: [
-        {
-          id: 'cp-1',
-          variable: 'cta_ia',
-          operator: 'existe',
-          thenText: '{{cta_ia}}',
-          elseText: '💥 {{nome}}',
-        },
-        {
-          id: 'cp-2',
-          variable: 'desconto_pct',
-          operator: 'maior_que',
-          compareValue: 0,
-          thenText: 'De: ~{{preco_original}}~ ❌',
-        },
-      ],
+      conditions: selectedPreset.conditions || DEFAULT_TEMPLATE_CONDITIONS,
     },
     integrations
   );
@@ -298,56 +234,77 @@ export const TemplatesConfigView: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-sm">
-              {templates.map((tpl) => (
-                <tr
-                  key={tpl.id}
-                  className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40 transition-colors"
-                >
-                  <td className="py-3.5 px-4 font-medium text-slate-900 dark:text-white">
-                    {tpl.name}
-                  </td>
-                  <td className="py-3.5 px-4">
-                    <span
-                      className={`inline-block px-2.5 py-0.5 rounded-md text-xs font-semibold font-mono ${getMarketplaceBadgeColor(
-                        tpl.platform
-                      )}`}
-                    >
-                      {tpl.platform}
-                    </span>
-                  </td>
-                  <td className="py-3.5 px-4 text-right">
-                    <div className="inline-flex items-center gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => openEditTemplate(tpl)}
-                        title="Editar template"
-                        className="p-2 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+              {templates.map((tpl) => {
+                const isActiveForPlatform =
+                  templates.find((t) => t.platform === tpl.platform)?.id === tpl.id;
+                return (
+                  <tr
+                    key={tpl.id}
+                    className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40 transition-colors"
+                  >
+                    <td className="py-3.5 px-4 font-medium text-slate-900 dark:text-white">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span>{tpl.name}</span>
+                        {isActiveForPlatform && (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            <span>Ativo</span>
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="py-3.5 px-4">
+                      <span
+                        className={`inline-block px-2.5 py-0.5 rounded-md text-xs font-semibold font-mono ${getMarketplaceBadgeColor(
+                          tpl.platform
+                        )}`}
                       >
-                        <Pencil className="w-4 h-4" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (templates.length <= 1) {
-                            notify(
-                              'Mantenha ao menos 1 template',
-                              undefined,
-                              'error'
-                            );
-                            return;
-                          }
-                          setTemplates((prev) => prev.filter((t) => t.id !== tpl.id));
-                          notify('Template removido', tpl.name, 'info');
-                        }}
-                        title="Excluir template"
-                        className="p-2 rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
+                        {tpl.platform}
+                      </span>
+                    </td>
+                    <td className="py-3.5 px-4 text-right">
+                      <div className="inline-flex items-center gap-1.5">
+                        {!isActiveForPlatform && (
+                          <button
+                            type="button"
+                            onClick={() => handleActivateTemplate(tpl)}
+                            className="px-2.5 py-1 rounded-lg border border-emerald-200 dark:border-emerald-800 text-xs font-semibold text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40"
+                          >
+                            Ativar
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => openEditTemplate(tpl)}
+                          title="Editar template"
+                          className="p-2 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+                        >
+                          <Pencil className="w-4 h-4" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (templates.length <= 1) {
+                              notify(
+                                'Mantenha ao menos 1 template',
+                                undefined,
+                                'error'
+                              );
+                              return;
+                            }
+                            setTemplates((prev) => prev.filter((t) => t.id !== tpl.id));
+                            notify('Template removido', tpl.name, 'info');
+                          }}
+                          title="Excluir template"
+                          className="p-2 rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -378,6 +335,23 @@ export const TemplatesConfigView: React.FC = () => {
               >
                 <X className="w-4 h-4" />
               </button>
+            </div>
+
+            <div className="mb-4 flex flex-wrap items-center gap-2.5">
+              <label className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+                Aplicar para a plataforma:
+              </label>
+              <select
+                value={presetPlatform}
+                onChange={(e) => setPresetPlatform(e.target.value as Marketplace)}
+                className="rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3 py-1.5 text-xs font-semibold"
+              >
+                {MARKETPLACES.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-start">
@@ -414,10 +388,11 @@ export const TemplatesConfigView: React.FC = () => {
               <div>
                 <WhatsAppMockup
                   message={presetPreviewRendered}
-                  artworkKey="sneaker"
+                  artworkKey={presetDemoProduct.artworkKey}
+                  customImageUrl={presetDemoProduct.customImageUrl}
                   showMedia
                   enableLinkPreview
-                  previewDomain="s.shopee.com.br"
+                  previewDomain={getPreviewDomain(presetPlatform)}
                   time="23:03"
                 />
               </div>
@@ -498,175 +473,15 @@ export const TemplatesConfigView: React.FC = () => {
                   </div>
                 </div>
 
-                {/* Variáveis Disponíveis */}
-                <div>
-                  <div className="text-xs font-semibold text-slate-700 dark:text-slate-200 mb-2">
-                    Variáveis Disponíveis (clique para inserir)
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {VARIABLE_CHIPS.map((chip) => (
-                      <button
-                        key={chip.token}
-                        type="button"
-                        onClick={() => setTplBody((prev) => `${prev} ${chip.token}`)}
-                        className={`px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-transform active:scale-95 ${chip.tone}`}
-                      >
-                        {chip.label}
-                      </button>
-                    ))}
-                    <button
-                      type="button"
-                      onClick={handleAddCondition}
-                      className="px-2.5 py-1.5 rounded-lg border border-sky-300 dark:border-sky-700 bg-sky-100/80 dark:bg-sky-950 text-sky-900 dark:text-sky-200 text-xs font-semibold"
-                    >
-                      + Condicional (Se/Senão) ({tplConditions.length})
-                    </button>
-                  </div>
-                </div>
-
-                {/* Blocos Condicionais (SE / SENÃO) */}
-                {tplConditions.length > 0 && (
-                  <div className="space-y-2.5">
-                    <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">
-                      Blocos Condicionais (SE / SENÃO)
-                    </div>
-                    {tplConditions.map((cond, idx) => (
-                      <div
-                        key={cond.id}
-                        className="rounded-xl border border-sky-200 dark:border-sky-800/70 bg-sky-50/50 dark:bg-sky-950/20 p-3 space-y-2 text-xs"
-                      >
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <span className="px-2 py-0.5 rounded bg-sky-200 dark:bg-sky-900 text-sky-900 dark:text-sky-200 font-bold">
-                              SE ({idx + 1})
-                            </span>
-                            <select
-                              value={cond.variable}
-                              onChange={(e) => {
-                                const val = e.target.value as TemplateCondition['variable'];
-                                setTplConditions((prev) =>
-                                  prev.map((c) =>
-                                    c.id === cond.id
-                                      ? {
-                                          ...c,
-                                          variable: val,
-                                          operator:
-                                            val === 'desconto_pct'
-                                              ? 'maior_que'
-                                              : 'existe',
-                                        }
-                                      : c
-                                  )
-                                );
-                              }}
-                              className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1"
-                            >
-                              <option value="cta_ia">CTA por IA</option>
-                              <option value="desconto_pct">% de desconto</option>
-                              <option value="cupom">Cupom</option>
-                              <option value="info_extra">Informação adicional</option>
-                            </select>
-                            <span className="text-slate-500">
-                              {cond.variable === 'desconto_pct' ? 'maior que 0' : 'existe'}
-                            </span>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setTplConditions((prev) =>
-                                prev.filter((c) => c.id !== cond.id)
-                              )
-                            }
-                            className="text-slate-400 hover:text-rose-500"
-                          >
-                            <X className="w-4 h-4" />
-                          </button>
-                        </div>
-
-                        <div>
-                          <input
-                            type="text"
-                            value={cond.thenText}
-                            onChange={(e) =>
-                              setTplConditions((prev) =>
-                                prev.map((c) =>
-                                  c.id === cond.id ? { ...c, thenText: e.target.value } : c
-                                )
-                              )
-                            }
-                            placeholder="Texto exibido se verdadeiro..."
-                            className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 font-mono text-xs"
-                          />
-                        </div>
-
-                        <div>
-                          <label className="text-[11px] font-semibold text-sky-700 dark:text-sky-400 block mb-1">
-                            SENÃO (opcional):
-                          </label>
-                          <input
-                            type="text"
-                            value={cond.elseText || ''}
-                            onChange={(e) =>
-                              setTplConditions((prev) =>
-                                prev.map((c) =>
-                                  c.id === cond.id ? { ...c, elseText: e.target.value } : c
-                                )
-                              )
-                            }
-                            placeholder="Ex: 💥 {{nome}}"
-                            className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 font-mono text-xs"
-                          />
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* Conteúdo do Template */}
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1.5">
-                    Conteúdo do Template
-                  </label>
-                  <div className="rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden bg-white dark:bg-slate-800">
-                    <textarea
-                      rows={6}
-                      value={tplBody}
-                      onChange={(e) => setTplBody(e.target.value)}
-                      placeholder="Escreva seu template aqui..."
-                      className="w-full p-3 text-sm font-mono bg-transparent focus:outline-none"
-                    />
-                    <div className="bg-slate-50 dark:bg-slate-800/90 border-t border-slate-200 dark:border-slate-700 px-3 py-1.5 flex items-center gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => setTplBody((prev) => `${prev} *destaque*`)}
-                        className="p-1.5 rounded hover:bg-slate-200/70 dark:hover:bg-slate-700"
-                      >
-                        <Bold className="w-3.5 h-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setTplBody((prev) => `${prev} _itálico_`)}
-                        className="p-1.5 rounded hover:bg-slate-200/70 dark:hover:bg-slate-700"
-                      >
-                        <Italic className="w-3.5 h-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setTplBody((prev) => `${prev} ~riscado~`)}
-                        className="p-1.5 rounded hover:bg-slate-200/70 dark:hover:bg-slate-700"
-                      >
-                        <Strikethrough className="w-3.5 h-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setTplBody((prev) => `${prev} \`cupom\``)}
-                        className="p-1.5 rounded hover:bg-slate-200/70 dark:hover:bg-slate-700"
-                      >
-                        <Code className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  </div>
-                </div>
+                {/* Editor unificado estilo BuboFlow: Variáveis, Conteúdo Dinâmico, Condicional e Blocos DENTRO do Conteúdo do Template */}
+                <TemplateBlockEditor
+                  body={tplBody}
+                  conditions={tplConditions}
+                  onChange={(nextBody, nextConditions) => {
+                    setTplBody(nextBody);
+                    setTplConditions(nextConditions);
+                  }}
+                />
 
                 {/* Estilo do CTA & Preview de Link */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-center">
@@ -709,7 +524,8 @@ export const TemplatesConfigView: React.FC = () => {
               <div className="lg:col-span-5">
                 <WhatsAppMockup
                   message={previewRendered}
-                  artworkKey="sneaker"
+                  artworkKey={editorDemoProduct.artworkKey}
+                  customImageUrl={editorDemoProduct.customImageUrl}
                   showMedia
                   enableLinkPreview={tplLinkPreview}
                   previewDomain={getPreviewDomain(tplPlatform)}

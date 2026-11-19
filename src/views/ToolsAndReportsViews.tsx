@@ -14,7 +14,6 @@ import {
   Users,
   UserPlus,
   TrendingUp,
-  Lightbulb,
   ShoppingBag,
   Image as ImageIcon,
   ExternalLink,
@@ -35,6 +34,15 @@ import {
   fetchShopeeCommissionsApi,
   getBaileysLiveStatsApi,
 } from '../utils/apiClient';
+import {
+  MEMBER_MONITOR_PERIODS,
+  MemberMonitorPeriod,
+  computeMemberMonitorSummary,
+  formatLocalDateKey,
+  truncateGroupOptionLabel,
+} from '../utils/memberMonitorAnalytics';
+import { MemberMonitorCharts } from '../components/MemberMonitorCharts';
+import type { DispatchGroup } from '../types';
 
 /* ============================================================================
  * 1. DOWNLOAD DE VÍDEOS (Telas 43–44)
@@ -737,14 +745,14 @@ export const SentLogsView: React.FC = () => {
                 className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 overflow-hidden flex flex-col justify-between"
               >
                 <div>
-                  <div className="relative">
+                  <div className="relative bg-white dark:bg-slate-900 border-b border-slate-100 dark:border-slate-800">
                     <ProductArtwork
                       artworkKey={item.artworkKey || 'cap'}
                       customImageUrl={item.customImageUrl}
                       alt={item.title}
-                      className="w-full h-52"
+                      className="w-full h-56 p-3"
                     />
-                    <span className="absolute top-3 right-3 px-2.5 py-0.5 rounded-md bg-[#EA580C] text-white text-xs font-semibold">
+                    <span className="absolute top-3 right-3 px-2.5 py-0.5 rounded-md bg-[#EA580C] text-white text-xs font-semibold shadow-xs">
                       {item.platform}
                     </span>
                   </div>
@@ -838,37 +846,93 @@ export const SentLogsView: React.FC = () => {
 /* ============================================================================
  * 5. MONITORAMENTO DE MEMBROS REAL (Via Baileys Multi-Device)
  * ========================================================================== */
-const WEEKDAY_NAMES = [
-  'Domingo',
-  'Segunda',
-  'Terça',
-  'Quarta',
-  'Quinta',
-  'Sexta',
-  'Sábado',
-];
-
 export const MemberMonitorView: React.FC = () => {
   const { dispatchGroups, accounts, syncWhatsAppGroupsFromAccount, setRoute } = useApp();
   const [selectedGroupId, setSelectedGroupId] = useState('all');
-  const [period, setPeriod] = useState('Últimos 7 dias');
+  const [period, setPeriod] = useState<MemberMonitorPeriod>('Últimos 7 dias');
+  const [customStartDate, setCustomStartDate] = useState<string>(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 6);
+    return formatLocalDateKey(d);
+  });
+  const [customEndDate, setCustomEndDate] = useState<string>(() => formatLocalDateKey(new Date()));
   const [memberEvents, setMemberEvents] = useState<BaileysMemberEvent[]>([]);
+  const [cachedFallbackGroups, setCachedFallbackGroups] = useState<DispatchGroup[]>([]);
   const [syncing, setSyncing] = useState(false);
 
   const loadStats = async () => {
     try {
       const res = await getBaileysLiveStatsApi();
-      if (res.ok && Array.isArray(res.memberEvents)) {
-        setMemberEvents(res.memberEvents);
+      if (res.ok) {
+        if (Array.isArray(res.memberEvents)) {
+          setMemberEvents(res.memberEvents);
+        }
+        if (Array.isArray(res.cachedGroups) && res.cachedGroups.length > 0) {
+          setCachedFallbackGroups(
+            res.cachedGroups.map((cg) => ({
+              id: `grp-wa-${normalizeGroupJid(cg.remoteJid).replace(/[^a-zA-Z0-9]/g, '')}`,
+              name: cg.name,
+              channel: 'WhatsApp',
+              accountId: cg.accountId || 'acc-wa-1',
+              accountName: 'WhatsApp',
+              remoteJid: normalizeGroupJid(cg.remoteJid),
+              activeForOffers: false,
+              isPriorityCapture: false,
+              isChannel: false,
+              membersCount: cg.membersCount,
+              maxCapacity: 1024,
+              inviteUrl: 'https://chat.whatsapp.com/',
+              segment: 'Geral',
+              isOwner: cg.isOwner,
+              isAdmin: cg.isAdmin,
+              isOwnerOrAdmin: cg.isOwnerOrAdmin,
+            }))
+          );
+        }
       }
     } catch {
       // Ignore network error
     }
   };
 
+  // Detect whether WhatsApp groups still lack owner/admin metadata (e.g., from before this update)
+  const needsRoleSync = useMemo(
+    () =>
+      dispatchGroups.length === 0 ||
+      dispatchGroups.some((g) => g.channel === 'WhatsApp' && g.isOwnerOrAdmin === undefined),
+    [dispatchGroups]
+  );
+
+  // Auto-load stats & trigger silent WhatsApp group sync on mount (or if role metadata is missing), then keep stats fresh every 15s
   useEffect(() => {
-    void loadStats();
-  }, [dispatchGroups.length]);
+    let active = true;
+    const bootstrap = async () => {
+      await loadStats();
+      if (!active) return;
+      if (needsRoleSync) {
+        setSyncing(true);
+        try {
+          await syncWhatsAppGroupsFromAccount(undefined, { silent: true });
+          if (active) await loadStats();
+        } finally {
+          if (active) setSyncing(false);
+        }
+      }
+    };
+    void bootstrap();
+    const timer = setInterval(() => {
+      void loadStats();
+    }, 15000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [needsRoleSync, syncWhatsAppGroupsFromAccount]);
+
+  const effectiveGroups = useMemo(
+    () => (dispatchGroups.length > 0 ? dispatchGroups : cachedFallbackGroups),
+    [dispatchGroups, cachedFallbackGroups]
+  );
 
   const handleRefreshLive = async () => {
     setSyncing(true);
@@ -880,156 +944,59 @@ export const MemberMonitorView: React.FC = () => {
     }
   };
 
+  const summary = useMemo(
+    () =>
+      computeMemberMonitorSummary({
+        groups: effectiveGroups,
+        memberEvents,
+        selectedGroupId,
+        period,
+        customStartDate,
+        customEndDate,
+        onlyOwnerOrAdmin: true,
+      }),
+    [effectiveGroups, memberEvents, selectedGroupId, period, customStartDate, customEndDate]
+  );
+
+  const {
+    ownedGroupsCount,
+    targetGroups,
+    totalParticipants,
+    todayStats,
+    periodStats,
+    perGroupBreakdown,
+  } = summary;
+
   useEffect(() => {
-    if (selectedGroupId !== 'all' && !dispatchGroups.some((g) => g.id === selectedGroupId)) {
+    if (selectedGroupId !== 'all' && !perGroupBreakdown.some((g) => g.id === selectedGroupId)) {
       setSelectedGroupId('all');
     }
-  }, [dispatchGroups, selectedGroupId]);
-
-  const targetGroups = useMemo(() => {
-    if (selectedGroupId === 'all') return dispatchGroups;
-    return dispatchGroups.filter((g) => g.id === selectedGroupId);
-  }, [dispatchGroups, selectedGroupId]);
-
-  const targetJids = useMemo(
-    () =>
-      new Set(
-        targetGroups
-          .map((g) => normalizeGroupJid(g.remoteJid))
-          .filter(Boolean)
-      ),
-    [targetGroups]
-  );
-
-  const totalParticipants = useMemo(
-    () => targetGroups.reduce((sum, g) => sum + (g.membersCount || 0), 0),
-    [targetGroups]
-  );
-
-  const relevantEvents = useMemo(() => {
-    if (targetJids.size === 0) return [];
-    return memberEvents.filter((ev) => targetJids.has(normalizeGroupJid(ev.groupJid)));
-  }, [memberEvents, targetJids]);
-
-  const todayKey = new Date().toISOString().slice(0, 10);
-  const todayStats = useMemo(() => {
-    let entries = 0;
-    let exits = 0;
-    for (const ev of relevantEvents) {
-      if (ev.date === todayKey) {
-        entries += ev.entries;
-        exits += ev.exits;
-      }
-    }
-    const net = entries - exits;
-    const churnPct = entries > 0 ? Math.round((exits / entries) * 100) : 0;
-    return { entries, exits, net, churnPct };
-  }, [relevantEvents, todayKey]);
-
-  const dailyFlow = useMemo(() => {
-    const now = new Date();
-    const days: { dateKey: string; label: string; entries: number; exits: number }[] = [];
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
-      const dateKey = d.toISOString().slice(0, 10);
-      const dd = String(d.getDate()).padStart(2, '0');
-      const mm = String(d.getMonth() + 1).padStart(2, '0');
-      days.push({ dateKey, label: `${dd}/${mm}`, entries: 0, exits: 0 });
-    }
-    for (const ev of relevantEvents) {
-      const slot = days.find((d) => d.dateKey === ev.date);
-      if (slot) {
-        slot.entries += ev.entries;
-        slot.exits += ev.exits;
-      }
-    }
-    // Reconstruct total member curve backward from current real totalParticipants
-    const totals = new Array<number>(days.length).fill(totalParticipants);
-    let running = totalParticipants;
-    for (let i = days.length - 1; i > 0; i--) {
-      const net = days[i].entries - days[i].exits;
-      running = Math.max(0, running - net);
-      totals[i - 1] = running;
-    }
-    return days.map((d, idx) => ({ ...d, total: totals[idx] }));
-  }, [relevantEvents, totalParticipants]);
-
-  const weekdayPatterns = useMemo(() => {
-    return WEEKDAY_NAMES.map((dayName, wIdx) => {
-      const matching = relevantEvents.filter((e) => e.weekday === wIdx);
-      const entries = matching.reduce((s, e) => s + e.entries, 0);
-      const exits = matching.reduce((s, e) => s + e.exits, 0);
-      const churnNum = entries > 0 ? (exits / entries) * 100 : 0;
-      const churnPct = entries > 0 ? `${churnNum.toFixed(1)}%` : '0%';
-      return {
-        day: dayName,
-        entries,
-        exits,
-        churnPct,
-        entryShade:
-          entries >= 5
-            ? 'bg-emerald-500 text-white'
-            : entries > 0
-            ? 'bg-emerald-200 text-slate-900'
-            : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300',
-        exitShade:
-          exits >= 5
-            ? 'bg-rose-500 text-white'
-            : exits > 0
-            ? 'bg-rose-200 text-slate-900'
-            : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300',
-        churnShade:
-          churnNum >= 50
-            ? 'bg-amber-400 text-slate-900'
-            : churnNum > 0
-            ? 'bg-amber-200 text-slate-900'
-            : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300',
-      };
-    });
-  }, [relevantEvents]);
-
-  const maxDailyBar = Math.max(
-    4,
-    ...dailyFlow.map((d) => Math.max(d.entries, d.exits))
-  );
-  const maxMemberAxis = Math.max(10, Math.ceil(Math.max(totalParticipants, ...dailyFlow.map((d) => d.total)) * 1.15));
-  const yTicks = [
-    0,
-    Math.round(maxMemberAxis * 0.25),
-    Math.round(maxMemberAxis * 0.5),
-    Math.round(maxMemberAxis * 0.75),
-    maxMemberAxis,
-  ];
-
-  // Build dynamic SVG line & area paths from dailyFlow
-  const { linePath, areaPath } = useMemo(() => {
-    const xStart = 50;
-    const xEnd = 330;
-    const step = (xEnd - xStart) / Math.max(1, dailyFlow.length - 1);
-    const pts = dailyFlow.map((d, idx) => {
-      const x = Math.round(xStart + idx * step);
-      const y = Math.round(155 - (d.total / maxMemberAxis) * 125);
-      return { x, y };
-    });
-    const line = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x} ${p.y}`).join(' ');
-    const area = `${line} L${pts[pts.length - 1].x} 155 L${pts[0].x} 155 Z`;
-    return { linePath: line, areaPath: area };
-  }, [dailyFlow, maxMemberAxis]);
+  }, [perGroupBreakdown, selectedGroupId]);
 
   const hasConnectedWa = accounts.some((a) => a.channel === 'WhatsApp' && a.connected);
 
+  // Use today's stats for the top "Saldo Diário" & "Churn Diário" cards on live periods (matching BuboFlow),
+  // and period stats when explicitly inspecting past/custom windows (Ontem / Mês Anterior / Personalizado).
+  const isHistoricalSlice =
+    period === 'Ontem' || period === 'Mês Anterior' || period === 'Personalizado';
+  const kpiNet = isHistoricalSlice ? periodStats.net : todayStats.net;
+  const kpiEntries = isHistoricalSlice ? periodStats.entries : todayStats.entries;
+  const kpiExits = isHistoricalSlice ? periodStats.exits : todayStats.exits;
+  const kpiChurnLabel = isHistoricalSlice ? periodStats.churnLabel : todayStats.churnLabel;
+
   return (
-    <div className="space-y-6">
-      <div className="flex items-start justify-between gap-3 flex-wrap">
-        <div>
-          <div className="flex items-center gap-2.5">
-            <BarChart3 className="w-6 h-6 text-[#15803D] dark:text-emerald-400" />
-            <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
+    <div className="space-y-5 sm:space-y-6 min-w-0 max-w-full overflow-x-hidden">
+      {/* Header matching BuboFlow */}
+      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 min-w-0">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <BarChart3 className="w-6 h-6 text-[#15803D] dark:text-emerald-400 shrink-0" />
+            <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900 dark:text-white break-words min-w-0">
               Monitoramento de Membros
             </h1>
           </div>
-          <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
-            Participantes reais puxados diretamente dos grupos conectados no seu WhatsApp.
+          <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mt-1 break-words">
+            Acompanhe o crescimento e engajamento dos seus grupos.
           </p>
         </div>
 
@@ -1037,25 +1004,27 @@ export const MemberMonitorView: React.FC = () => {
           type="button"
           disabled={syncing}
           onClick={() => void handleRefreshLive()}
-          className="px-4 py-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-2 hover:bg-slate-50 dark:hover:bg-slate-800"
+          className="w-full sm:w-auto justify-center px-4 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-2 hover:bg-slate-50 dark:hover:bg-slate-800 shrink-0 disabled:opacity-60"
         >
-          <RefreshCw className={`w-4 h-4 ${syncing ? 'animate-spin text-[#15803D]' : ''}`} />
-          <span>Atualizar Membros do WhatsApp</span>
+          <RefreshCw className={`w-4 h-4 shrink-0 ${syncing ? 'animate-spin text-[#15803D]' : ''}`} />
+          <span>{syncing ? 'Atualizando...' : 'Atualizar Grupos'}</span>
         </button>
       </div>
 
-      {dispatchGroups.length === 0 && (
+      {/* Empty states: not connected vs connected with 0 owner/admin groups */}
+      {effectiveGroups.length === 0 ? (
         <div className="rounded-2xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="text-xs sm:text-sm text-amber-900 dark:text-amber-200">
             {hasConnectedWa ? (
               <span>
-                Seu WhatsApp está conectado! Clique em <strong>Atualizar Membros do WhatsApp</strong>{' '}
-                para puxar todos os seus grupos reais agora.
+                Seu WhatsApp está conectado! Clique em <strong>Atualizar Grupos</strong> para
+                carregar os grupos em que você é dono ou administrador.
               </span>
             ) : (
               <span>
                 Nenhum grupo sincronizado ainda. Conecte seu WhatsApp em{' '}
-                <strong>Canais → WhatsApp</strong> para carregar automaticamente os membros reais.
+                <strong>Canais → WhatsApp</strong> para monitorar os grupos em que você é dono ou
+                administrador.
               </span>
             )}
           </div>
@@ -1069,250 +1038,260 @@ export const MemberMonitorView: React.FC = () => {
             </button>
           )}
         </div>
-      )}
+      ) : ownedGroupsCount === 0 ? (
+        <div className="rounded-2xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="text-xs sm:text-sm text-amber-900 dark:text-amber-200">
+            Nenhum grupo em que você é <strong>dono ou administrador</strong> foi encontrado na
+            conta conectada. O monitoramento de membros acompanha apenas grupos gerenciados por
+            você (grupos de terceiros em que você é apenas participante são filtrados
+            automaticamente).
+          </div>
+          <button
+            type="button"
+            disabled={syncing}
+            onClick={() => void handleRefreshLive()}
+            className="px-3.5 py-2 rounded-xl bg-[#15803D] text-white text-xs font-semibold shrink-0 disabled:opacity-60"
+          >
+            Verificar novamente
+          </button>
+        </div>
+      ) : null}
 
-      <select
-        value={selectedGroupId}
-        onChange={(e) => setSelectedGroupId(e.target.value)}
-        className="w-full sm:w-80 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-3.5 py-2.5 text-sm"
-      >
-        <option value="all">Todos os Grupos Conectados ({dispatchGroups.length})</option>
-        {dispatchGroups.map((g) => (
-          <option key={g.id} value={g.id}>
-            {g.name} ({g.membersCount} membros)
-          </option>
-        ))}
-      </select>
+      {/* Group Filter Select (Owner/Admin groups only) */}
+      <div className="min-w-0 max-w-full">
+        <label htmlFor="member-monitor-group-select" className="sr-only">
+          Filtrar por grupo em que você é dono ou admin
+        </label>
+        <select
+          id="member-monitor-group-select"
+          value={selectedGroupId}
+          onChange={(e) => setSelectedGroupId(e.target.value)}
+          className="w-full max-w-full sm:w-96 min-w-0 truncate rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-3.5 py-2.5 text-sm text-slate-900 dark:text-slate-100"
+        >
+          <option value="all">Todos os Grupos ({ownedGroupsCount})</option>
+          {perGroupBreakdown.map((g) => (
+            <option key={g.id} value={g.id}>
+              {truncateGroupOptionLabel(g.name, 34)} ({g.membersCount.toLocaleString('pt-BR')} ·{' '}
+              {g.isOwner ? 'Dono' : 'Admin'})
+            </option>
+          ))}
+        </select>
+      </div>
 
-      {/* 4 Real KPI Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 flex items-center gap-4">
+      {/* 4 BuboFlow KPI Cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5 sm:gap-4">
+        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4 sm:p-5 flex items-center gap-4 min-w-0">
           <div className="w-12 h-12 rounded-xl bg-emerald-50 dark:bg-emerald-950/60 text-[#15803D] dark:text-emerald-400 flex items-center justify-center shrink-0">
             <Users className="w-6 h-6" />
           </div>
-          <div>
+          <div className="min-w-0">
             <div className="text-xs text-slate-500">Total de Grupos</div>
-            <div className="text-2xl font-bold tabular-nums mt-0.5">{targetGroups.length}</div>
+            <div className="text-2xl font-bold tabular-nums mt-0.5 text-slate-900 dark:text-white">
+              {targetGroups.length.toLocaleString('pt-BR')}
+            </div>
+            <div className="text-[11px] text-slate-400 mt-0.5">Dono ou Admin</div>
           </div>
         </div>
 
-        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 flex items-center gap-4">
+        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4 sm:p-5 flex items-center gap-4 min-w-0">
           <div className="w-12 h-12 rounded-xl bg-emerald-50 dark:bg-emerald-950/60 text-[#15803D] dark:text-emerald-400 flex items-center justify-center shrink-0">
             <UserPlus className="w-6 h-6" />
           </div>
-          <div>
+          <div className="min-w-0">
             <div className="text-xs text-slate-500">Total de Participantes</div>
-            <div className="text-2xl font-bold tabular-nums mt-0.5">{totalParticipants}</div>
+            <div className="text-2xl font-bold tabular-nums mt-0.5 text-slate-900 dark:text-white">
+              {totalParticipants.toLocaleString('pt-BR')}
+            </div>
+            <div className="text-[11px] text-slate-400 mt-0.5">Nos seus grupos</div>
           </div>
         </div>
 
-        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 flex items-center gap-4">
+        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4 sm:p-5 flex items-center gap-4 min-w-0">
           <div className="w-12 h-12 rounded-xl bg-emerald-50 dark:bg-emerald-950/60 text-[#15803D] dark:text-emerald-400 flex items-center justify-center shrink-0">
             <TrendingUp className="w-6 h-6" />
           </div>
-          <div>
-            <div className="text-xs text-slate-500">Saldo Diário</div>
-            <div className="text-2xl font-bold tabular-nums mt-0.5">
-              {todayStats.net > 0 ? `+${todayStats.net}` : todayStats.net}
+          <div className="min-w-0">
+            <div className="text-xs text-slate-500">
+              {isHistoricalSlice ? `Saldo (${periodStats.labelSuffix})` : 'Saldo Diário'}
+            </div>
+            <div
+              className={`text-2xl font-bold tabular-nums mt-0.5 ${
+                kpiNet > 0
+                  ? 'text-[#15803D] dark:text-emerald-400'
+                  : kpiNet < 0
+                  ? 'text-rose-600 dark:text-rose-400'
+                  : 'text-slate-900 dark:text-white'
+              }`}
+            >
+              {kpiNet > 0 ? `+${kpiNet}` : kpiNet}
+            </div>
+            <div className="text-[11px] text-slate-400 tabular-nums mt-0.5">
+              +{kpiEntries} entr. · -{kpiExits} saíd.
             </div>
           </div>
         </div>
 
-        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 flex items-center gap-4">
+        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4 sm:p-5 flex items-center gap-4 min-w-0">
           <div className="w-12 h-12 rounded-xl bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 flex items-center justify-center shrink-0">
             <BarChart3 className="w-6 h-6" />
           </div>
-          <div>
-            <div className="text-xs text-slate-500">Churn Diário</div>
-            <div className="text-2xl font-bold tabular-nums mt-0.5">{todayStats.churnPct}%</div>
+          <div className="min-w-0">
+            <div className="text-xs text-slate-500">
+              {isHistoricalSlice ? `Churn (${periodStats.labelSuffix})` : 'Churn Diário'}
+            </div>
+            <div className="text-2xl font-bold tabular-nums mt-0.5 text-slate-900 dark:text-white">
+              {kpiChurnLabel}
+            </div>
+            <div className="text-[11px] text-slate-400 tabular-nums mt-0.5">
+              {!isHistoricalSlice && period !== 'Hoje'
+                ? `Período: ${periodStats.churnLabel} (${periodStats.exits} saíd.)`
+                : `${kpiExits} saída(s) / ${kpiEntries} entrada(s)`}
+            </div>
           </div>
         </div>
       </div>
 
-      {/* Period Buttons */}
-      <div className="flex flex-wrap gap-2">
-        {['Hoje', 'Ontem', 'Últimos 7 dias', 'Mês Atual', 'Mês Anterior', 'Últimos 30 dias'].map(
-          (p) => (
+      {/* 7 Period Filter Buttons (including Personalizado) */}
+      <div className="space-y-3 min-w-0">
+        <div className="grid grid-cols-2 sm:flex sm:flex-wrap gap-2">
+          {MEMBER_MONITOR_PERIODS.map((p) => (
             <button
               key={p}
               type="button"
               onClick={() => setPeriod(p)}
-              className={`px-3.5 py-2 rounded-xl text-xs sm:text-sm font-medium whitespace-nowrap ${
+              className={`px-3.5 py-2 rounded-xl text-xs sm:text-sm font-medium text-center transition-colors ${
                 period === p
                   ? 'bg-[#15803D] text-white'
-                  : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300'
+                  : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
               }`}
             >
               {p}
             </button>
-          )
+          ))}
+        </div>
+
+        {period === 'Personalizado' && (
+          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-3.5 sm:p-4 flex flex-col sm:flex-row sm:items-end gap-3">
+            <div className="flex-1 min-w-0">
+              <label
+                htmlFor="member-monitor-start-date"
+                className="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1"
+              >
+                Data Inicial
+              </label>
+              <input
+                id="member-monitor-start-date"
+                type="date"
+                value={customStartDate}
+                max={customEndDate}
+                onChange={(e) => setCustomStartDate(e.target.value)}
+                className="w-full rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-3 py-2 text-sm text-slate-900 dark:text-white"
+              />
+            </div>
+            <div className="flex-1 min-w-0">
+              <label
+                htmlFor="member-monitor-end-date"
+                className="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1"
+              >
+                Data Final
+              </label>
+              <input
+                id="member-monitor-end-date"
+                type="date"
+                value={customEndDate}
+                min={customStartDate}
+                onChange={(e) => setCustomEndDate(e.target.value)}
+                className="w-full rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-3 py-2 text-sm text-slate-900 dark:text-white"
+              />
+            </div>
+          </div>
         )}
       </div>
 
-      {/* Charts Row: Evolução de Membros & Entradas vs Saídas */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Evolução de Membros Area Chart */}
-        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5">
-          <h2 className="font-bold text-base text-slate-900 dark:text-white mb-4">
-            Evolução de Membros
-          </h2>
-          <svg viewBox="0 0 360 190" className="w-full h-48">
-            <defs>
-              <linearGradient id="memberGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#15803D" stopOpacity="0.32" />
-                <stop offset="100%" stopColor="#15803D" stopOpacity="0.02" />
-              </linearGradient>
-            </defs>
-            {yTicks.map((v, idx) => {
-              const y = 155 - (v / maxMemberAxis) * 125;
+      {/* Compact List of Monitored Owner/Admin Groups */}
+      {perGroupBreakdown.length > 0 && (
+        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4 sm:p-5 space-y-3 min-w-0">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="font-bold text-base text-slate-900 dark:text-white">
+              Seus Grupos Monitorados ({perGroupBreakdown.length})
+            </h2>
+            {selectedGroupId !== 'all' && (
+              <button
+                type="button"
+                onClick={() => setSelectedGroupId('all')}
+                className="text-xs font-semibold text-[#15803D] dark:text-emerald-400 hover:underline"
+              >
+                Ver todos os grupos
+              </button>
+            )}
+          </div>
+
+          <div className="divide-y divide-slate-100 dark:divide-slate-800">
+            {perGroupBreakdown.map((g) => {
+              const isSelected = selectedGroupId === g.id;
               return (
-                <g key={idx}>
-                  <line
-                    x1="38"
-                    y1={y}
-                    x2="345"
-                    y2={y}
-                    stroke="#E2E8F0"
-                    strokeDasharray="3 3"
-                  />
-                  <text x="32" y={y + 4} textAnchor="end" fontSize="10" fill="#94A3B8">
-                    {v}
-                  </text>
-                </g>
+                <button
+                  key={g.id}
+                  type="button"
+                  onClick={() => setSelectedGroupId(isSelected ? 'all' : g.id)}
+                  className={`w-full text-left py-3 px-2.5 -mx-2.5 rounded-xl flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 transition-colors ${
+                    isSelected
+                      ? 'bg-emerald-50/80 dark:bg-emerald-950/40'
+                      : 'hover:bg-slate-50 dark:hover:bg-slate-800/50'
+                  }`}
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                      <span className="font-semibold text-sm text-slate-900 dark:text-white truncate">
+                        {g.name}
+                      </span>
+                      <span
+                        className={`text-[10px] font-semibold px-2 py-0.5 rounded-md shrink-0 ${
+                          g.isOwner
+                            ? 'bg-emerald-100 dark:bg-emerald-950 text-[#15803D] dark:text-emerald-400'
+                            : 'bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-300'
+                        }`}
+                      >
+                        {g.isOwner ? 'Dono' : 'Admin'}
+                      </span>
+                      {g.activeForOffers && (
+                        <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 shrink-0">
+                          Disparo ativo
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between sm:justify-end gap-4 text-xs tabular-nums shrink-0">
+                    <div className="font-bold text-slate-900 dark:text-white">
+                      {g.membersCount.toLocaleString('pt-BR')}{' '}
+                      <span className="font-normal text-slate-500">membros</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[#16A34A] font-semibold">+{g.entries}</span>
+                      <span className="text-rose-600 font-semibold">-{g.exits}</span>
+                      <span
+                        className={`font-semibold px-1.5 py-0.5 rounded ${
+                          g.net > 0
+                            ? 'bg-emerald-50 dark:bg-emerald-950/60 text-[#15803D] dark:text-emerald-400'
+                            : g.net < 0
+                            ? 'bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400'
+                            : 'bg-slate-100 dark:bg-slate-800 text-slate-500'
+                        }`}
+                      >
+                        {g.net > 0 ? `+${g.net}` : g.net}
+                      </span>
+                    </div>
+                  </div>
+                </button>
               );
             })}
-            <path d={areaPath} fill="url(#memberGrad)" />
-            <path
-              d={linePath}
-              fill="none"
-              stroke="#15803D"
-              strokeWidth="3"
-              strokeLinecap="round"
-            />
-            {[0, 2, 4, 6].map((idx) => {
-              const item = dailyFlow[idx];
-              if (!item) return null;
-              const x = Math.round(50 + idx * ((330 - 50) / 6));
-              return (
-                <text key={idx} x={x} y="176" textAnchor="middle" fontSize="10" fill="#64748B">
-                  {item.label}
-                </text>
-              );
-            })}
-          </svg>
-          <div className="flex items-center justify-center gap-4 text-xs text-[#15803D] dark:text-emerald-400 font-medium mt-2">
-            <span>● Total Real de Membros ({totalParticipants})</span>
           </div>
         </div>
+      )}
 
-        {/* Entradas vs Saídas Diárias */}
-        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5">
-          <h2 className="font-bold text-base text-slate-900 dark:text-white mb-4">
-            Entradas vs Saídas Diárias (Tempo Real)
-          </h2>
-          <div className="h-48 flex items-end justify-between gap-2 pt-4 pb-6 px-4 border-b border-slate-100 dark:border-slate-800">
-            {dailyFlow.map((d) => (
-              <div key={d.dateKey} className="flex-1 flex flex-col items-center gap-1.5">
-                <div className="flex items-end gap-1 h-36">
-                  <div
-                    style={{
-                      height: `${d.entries > 0 ? Math.max(6, (d.entries / maxDailyBar) * 135) : 2}px`,
-                    }}
-                    title={`Entradas: ${d.entries}`}
-                    className="w-3 sm:w-4 rounded-t bg-[#16A34A]"
-                  />
-                  <div
-                    style={{
-                      height: `${d.exits > 0 ? Math.max(6, (d.exits / maxDailyBar) * 135) : 2}px`,
-                    }}
-                    title={`Saídas: ${d.exits}`}
-                    className="w-3 sm:w-4 rounded-t bg-[#EF4444]"
-                  />
-                </div>
-                <span className="text-[10px] text-slate-500 tabular-nums">{d.label}</span>
-              </div>
-            ))}
-          </div>
-          <div className="flex items-center justify-center gap-5 text-xs mt-3">
-            <span className="inline-flex items-center gap-1.5 text-[#16A34A] font-medium">
-              <span className="w-3 h-3 rounded-xs bg-[#16A34A]" /> Entradas ({todayStats.entries}{' '}
-              hoje)
-            </span>
-            <span className="inline-flex items-center gap-1.5 text-[#EF4444] font-medium">
-              <span className="w-3 h-3 rounded-xs bg-[#EF4444]" /> Saídas ({todayStats.exits} hoje)
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {/* Padrão por Dia da Semana */}
-      <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 sm:p-6 space-y-6">
-        <h2 className="font-bold text-lg text-slate-900 dark:text-white">
-          Padrão por Dia da Semana (Eventos Reais do WhatsApp)
-        </h2>
-
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Entradas */}
-          <div className="space-y-2.5">
-            <h3 className="text-sm font-semibold text-center text-[#15803D] dark:text-emerald-400">
-              Entradas Registradas
-            </h3>
-            {weekdayPatterns.map((w) => (
-              <div key={w.day} className="flex items-center gap-3">
-                <span className="w-18 text-xs text-slate-600 dark:text-slate-300">{w.day}</span>
-                <div
-                  className={`flex-1 py-2.5 rounded-lg text-center font-bold text-sm tabular-nums ${w.entryShade}`}
-                >
-                  {w.entries}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          {/* Saídas */}
-          <div className="space-y-2.5">
-            <h3 className="text-sm font-semibold text-center text-rose-600 dark:text-rose-400">
-              Saídas Registradas
-            </h3>
-            {weekdayPatterns.map((w) => (
-              <div key={w.day} className="flex items-center gap-3">
-                <span className="w-18 text-xs text-slate-600 dark:text-slate-300">{w.day}</span>
-                <div
-                  className={`flex-1 py-2.5 rounded-lg text-center font-bold text-sm tabular-nums ${w.exitShade}`}
-                >
-                  {w.exits}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          {/* Churn (%) */}
-          <div className="space-y-2.5">
-            <h3 className="text-sm font-semibold text-center text-amber-600 dark:text-amber-400">
-              Taxa de Churn (%)
-            </h3>
-            {weekdayPatterns.map((w) => (
-              <div key={w.day} className="flex items-center gap-3">
-                <span className="w-18 text-xs text-slate-600 dark:text-slate-300">{w.day}</span>
-                <div
-                  className={`flex-1 py-2.5 rounded-lg text-center font-bold text-sm tabular-nums ${w.churnShade}`}
-                >
-                  {w.churnPct}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="rounded-xl bg-sky-50 dark:bg-sky-950/40 border border-sky-200/70 dark:border-sky-800/60 p-4 flex items-start gap-3 text-sm text-sky-900 dark:text-sky-200">
-          <Lightbulb className="w-5 h-5 text-sky-600 dark:text-sky-400 shrink-0 mt-0.5" />
-          <p>
-            <strong>Monitoramento em Tempo Real:</strong> Enquanto sua sessão Baileys estiver
-            conectada, cada entrada e saída de participante nos seus grupos do WhatsApp é
-            registrada automaticamente aqui.
-          </p>
-        </div>
-      </div>
+      {/* All 6 BuboFlow Charts */}
+      <MemberMonitorCharts summary={summary} />
     </div>
   );
 };

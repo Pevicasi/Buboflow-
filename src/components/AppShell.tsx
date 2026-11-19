@@ -330,7 +330,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
   );
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#F4F7F5] dark:bg-slate-950 text-slate-900 dark:text-slate-100">
+    <div className="min-h-screen flex flex-col overflow-x-clip bg-[#F4F7F5] dark:bg-slate-950 text-slate-900 dark:text-slate-100">
       {/* Top Header */}
       <header className="sticky top-0 z-30 h-15 bg-white dark:bg-slate-900 border-b border-slate-200/80 dark:border-slate-800 px-3 sm:px-6 flex items-center justify-between gap-3">
         {/* Left: Hamburger + Brand */}
@@ -514,7 +514,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
         )}
 
         {/* Main Content Viewport */}
-        <main className="flex-1 min-w-0 px-4 py-5 sm:px-6 lg:px-8 max-w-6xl mx-auto w-full">
+        <main className="flex-1 min-w-0 px-3.5 py-5 sm:px-6 lg:px-8 max-w-6xl mx-auto w-full overflow-x-clip">
           {children}
         </main>
       </div>

@@ -106,6 +106,9 @@ export interface DispatchGroup {
   accountName: string;
   remoteJid?: string;
   isChannel?: boolean;
+  isOwner?: boolean;
+  isAdmin?: boolean;
+  isOwnerOrAdmin?: boolean;
   activeForOffers: boolean;
   membersCount: number;
   maxCapacity: number;
@@ -123,15 +126,22 @@ export interface MonitoringGroup {
   remoteJid?: string;
   monitored: boolean;
   capturedToday: number;
+  useGroupImage?: boolean;
+  allowedMarketplaces?: Marketplace[];
 }
 
 export interface SavedGroupPreference {
   activeForOffers?: boolean;
   monitored?: boolean;
+  useGroupImage?: boolean;
+  allowedMarketplaces?: Marketplace[];
   segment?: string;
   inviteUrl?: string;
   isChannel?: boolean;
   isPriorityCapture?: boolean;
+  isOwner?: boolean;
+  isAdmin?: boolean;
+  isOwnerOrAdmin?: boolean;
 }
 
 export interface ScheduledItem {
@@ -159,8 +169,8 @@ export interface DispatchQueue {
 
 export interface TemplateCondition {
   id: string;
-  variable: 'cta_ia' | 'desconto_pct' | 'cupom' | 'info_extra';
-  operator: 'existe' | 'maior_que';
+  variable: 'cta_ia' | 'desconto_pct' | 'cupom' | 'info_extra' | 'espaco';
+  operator: 'existe' | 'nao_existe' | 'maior_que' | 'menor_que' | 'igual_a' | 'sempre';
   compareValue?: number;
   thenText: string;
   elseText?: string;

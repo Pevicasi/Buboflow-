@@ -176,7 +176,8 @@ export function buildMercadoLivreExtensionZip(options: {
   extensionKey: string;
   etiqueta: string;
 }): Buffer {
-  const cleanServerUrl = String(options.serverUrl || '').trim().replace(/\/+$/, '');
+  const rawServerUrl = String(options.serverUrl || '').trim().replace(/\/+$/, '');
+  const cleanServerUrl = rawServerUrl.replace(/^http:\/\/([^/]+\.run\.app)/i, 'https://$1');
   const cleanKey = String(options.extensionKey || '').trim();
   const cleanTag = String(options.etiqueta || '').trim();
 
@@ -186,20 +187,42 @@ export function buildMercadoLivreExtensionZip(options: {
     'https://meli.la/*',
     'https://*.run.app/*',
     'http://localhost/*',
+    'http://127.0.0.1/*',
   ];
   if (cleanServerUrl && !hostPerms.includes(`${cleanServerUrl}/*`)) {
     hostPerms.push(`${cleanServerUrl}/*`);
+  }
+
+  const contentMatches = [
+    'https://*.run.app/*',
+    'http://localhost/*',
+    'http://127.0.0.1/*',
+  ];
+  if (
+    cleanServerUrl &&
+    !/^https:\/\/[^/]+\.run\.app$/i.test(cleanServerUrl) &&
+    !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(cleanServerUrl)
+  ) {
+    contentMatches.push(`${cleanServerUrl}/*`);
   }
 
   const manifestJson = JSON.stringify(
     {
       manifest_version: 3,
       name: 'Conector Mercado Livre Afiliados',
-      version: '1.0.0',
+      version: '1.1.0',
       description:
         'Sincroniza sua sessão do Mercado Livre com o painel e gera links curtos /sec/ automaticamente no PC ou no Lemur Browser (Android).',
       permissions: ['cookies', 'storage', 'alarms', 'activeTab', 'tabs'],
       host_permissions: hostPerms,
+      content_scripts: [
+        {
+          matches: contentMatches,
+          all_frames: true,
+          run_at: 'document_idle',
+          js: ['content_bridge.js'],
+        },
+      ],
       action: {
         default_popup: 'popup.html',
         default_title: 'Conector Mercado Livre',
@@ -232,6 +255,175 @@ export function buildMercadoLivreExtensionZip(options: {
     2
   );
 
+  const contentBridgeJs = `(() => {
+  if (window.__buboflowBridgeInstalled) return;
+  window.__buboflowBridgeInstalled = true;
+
+  function isBuboFlowPanel() {
+    return document.documentElement?.dataset?.buboflowPanel === '1';
+  }
+
+  function readPanelConfig() {
+    const ds = document.documentElement?.dataset || {};
+    return {
+      serverUrl: window.location.origin.replace(/\\/+$/, ''),
+      extensionKey: String(ds.buboflowMlKey || '').trim(),
+      etiqueta: String(ds.buboflowMlTag || '').trim(),
+    };
+  }
+
+  let announcedReady = false;
+  let lastReportedSig = '';
+
+  function announceAndReport(triggerAutoSync) {
+    if (!isBuboFlowPanel()) return;
+    const cfg = readPanelConfig();
+    if (!announcedReady) {
+      announcedReady = true;
+      window.postMessage(
+        { source: 'buboflow-extension', type: 'EXTENSION_READY', version: '1.1.0' },
+        '*'
+      );
+    }
+    const sig = cfg.serverUrl + '|' + cfg.extensionKey + '|' + cfg.etiqueta;
+    if (cfg.extensionKey && (sig !== lastReportedSig || triggerAutoSync)) {
+      lastReportedSig = sig;
+      try {
+        chrome.runtime.sendMessage(
+          {
+            type: 'PANEL_DETECTED',
+            payload: cfg,
+            autoSync: Boolean(triggerAutoSync),
+          },
+          () => {
+            void chrome.runtime.lastError;
+          }
+        );
+      } catch {}
+    }
+  }
+
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    const data = event.data;
+    if (!data || data.source !== 'buboflow-panel') return;
+
+    if (data.type === 'PANEL_CONFIG' || data.type === 'EXTENSION_PING') {
+      announcedReady = false;
+      announceAndReport(data.type === 'PANEL_CONFIG');
+      return;
+    }
+
+    if (data.type === 'REQUEST_SYNC') {
+      const cfg = readPanelConfig();
+      const payload = {
+        serverUrl: cfg.serverUrl,
+        extensionKey: String(data.extensionKey || cfg.extensionKey || '').trim(),
+        etiqueta: String(data.etiqueta || cfg.etiqueta || '').trim(),
+      };
+      try {
+        chrome.runtime.sendMessage({ type: 'SYNC_NOW', payload }, (res) => {
+          void chrome.runtime.lastError;
+          window.postMessage(
+            {
+              source: 'buboflow-extension',
+              type: 'ML_SYNC_RESULT',
+              ok: Boolean(res?.ok),
+              hasSsid: Boolean(res?.hasSsid),
+              cookiesCount: Number(res?.cookiesCount || 0),
+              extensionKey: res?.extensionKey || payload.extensionKey,
+              error: res?.error || null,
+            },
+            '*'
+          );
+        });
+      } catch {}
+    }
+  });
+
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (!isBuboFlowPanel()) {
+      return false;
+    }
+
+    if (msg?.type === 'GET_PANEL_CONFIG') {
+      sendResponse({ ok: true, ...readPanelConfig() });
+      return false;
+    }
+
+    if (msg?.type === 'RELAY_FETCH') {
+      (async () => {
+        try {
+          const path = String(msg.path || '');
+          const res = await fetch(path, {
+            method: msg.method || 'POST',
+            credentials: 'same-origin',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            body: msg.body !== undefined ? JSON.stringify(msg.body) : undefined,
+          });
+          const contentType = res.headers.get('content-type') || '';
+          const text = await res.text();
+          let json = null;
+          if (contentType.includes('application/json') || text.trim().startsWith('{')) {
+            try {
+              json = JSON.parse(text);
+            } catch {}
+          }
+          if (!res.ok || !json) {
+            sendResponse({
+              ok: false,
+              status: res.status,
+              error:
+                json?.error ||
+                ('O painel respondeu HTTP ' + res.status + ' (resposta não-JSON).'),
+            });
+            return;
+          }
+          if (path.includes('/api/mercadolivre/extension/sync') && json.ok) {
+            window.postMessage(
+              {
+                source: 'buboflow-extension',
+                type: 'ML_SYNC_RESULT',
+                ok: true,
+                hasSsid: Boolean(json.hasSsid),
+                cookiesCount: Number(json.cookiesCount || 0),
+                extensionKey: json.extensionKey || msg.body?.extensionKey || '',
+              },
+              '*'
+            );
+          }
+          sendResponse({ ok: true, status: res.status, json });
+        } catch (err) {
+          sendResponse({
+            ok: false,
+            error: err?.message || 'Erro de rede ao enviar pelo painel.',
+          });
+        }
+      })();
+      return true;
+    }
+
+    return false;
+  });
+
+  const observer = new MutationObserver(() => {
+    if (isBuboFlowPanel()) {
+      announceAndReport(false);
+    }
+  });
+  observer.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['data-buboflow-panel', 'data-buboflow-ml-key', 'data-buboflow-ml-tag'],
+  });
+
+  setTimeout(() => announceAndReport(true), 250);
+  setTimeout(() => announceAndReport(false), 1500);
+})();
+`;
+
   const backgroundJs = `const DEFAULT_CONFIG = {
   serverUrl: ${JSON.stringify(cleanServerUrl)},
   extensionKey: ${JSON.stringify(cleanKey)},
@@ -240,24 +432,189 @@ export function buildMercadoLivreExtensionZip(options: {
 
 let pollTimer = null;
 
+function normalizeServerUrl(raw) {
+  let u = String(raw || '').trim().replace(/\\/+$/, '');
+  if (!u) return '';
+  if (!/^https?:\\/\\//i.test(u)) {
+    u = /^(localhost|127\\.0\\.0\\.1)(:\\d+)?/i.test(u) ? 'http://' + u : 'https://' + u;
+  }
+  // Cloud Run / AI Studio preview URLs always require HTTPS (HTTP redirects break POST)
+  u = u.replace(/^http:\\/\\/([^/]+\\.run\\.app)/i, 'https://$1');
+  return u;
+}
+
 async function getConfig() {
   const stored = await chrome.storage.local.get(['serverUrl', 'extensionKey', 'etiqueta']);
   return {
-    serverUrl: (stored.serverUrl || DEFAULT_CONFIG.serverUrl || '').replace(/\\/+$/, ''),
-    extensionKey: (stored.extensionKey || DEFAULT_CONFIG.extensionKey || '').trim(),
-    etiqueta: (stored.etiqueta || DEFAULT_CONFIG.etiqueta || '').trim(),
+    serverUrl: normalizeServerUrl(stored.serverUrl || DEFAULT_CONFIG.serverUrl || ''),
+    extensionKey: String(stored.extensionKey || DEFAULT_CONFIG.extensionKey || '').trim(),
+    etiqueta: String(stored.etiqueta || DEFAULT_CONFIG.etiqueta || '').trim(),
   };
 }
 
 async function saveConfig(partial) {
   const cur = await getConfig();
   const next = {
-    serverUrl: (partial.serverUrl !== undefined ? partial.serverUrl : cur.serverUrl).replace(/\\/+$/, ''),
-    extensionKey: (partial.extensionKey !== undefined ? partial.extensionKey : cur.extensionKey).trim(),
-    etiqueta: (partial.etiqueta !== undefined ? partial.etiqueta : cur.etiqueta).trim(),
+    serverUrl: normalizeServerUrl(
+      partial.serverUrl !== undefined ? partial.serverUrl : cur.serverUrl
+    ),
+    extensionKey: String(
+      partial.extensionKey !== undefined ? partial.extensionKey : cur.extensionKey
+    ).trim(),
+    etiqueta: String(
+      partial.etiqueta !== undefined ? partial.etiqueta : cur.etiqueta
+    ).trim(),
   };
   await chrome.storage.local.set(next);
   return next;
+}
+
+async function rememberPanelFrame(tabId, frameId, cfg) {
+  if (typeof tabId !== 'number') return;
+  await chrome.storage.local.set({
+    lastPanelFrame: {
+      tabId,
+      frameId: typeof frameId === 'number' ? frameId : 0,
+      serverUrl: normalizeServerUrl(cfg?.serverUrl || ''),
+      seenAt: Date.now(),
+    },
+  });
+}
+
+function sendTabMessageSafe(tabId, message, frameId) {
+  return new Promise((resolve) => {
+    try {
+      const cb = (resp) => {
+        if (chrome.runtime.lastError) {
+          resolve(null);
+          return;
+        }
+        resolve(resp || null);
+      };
+      if (typeof frameId === 'number') {
+        chrome.tabs.sendMessage(tabId, message, { frameId }, cb);
+      } else {
+        chrome.tabs.sendMessage(tabId, message, cb);
+      }
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function findLivePanelTarget() {
+  const stored = await chrome.storage.local.get(['lastPanelFrame']);
+  const saved = stored.lastPanelFrame;
+  if (saved && typeof saved.tabId === 'number') {
+    const ping = await sendTabMessageSafe(
+      saved.tabId,
+      { type: 'GET_PANEL_CONFIG' },
+      saved.frameId
+    );
+    if (ping?.ok && ping.serverUrl) {
+      return {
+        tabId: saved.tabId,
+        frameId: saved.frameId,
+        config: {
+          serverUrl: normalizeServerUrl(ping.serverUrl),
+          extensionKey: String(ping.extensionKey || '').trim(),
+          etiqueta: String(ping.etiqueta || '').trim(),
+        },
+      };
+    }
+  }
+
+  try {
+    const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const allTabs = await chrome.tabs.query({});
+    const seen = new Set();
+    const ordered = [...activeTabs, ...allTabs].filter((t) => {
+      if (!t || typeof t.id !== 'number' || seen.has(t.id)) return false;
+      seen.add(t.id);
+      return true;
+    });
+
+    for (const tab of ordered) {
+      const ping = await sendTabMessageSafe(tab.id, { type: 'GET_PANEL_CONFIG' });
+      if (ping?.ok && ping.serverUrl) {
+        const foundCfg = {
+          serverUrl: normalizeServerUrl(ping.serverUrl),
+          extensionKey: String(ping.extensionKey || '').trim(),
+          etiqueta: String(ping.etiqueta || '').trim(),
+        };
+        await rememberPanelFrame(tab.id, undefined, foundCfg);
+        return { tabId: tab.id, frameId: undefined, config: foundCfg };
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
+async function postToPanelServer(path, body, serverUrl, liveTarget) {
+  const target = liveTarget || (await findLivePanelTarget());
+  if (target) {
+    const relayed = await sendTabMessageSafe(
+      target.tabId,
+      { type: 'RELAY_FETCH', path, method: 'POST', body },
+      target.frameId
+    );
+    if (relayed && relayed.ok && relayed.json) {
+      return {
+        ok: true,
+        json: relayed.json,
+        via: 'panel_bridge',
+        serverUrl: target.config.serverUrl,
+      };
+    }
+  }
+
+  const cleanUrl = normalizeServerUrl(serverUrl);
+  if (!cleanUrl) {
+    return { ok: false, error: 'URL do painel não configurada.' };
+  }
+
+  try {
+    const res = await fetch(cleanUrl + path, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    const contentType = res.headers.get('content-type') || '';
+    const text = await res.text();
+    let json = null;
+    if (contentType.includes('application/json') || text.trim().startsWith('{')) {
+      try {
+        json = JSON.parse(text);
+      } catch {}
+    }
+
+    if (!res.ok || !json) {
+      const isHtml = /<html|<!doctype/i.test(text);
+      return {
+        ok: false,
+        error: isHtml
+          ? 'O endereço do painel exigiu login ou expirou (HTTP ' +
+            res.status +
+            '). Deixe o painel aberto neste navegador e toque em Sincronizar novamente.'
+          : json?.error ||
+            'Servidor retornou HTTP ' + res.status + '. Verifique a URL do painel.',
+      };
+    }
+
+    return { ok: true, json, via: 'direct', serverUrl: cleanUrl };
+  } catch (err) {
+    return {
+      ok: false,
+      error:
+        (err?.message || 'Erro de rede') +
+        ' — verifique se a URL do painel começa com https:// e está aberta neste navegador.',
+    };
+  }
 }
 
 async function readMercadoLivreCookies() {
@@ -381,11 +738,25 @@ async function createShortLinkInBrowser(targetUrl, overrideTag) {
   };
 }
 
-async function syncSessionWithServer() {
-  const cfg = await getConfig();
-  if (!cfg.serverUrl || !cfg.extensionKey) {
-    return { ok: false, error: 'Configure a URL do painel e a Chave de Conexão.' };
+async function syncSessionWithServer(preferLivePanel = true) {
+  let cfg = await getConfig();
+  const liveTarget = await findLivePanelTarget();
+
+  if (liveTarget?.config?.serverUrl && preferLivePanel) {
+    cfg = await saveConfig({
+      serverUrl: liveTarget.config.serverUrl,
+      extensionKey: liveTarget.config.extensionKey || cfg.extensionKey,
+      etiqueta: liveTarget.config.etiqueta || cfg.etiqueta,
+    });
   }
+
+  if (!cfg.serverUrl || !cfg.extensionKey) {
+    return {
+      ok: false,
+      error: 'Abra o painel neste navegador ou preencha a URL (https://...) e a Chave.',
+    };
+  }
+
   const cookieData = await readMercadoLivreCookies();
   const payload = {
     extensionKey: cfg.extensionKey,
@@ -394,58 +765,74 @@ async function syncSessionWithServer() {
     cookiesCount: cookieData.cookiesCount,
     hasSsid: cookieData.hasSsid,
     mlUserId: cookieData.mlUserId,
-    browserName: navigator.userAgent.includes('Android') ? 'Android Extension Browser' : 'Desktop Chrome',
+    browserName: navigator.userAgent.includes('Android')
+      ? 'Android Extension Browser'
+      : 'Desktop Chrome',
     syncedAt: new Date().toISOString(),
   };
-  try {
-    const res = await fetch(cfg.serverUrl + '/api/mercadolivre/extension/sync', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const json = await res.json();
-    await chrome.storage.local.set({
-      lastSyncAt: new Date().toISOString(),
-      lastSyncOk: Boolean(json.ok),
-      lastHasSsid: cookieData.hasSsid,
-      lastCookiesCount: cookieData.cookiesCount,
-    });
-    return {
-      ok: Boolean(json.ok),
-      hasSsid: cookieData.hasSsid,
-      cookiesCount: cookieData.cookiesCount,
-      mlUserId: cookieData.mlUserId,
-      error: json.error,
-    };
-  } catch (err) {
-    return { ok: false, error: err?.message || 'Erro ao conectar com o servidor do painel.' };
-  }
+
+  const result = await postToPanelServer(
+    '/api/mercadolivre/extension/sync',
+    payload,
+    cfg.serverUrl,
+    liveTarget
+  );
+
+  const ok = Boolean(result.ok && result.json?.ok);
+  const errorMsg = ok ? null : result.json?.error || result.error || 'Falha ao sincronizar.';
+
+  await chrome.storage.local.set({
+    lastSyncAt: new Date().toISOString(),
+    lastSyncOk: ok,
+    lastSyncError: errorMsg,
+    lastSyncServerUrl: result.serverUrl || cfg.serverUrl,
+    lastSyncVia: result.via || null,
+    lastHasSsid: cookieData.hasSsid,
+    lastCookiesCount: cookieData.cookiesCount,
+  });
+
+  return {
+    ok,
+    hasSsid: cookieData.hasSsid,
+    cookiesCount: cookieData.cookiesCount,
+    mlUserId: cookieData.mlUserId,
+    extensionKey: cfg.extensionKey,
+    etiqueta: cfg.etiqueta,
+    serverUrl: result.serverUrl || cfg.serverUrl,
+    via: result.via || null,
+    error: errorMsg,
+  };
 }
 
 async function pollServerBridgeJobs() {
   const cfg = await getConfig();
   if (!cfg.serverUrl || !cfg.extensionKey) return;
   try {
-    const res = await fetch(cfg.serverUrl + '/api/mercadolivre/extension/poll', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ extensionKey: cfg.extensionKey }),
-    });
-    if (!res.ok) return;
-    const json = await res.json();
+    const liveTarget = await findLivePanelTarget();
+    const pollKey = liveTarget?.config?.extensionKey || cfg.extensionKey;
+    const pollUrl = liveTarget?.config?.serverUrl || cfg.serverUrl;
+    const res = await postToPanelServer(
+      '/api/mercadolivre/extension/poll',
+      { extensionKey: pollKey },
+      pollUrl,
+      liveTarget
+    );
+    if (!res.ok || !res.json) return;
+    const json = res.json;
     if (json && json.job && json.job.id && json.job.url) {
       const conv = await createShortLinkInBrowser(json.job.url, json.job.etiqueta);
-      await fetch(cfg.serverUrl + '/api/mercadolivre/extension/job-result', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          extensionKey: cfg.extensionKey,
+      await postToPanelServer(
+        '/api/mercadolivre/extension/job-result',
+        {
+          extensionKey: pollKey,
           jobId: json.job.id,
           ok: conv.ok,
           shortUrl: conv.shortUrl || null,
           error: conv.error || null,
-        }),
-      });
+        },
+        pollUrl,
+        liveTarget
+      );
     }
   } catch {}
 }
@@ -458,59 +845,103 @@ function scheduleBridgeHeartbeat() {
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
-  const cur = await chrome.storage.local.get(['serverUrl', 'extensionKey', 'etiqueta']);
   await chrome.storage.local.set({
-    serverUrl: cur.serverUrl || DEFAULT_CONFIG.serverUrl,
-    extensionKey: cur.extensionKey || DEFAULT_CONFIG.extensionKey,
-    etiqueta: cur.etiqueta || DEFAULT_CONFIG.etiqueta,
+    serverUrl: normalizeServerUrl(DEFAULT_CONFIG.serverUrl),
+    extensionKey: DEFAULT_CONFIG.extensionKey,
+    etiqueta: DEFAULT_CONFIG.etiqueta,
+    lastSyncOk: false,
+    lastSyncError: null,
   });
   chrome.alarms.create('ml_sync_alarm', { periodInMinutes: 1 });
   scheduleBridgeHeartbeat();
-  void syncSessionWithServer();
+  void syncSessionWithServer(true);
 });
 
 chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create('ml_sync_alarm', { periodInMinutes: 1 });
   scheduleBridgeHeartbeat();
-  void syncSessionWithServer();
+  void syncSessionWithServer(true);
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'ml_sync_alarm') {
     scheduleBridgeHeartbeat();
-    void syncSessionWithServer();
+    void syncSessionWithServer(true);
     void pollServerBridgeJobs();
   }
 });
 
 scheduleBridgeHeartbeat();
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
-    if (msg?.type === 'GET_STATE') {
-      const cfg = await getConfig();
-      const cookies = await readMercadoLivreCookies();
-      const meta = await chrome.storage.local.get(['lastSyncAt', 'lastSyncOk']);
-      sendResponse({ ok: true, config: cfg, cookies, meta });
+    if (msg?.type === 'PANEL_DETECTED' && msg.payload?.serverUrl) {
+      const next = await saveConfig({
+        serverUrl: msg.payload.serverUrl,
+        extensionKey: msg.payload.extensionKey || undefined,
+        etiqueta: msg.payload.etiqueta || undefined,
+      });
+      await rememberPanelFrame(sender?.tab?.id, sender?.frameId, next);
+      if (msg.autoSync) {
+        void syncSessionWithServer(true);
+      }
+      sendResponse({ ok: true, config: next });
       return;
     }
+
+    if (msg?.type === 'GET_STATE') {
+      const liveTarget = await findLivePanelTarget();
+      if (liveTarget?.config?.serverUrl) {
+        await saveConfig({
+          serverUrl: liveTarget.config.serverUrl,
+          extensionKey: liveTarget.config.extensionKey || undefined,
+          etiqueta: liveTarget.config.etiqueta || undefined,
+        });
+      }
+      const cfg = await getConfig();
+      const cookies = await readMercadoLivreCookies();
+      const meta = await chrome.storage.local.get([
+        'lastSyncAt',
+        'lastSyncOk',
+        'lastSyncError',
+        'lastSyncServerUrl',
+        'lastSyncVia',
+      ]);
+      sendResponse({
+        ok: true,
+        config: cfg,
+        cookies,
+        meta,
+        panelDetected: Boolean(liveTarget),
+      });
+      return;
+    }
+
     if (msg?.type === 'SAVE_CONFIG') {
       const next = await saveConfig(msg.payload || {});
       sendResponse({ ok: true, config: next });
       return;
     }
+
     if (msg?.type === 'SYNC_NOW') {
-      if (msg.payload) await saveConfig(msg.payload);
-      const result = await syncSessionWithServer();
+      const liveTarget = await findLivePanelTarget();
+      if (msg.payload) {
+        await saveConfig(msg.payload);
+      }
+      // If the live panel is open right behind the popup, prefer its live origin & key when stored ones are stale
+      const preferLive = Boolean(liveTarget?.config?.serverUrl);
+      const result = await syncSessionWithServer(preferLive);
       void pollServerBridgeJobs();
       sendResponse(result);
       return;
     }
+
     if (msg?.type === 'CONVERT_URL') {
       const conv = await createShortLinkInBrowser(msg.url, msg.etiqueta);
       sendResponse(conv);
       return;
     }
+
     sendResponse({ ok: false, error: 'Ação desconhecida' });
   })();
   return true;
@@ -527,17 +958,21 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
     body { margin: 0; padding: 14px; width: 340px; background: #f8fafc; color: #0f172a; }
     .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 14px; }
-    .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+    .head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
     .title { font-size: 14px; font-weight: 700; }
-    .badge { font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 8px; }
+    .badge { font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 8px; white-space: nowrap; }
     .ok { background: #dcfce7; color: #166534; }
     .warn { background: #fef3c7; color: #92400e; }
+    .err { background: #fee2e2; color: #991b1b; }
     label { display: block; font-size: 11px; font-weight: 600; color: #475569; margin: 8px 0 4px; }
     input { width: 100%; padding: 8px 10px; border-radius: 10px; border: 1px solid #cbd5e1; font-size: 12px; font-family: monospace; }
     button { width: 100%; margin-top: 8px; padding: 10px 12px; border: 0; border-radius: 10px; font-size: 12px; font-weight: 700; cursor: pointer; }
     .btn-primary { background: #15803d; color: #fff; }
+    .btn-primary:disabled { opacity: 0.6; }
     .btn-secondary { background: #f1f5f9; color: #0f172a; border: 1px solid #cbd5e1; }
     .status { margin-top: 10px; font-size: 11px; line-height: 1.45; padding: 8px 10px; border-radius: 10px; background: #f1f5f9; color: #334155; word-break: break-word; }
+    .status.ok { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
+    .status.err { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
     .link-out { margin-top: 8px; padding: 8px; border-radius: 8px; background: #ecfdf5; border: 1px solid #a7f3d0; font-family: monospace; font-size: 11px; color: #065f46; word-break: break-all; display: none; }
   </style>
 </head>
@@ -571,8 +1006,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   const popupJs = `const $ = (id) => document.getElementById(id);
 
-function setStatus(text) {
-  $('statusBox').textContent = text;
+function setStatus(text, tone = '') {
+  const el = $('statusBox');
+  el.textContent = text;
+  el.className = 'status' + (tone ? ' ' + tone : '');
 }
 
 function updateBadge(hasSsid, cookiesCount) {
@@ -589,7 +1026,7 @@ function updateBadge(hasSsid, cookiesCount) {
 async function init() {
   const resp = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
   if (!resp || !resp.ok) {
-    setStatus('Erro ao iniciar extensão.');
+    setStatus('Erro ao iniciar extensão.', 'err');
     return;
   }
   $('extensionKey').value = resp.config.extensionKey || '';
@@ -597,11 +1034,31 @@ async function init() {
   $('serverUrl').value = resp.config.serverUrl || '';
   updateBadge(resp.cookies.hasSsid, resp.cookies.cookiesCount);
 
+  if (resp.meta?.lastSyncOk && resp.meta?.lastSyncAt) {
+    const sameServer =
+      !resp.meta.lastSyncServerUrl ||
+      resp.meta.lastSyncServerUrl === resp.config.serverUrl;
+    if (sameServer && resp.cookies.hasSsid) {
+      setStatus(
+        'Sincronizado com o painel às ' +
+          new Date(resp.meta.lastSyncAt).toLocaleTimeString('pt-BR') +
+          (resp.panelDetected ? ' (Painel detectado automaticamente).' : '.'),
+        'ok'
+      );
+      return;
+    }
+  }
+
+  if (resp.meta?.lastSyncError) {
+    setStatus('Última tentativa falhou: ' + resp.meta.lastSyncError, 'err');
+    return;
+  }
+
   if (resp.cookies.hasSsid) {
     setStatus(
-      resp.meta?.lastSyncAt
-        ? 'Sessão Mercado Livre pronta! Última sincronização: ' + new Date(resp.meta.lastSyncAt).toLocaleTimeString('pt-BR')
-        : 'Conta Mercado Livre detectada! Toque em "Sincronizar Sessão Agora".'
+      resp.panelDetected
+        ? 'Painel e conta ML detectados! Toque em "Sincronizar Sessão Agora".'
+        : 'Conta Mercado Livre detectada! Abra o painel neste navegador e toque em "Sincronizar Sessão Agora".'
     );
   } else {
     setStatus('Toque em "Abrir Mercado Livre Afiliados", entre na sua conta e depois toque em "Sincronizar Sessão Agora".');
@@ -620,16 +1077,22 @@ $('btnSync').addEventListener('click', async () => {
         serverUrl: $('serverUrl').value.trim(),
       },
     });
+    if (res?.extensionKey) $('extensionKey').value = res.extensionKey;
+    if (res?.etiqueta) $('etiqueta').value = res.etiqueta;
+    if (res?.serverUrl) $('serverUrl').value = res.serverUrl;
     updateBadge(Boolean(res?.hasSsid), Number(res?.cookiesCount || 0));
     if (res?.ok) {
       setStatus(
         res.hasSsid
-          ? 'Conectado e sincronizado com sucesso! Agora o painel pode usar sua sessão do Mercado Livre.'
-          : 'Conectado ao painel, mas o login do Mercado Livre ainda não foi detectado neste navegador.'
+          ? 'Conectado e sincronizado com sucesso! O painel já recebeu sua sessão do Mercado Livre.'
+          : 'Conectado ao painel, mas o login do Mercado Livre ainda não foi detectado neste navegador.',
+        res.hasSsid ? 'ok' : ''
       );
     } else {
-      setStatus('Falha ao sincronizar: ' + (res?.error || 'Verifique a URL do painel.'));
+      setStatus('Falha ao sincronizar: ' + (res?.error || 'Verifique a URL do painel (https://).'), 'err');
     }
+  } catch (err) {
+    setStatus('Erro ao comunicar com a extensão: ' + (err?.message || 'recarregue a extensão.'), 'err');
   } finally {
     $('btnSync').disabled = false;
   }
@@ -658,39 +1121,42 @@ $('btnConvertTab').addEventListener('click', async () => {
     out.textContent = res.shortUrl;
     try {
       await navigator.clipboard.writeText(res.shortUrl);
-      setStatus('Link /sec/ gerado e copiado!');
+      setStatus('Link /sec/ gerado e copiado!', 'ok');
     } catch {
-      setStatus('Link /sec/ gerado com sucesso!');
+      setStatus('Link /sec/ gerado com sucesso!', 'ok');
     }
   } else {
-    setStatus(res?.error || 'Não foi possível gerar o link /sec/. Verifique se está inscrito no Mercado Livre Afiliados.');
+    setStatus(
+      res?.error || 'Não foi possível gerar o link /sec/. Verifique se está inscrito no Mercado Livre Afiliados.',
+      'err'
+    );
   }
 });
 
 void init();
 `;
 
-  const readmeTxt = `CONECTOR MERCADO LIVRE AFILIADOS (PC & ANDROID LEMUR BROWSER)
-=============================================================
+  const readmeTxt = `CONECTOR MERCADO LIVRE AFILIADOS v1.1.0 (PC & ANDROID LEMUR BROWSER)
+====================================================================
 
-COMO TESTAR NO CELULAR ANDROID (SEM PC):
-1. Instale o navegador "Lemur Browser" na Google Play Store.
-2. Abra o link deste aplicativo no Lemur Browser e baixe este arquivo .zip.
-3. No Lemur Browser, toque no menu de Extensões -> ative o "Modo Desenvolvedor".
-4. Toque em "+ (from .zip/.crx)" ou "Carregar compactada" e selecione este .zip.
-5. Abra a extensão, toque em "Abrir Mercado Livre Afiliados", faça login na sua conta e toque em "Sincronizar Sessão Agora".
-6. Pronto! Você já pode voltar para o Chrome normal ou continuar usando no painel.
+COMO INSTALAR/ATUALIZAR NO CELULAR ANDROID (LEMUR BROWSER):
+1. Abra o painel no Lemur Browser e toque em "Baixar Extensão (.zip)".
+2. No Lemur Browser, vá em Extensões -> remova a versão antiga (se houver).
+3. Ative o "Modo Desenvolvedor", toque em "+ (from .zip/.crx)" e selecione o novo .zip.
+4. Volte para a aba do painel — a extensão detecta automaticamente a URL e a Chave ativas!
+5. Abra a extensão e toque em "Sincronizar Sessão Agora" (ou clique em "Sincronizar agora" direto no painel).
 
-COMO TESTAR NO PC (GOOGLE CHROME):
+COMO INSTALAR NO PC (GOOGLE CHROME):
 1. Descompacte este arquivo .zip em uma pasta.
 2. Acesse chrome://extensions e ative o "Modo do desenvolvedor".
 3. Clique em "Carregar sem compactação" e escolha a pasta descompactada.
-4. Clique no ícone da extensão e toque em "Sincronizar Sessão Agora".
+4. Deixe o painel aberto e clique em "Sincronizar Sessão Agora".
 `;
 
   return createZipBuffer([
     { name: 'manifest.json', data: manifestJson },
     { name: 'config.json', data: configJson },
+    { name: 'content_bridge.js', data: contentBridgeJs },
     { name: 'background.js', data: backgroundJs },
     { name: 'popup.html', data: popupHtml },
     { name: 'popup.js', data: popupJs },

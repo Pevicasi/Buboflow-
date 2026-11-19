@@ -134,7 +134,7 @@ export const WhatsAppMockup: React.FC<WhatsAppMockupProps> = ({
                   artworkKey={artworkKey || 'sneaker'}
                   customImageUrl={customImageUrl}
                   alt="Imagem da oferta"
-                  className="w-full h-40"
+                  className="w-full h-48 p-1.5"
                 />
                 {enableLinkPreview && (
                   <div className="bg-[#CFE9C8] px-2.5 py-1.5 text-[11px] text-slate-600 font-mono truncate">

@@ -7,3 +7,5 @@ coverage/
 .env*
 !.env.example
 .wa_sessions/
+.playwright-cli/
+public/assets/aistudio/
