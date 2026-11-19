@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AutoDispatchConfig,
   ChannelAccount,
@@ -51,6 +51,23 @@ import {
   saveLocalSessionBackups,
   savePanelStateApi,
 } from '../utils/apiClient';
+import {
+  DEFAULT_SEGMENT,
+  createDefaultAutoDispatchForSegment,
+  createDefaultMonitoringRulesForSegment,
+  createDefaultSiteCaptureForSegment,
+  createDefaultTemplatesForSegment,
+  dedupeSegmentNames,
+  deleteSegmentFromMap,
+  getGroupActiveSegments,
+  getGroupMonitoredSegments,
+  isGroupActiveInSegment,
+  normalizeSegmentName,
+  removeSegmentFromList,
+  renameSegmentInMap,
+  replaceSegmentInList,
+  resolveSegmentConfig,
+} from '../utils/segmentScoping';
 
 const STORAGE_KEY = 'buboflow_panel_state_v1';
 const SERVER_MIGRATED_KEY = 'buboflow_server_synced_v6';
@@ -121,11 +138,16 @@ function dedupeDispatchGroups(list: DispatchGroup[]): DispatchGroup[] {
     if (!existing) {
       byKey.set(key, normalized);
     } else {
+      const mergedActiveSegments = dedupeSegmentNames([
+        ...getGroupActiveSegments(existing),
+        ...getGroupActiveSegments(normalized),
+      ]);
       byKey.set(key, {
         ...existing,
         ...normalized,
         id: normalized.id || existing.id,
-        activeForOffers: Boolean(existing.activeForOffers || normalized.activeForOffers),
+        activeForOffers: mergedActiveSegments.length > 0,
+        activeSegments: mergedActiveSegments,
         isPriorityCapture: Boolean(existing.isPriorityCapture || normalized.isPriorityCapture),
         isChannel: Boolean(existing.isChannel || normalized.isChannel),
         isOwner: normalized.isOwner ?? existing.isOwner,
@@ -157,11 +179,16 @@ function dedupeMonitoringGroups(list: MonitoringGroup[]): MonitoringGroup[] {
     if (!existing) {
       byKey.set(key, normalized);
     } else {
+      const mergedMonSegments = dedupeSegmentNames([
+        ...getGroupMonitoredSegments(existing),
+        ...getGroupMonitoredSegments(normalized),
+      ]);
       byKey.set(key, {
         ...existing,
         ...normalized,
         id: normalized.id || existing.id,
-        monitored: Boolean(existing.monitored || normalized.monitored),
+        monitored: mergedMonSegments.length > 0,
+        monitoredSegments: mergedMonSegments,
         capturedToday: Math.max(existing.capturedToday || 0, normalized.capturedToday || 0),
       });
     }
@@ -200,6 +227,10 @@ interface PersistedState {
   siteCapture: SiteCaptureConfig;
   integrations: PlatformIntegrations;
   monitoringRules: MonitoringRulesConfig;
+  autoDispatchBySegment?: Record<string, AutoDispatchConfig>;
+  templatesBySegment?: Record<string, MessageTemplate[]>;
+  siteCaptureBySegment?: Record<string, SiteCaptureConfig>;
+  monitoringRulesBySegment?: Record<string, MonitoringRulesConfig>;
   profile: UserProfile;
 }
 
@@ -208,7 +239,7 @@ const DEFAULT_PERSISTED: PersistedState = {
   stripFictionalProductsV6: true,
   darkMode: false,
   segments: INITIAL_SEGMENTS,
-  activeSegment: 'Geral',
+  activeSegment: DEFAULT_SEGMENT,
   totalSentCount: 0,
   accounts: INITIAL_ACCOUNTS,
   dispatchGroups: INITIAL_DISPATCH_GROUPS,
@@ -225,6 +256,10 @@ const DEFAULT_PERSISTED: PersistedState = {
   siteCapture: INITIAL_SITE_CAPTURE,
   integrations: INITIAL_INTEGRATIONS,
   monitoringRules: INITIAL_MONITORING_RULES,
+  autoDispatchBySegment: { [DEFAULT_SEGMENT]: INITIAL_AUTO_DISPATCH },
+  templatesBySegment: { [DEFAULT_SEGMENT]: INITIAL_TEMPLATES },
+  siteCaptureBySegment: { [DEFAULT_SEGMENT]: INITIAL_SITE_CAPTURE },
+  monitoringRulesBySegment: { [DEFAULT_SEGMENT]: INITIAL_MONITORING_RULES },
   profile: INITIAL_PROFILE,
 };
 
@@ -269,6 +304,7 @@ export interface AppContextValue extends PersistedState {
     customImageUrl?: string;
     enableLinkPreview?: boolean;
     mentionAll?: boolean;
+    segment?: string;
   }) => Promise<{ ok: boolean; sentCount: number; message: string; error?: string }>;
   getTemplateForPlatform: (platform: Marketplace) => MessageTemplate;
   toasts: ToastMessage[];
@@ -318,10 +354,16 @@ function sanitizePersistedState(
     const key = canonicalGroupKey(g.channel, g.remoteJid);
     if (!key) continue;
     const prev = merged.savedGroupPrefs[key] || {};
+    const resolvedActiveSegs = Array.isArray(g.activeSegments)
+      ? dedupeSegmentNames(g.activeSegments)
+      : Array.isArray(prev.activeSegments)
+      ? dedupeSegmentNames(prev.activeSegments)
+      : dedupeSegmentNames([...getGroupActiveSegments(prev), ...getGroupActiveSegments(g)]);
     merged.savedGroupPrefs[key] = {
       ...prev,
-      activeForOffers: Boolean(prev.activeForOffers || g.activeForOffers),
-      segment: g.segment || prev.segment,
+      activeForOffers: resolvedActiveSegs.length > 0,
+      activeSegments: resolvedActiveSegs,
+      segment: g.segment || prev.segment || DEFAULT_SEGMENT,
       inviteUrl: g.inviteUrl || prev.inviteUrl,
       isChannel: g.isChannel ?? prev.isChannel,
       isPriorityCapture: Boolean(prev.isPriorityCapture || g.isPriorityCapture),
@@ -335,13 +377,46 @@ function sanitizePersistedState(
     const key = canonicalGroupKey(m.channel, m.remoteJid);
     if (!key) continue;
     const prev = merged.savedGroupPrefs[key] || {};
+    const resolvedMonSegs = Array.isArray(m.monitoredSegments)
+      ? dedupeSegmentNames(m.monitoredSegments)
+      : Array.isArray(prev.monitoredSegments)
+      ? dedupeSegmentNames(prev.monitoredSegments)
+      : dedupeSegmentNames([...getGroupMonitoredSegments(prev), ...getGroupMonitoredSegments(m)]);
     merged.savedGroupPrefs[key] = {
       ...prev,
-      monitored: Boolean(prev.monitored || m.monitored),
+      monitored: resolvedMonSegs.length > 0,
+      monitoredSegments: resolvedMonSegs,
       useGroupImage: m.useGroupImage ?? prev.useGroupImage ?? false,
       allowedMarketplaces: m.allowedMarketplaces ?? prev.allowedMarketplaces,
     };
   }
+
+  // Ensure per-segment configuration maps exist and keep 'Geral' synced with legacy fields
+  const geralAuto = parsed.autoDispatchBySegment?.[DEFAULT_SEGMENT] || merged.autoDispatch || INITIAL_AUTO_DISPATCH;
+  const geralTemplates = parsed.templatesBySegment?.[DEFAULT_SEGMENT] || merged.templates || INITIAL_TEMPLATES;
+  const geralSite = parsed.siteCaptureBySegment?.[DEFAULT_SEGMENT] || merged.siteCapture || INITIAL_SITE_CAPTURE;
+  const geralRules = parsed.monitoringRulesBySegment?.[DEFAULT_SEGMENT] || merged.monitoringRules || INITIAL_MONITORING_RULES;
+
+  merged.autoDispatch = geralAuto;
+  merged.templates = geralTemplates;
+  merged.siteCapture = geralSite;
+  merged.monitoringRules = geralRules;
+  merged.autoDispatchBySegment = {
+    ...(parsed.autoDispatchBySegment || {}),
+    [DEFAULT_SEGMENT]: geralAuto,
+  };
+  merged.templatesBySegment = {
+    ...(parsed.templatesBySegment || {}),
+    [DEFAULT_SEGMENT]: geralTemplates,
+  };
+  merged.siteCaptureBySegment = {
+    ...(parsed.siteCaptureBySegment || {}),
+    [DEFAULT_SEGMENT]: geralSite,
+  };
+  merged.monitoringRulesBySegment = {
+    ...(parsed.monitoringRulesBySegment || {}),
+    [DEFAULT_SEGMENT]: geralRules,
+  };
 
   // On boot, Baileys accounts start unverified until /api/whatsapp/baileys/sessions confirms live socket
   if (!options?.preserveLiveConnectionState) {
@@ -451,19 +526,157 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
   const [products, setProducts] = useState<Product[]>(initial.products);
   const [coupons, setCoupons] = useState<Coupon[]>(initial.coupons);
-  const [templates, setTemplates] = useState<MessageTemplate[]>(initial.templates);
+  const [templatesBySegment, setTemplatesBySegment] = useState<Record<string, MessageTemplate[]>>(
+    () => ({
+      ...(initial.templatesBySegment || {}),
+      [DEFAULT_SEGMENT]:
+        initial.templatesBySegment?.[DEFAULT_SEGMENT] || initial.templates || INITIAL_TEMPLATES,
+    })
+  );
   const [queues, setQueues] = useState<DispatchQueue[]>(initial.queues);
   const [schedules, setSchedules] = useState<ScheduledItem[]>(initial.schedules);
   const [sentLogs, setSentLogs] = useState<SentLog[]>(initial.sentLogs);
   const [convertedLinks, setConvertedLinks] = useState<ConvertedLinkItem[]>(initial.convertedLinks);
-  const [autoDispatch, setAutoDispatch] = useState<AutoDispatchConfig>(initial.autoDispatch);
-  const [siteCapture, setSiteCapture] = useState<SiteCaptureConfig>(initial.siteCapture);
+  const [autoDispatchBySegment, setAutoDispatchBySegment] = useState<
+    Record<string, AutoDispatchConfig>
+  >(() => ({
+    ...(initial.autoDispatchBySegment || {}),
+    [DEFAULT_SEGMENT]:
+      initial.autoDispatchBySegment?.[DEFAULT_SEGMENT] ||
+      initial.autoDispatch ||
+      INITIAL_AUTO_DISPATCH,
+  }));
+  const [siteCaptureBySegment, setSiteCaptureBySegment] = useState<
+    Record<string, SiteCaptureConfig>
+  >(() => ({
+    ...(initial.siteCaptureBySegment || {}),
+    [DEFAULT_SEGMENT]:
+      initial.siteCaptureBySegment?.[DEFAULT_SEGMENT] ||
+      initial.siteCapture ||
+      INITIAL_SITE_CAPTURE,
+  }));
   const [integrations, setIntegrations] = useState<PlatformIntegrations>(initial.integrations);
-  const [monitoringRules, setMonitoringRules] = useState<MonitoringRulesConfig>(
-    initial.monitoringRules
-  );
+  const [monitoringRulesBySegment, setMonitoringRulesBySegment] = useState<
+    Record<string, MonitoringRulesConfig>
+  >(() => ({
+    ...(initial.monitoringRulesBySegment || {}),
+    [DEFAULT_SEGMENT]:
+      initial.monitoringRulesBySegment?.[DEFAULT_SEGMENT] ||
+      initial.monitoringRules ||
+      INITIAL_MONITORING_RULES,
+  }));
   const [profile, setProfile] = useState<UserProfile>(initial.profile);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+
+  const templates = useMemo(
+    () =>
+      resolveSegmentConfig(
+        templatesBySegment,
+        INITIAL_TEMPLATES,
+        activeSegment,
+        createDefaultTemplatesForSegment
+      ),
+    [templatesBySegment, activeSegment]
+  );
+
+  const autoDispatch = useMemo(
+    () =>
+      resolveSegmentConfig(
+        autoDispatchBySegment,
+        INITIAL_AUTO_DISPATCH,
+        activeSegment,
+        createDefaultAutoDispatchForSegment
+      ),
+    [autoDispatchBySegment, activeSegment]
+  );
+
+  const siteCapture = useMemo(
+    () =>
+      resolveSegmentConfig(
+        siteCaptureBySegment,
+        INITIAL_SITE_CAPTURE,
+        activeSegment,
+        createDefaultSiteCaptureForSegment
+      ),
+    [siteCaptureBySegment, activeSegment]
+  );
+
+  const monitoringRules = useMemo(
+    () =>
+      resolveSegmentConfig(
+        monitoringRulesBySegment,
+        INITIAL_MONITORING_RULES,
+        activeSegment,
+        createDefaultMonitoringRulesForSegment
+      ),
+    [monitoringRulesBySegment, activeSegment]
+  );
+
+  const setTemplates: React.Dispatch<React.SetStateAction<MessageTemplate[]>> = useCallback(
+    (action) => {
+      const seg = normalizeSegmentName(activeSegmentRef.current);
+      setTemplatesBySegment((prev) => {
+        const cur = resolveSegmentConfig(
+          prev,
+          INITIAL_TEMPLATES,
+          seg,
+          createDefaultTemplatesForSegment
+        );
+        const next = typeof action === 'function' ? action(cur) : action;
+        return { ...prev, [seg]: next };
+      });
+    },
+    []
+  );
+
+  const setAutoDispatch: React.Dispatch<React.SetStateAction<AutoDispatchConfig>> = useCallback(
+    (action) => {
+      const seg = normalizeSegmentName(activeSegmentRef.current);
+      setAutoDispatchBySegment((prev) => {
+        const cur = resolveSegmentConfig(
+          prev,
+          INITIAL_AUTO_DISPATCH,
+          seg,
+          createDefaultAutoDispatchForSegment
+        );
+        const next = typeof action === 'function' ? action(cur) : action;
+        return { ...prev, [seg]: next };
+      });
+    },
+    []
+  );
+
+  const setSiteCapture: React.Dispatch<React.SetStateAction<SiteCaptureConfig>> = useCallback(
+    (action) => {
+      const seg = normalizeSegmentName(activeSegmentRef.current);
+      setSiteCaptureBySegment((prev) => {
+        const cur = resolveSegmentConfig(
+          prev,
+          INITIAL_SITE_CAPTURE,
+          seg,
+          createDefaultSiteCaptureForSegment
+        );
+        const next = typeof action === 'function' ? action(cur) : action;
+        return { ...prev, [seg]: next };
+      });
+    },
+    []
+  );
+
+  const setMonitoringRules: React.Dispatch<React.SetStateAction<MonitoringRulesConfig>> =
+    useCallback((action) => {
+      const seg = normalizeSegmentName(activeSegmentRef.current);
+      setMonitoringRulesBySegment((prev) => {
+        const cur = resolveSegmentConfig(
+          prev,
+          INITIAL_MONITORING_RULES,
+          seg,
+          createDefaultMonitoringRulesForSegment
+        );
+        const next = typeof action === 'function' ? action(cur) : action;
+        return { ...prev, [seg]: next };
+      });
+    }, []);
 
   const accountsRef = useRef(accounts);
   accountsRef.current = accounts;
@@ -513,8 +726,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const key = canonicalGroupKey(g.channel, g.remoteJid);
         if (!key) continue;
         const cur = next[key] || {};
+        const nextActiveSegs = getGroupActiveSegments(g);
+        const activeSegsChanged =
+          JSON.stringify(cur.activeSegments ?? null) !== JSON.stringify(nextActiveSegs);
         if (
           cur.activeForOffers !== g.activeForOffers ||
+          activeSegsChanged ||
           cur.segment !== g.segment ||
           cur.inviteUrl !== g.inviteUrl ||
           cur.isChannel !== g.isChannel ||
@@ -525,7 +742,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ) {
           next[key] = {
             ...cur,
-            activeForOffers: g.activeForOffers,
+            activeForOffers: nextActiveSegs.length > 0,
+            activeSegments: nextActiveSegs,
             segment: g.segment,
             inviteUrl: g.inviteUrl,
             isChannel: g.isChannel,
@@ -544,14 +762,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const nextMarkets = m.allowedMarketplaces;
         const marketsChanged =
           JSON.stringify(cur.allowedMarketplaces || null) !== JSON.stringify(nextMarkets || null);
+        const nextMonSegs = getGroupMonitoredSegments(m);
+        const monSegsChanged =
+          JSON.stringify(cur.monitoredSegments ?? null) !== JSON.stringify(nextMonSegs);
         if (
           cur.monitored !== m.monitored ||
+          monSegsChanged ||
           Boolean(cur.useGroupImage) !== Boolean(m.useGroupImage) ||
           marketsChanged
         ) {
           next[key] = {
             ...cur,
-            monitored: m.monitored,
+            monitored: nextMonSegs.length > 0,
+            monitoredSegments: nextMonSegs,
             useGroupImage: Boolean(m.useGroupImage),
             allowedMarketplaces: nextMarkets,
           };
@@ -882,6 +1105,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             const syncedWaGroups: DispatchGroup[] = uniqueLiveList.map((grp) => {
               const saved = prefsSnapshot[`wa:${grp.remoteJid}`];
               const prevLive = prevByJid.get(grp.remoteJid);
+              const restoredActiveSegs = Array.isArray(saved?.activeSegments)
+                ? dedupeSegmentNames(saved.activeSegments)
+                : Array.isArray(prevLive?.activeSegments)
+                ? dedupeSegmentNames(prevLive.activeSegments)
+                : getGroupActiveSegments(saved ?? prevLive);
               return {
                 id: `grp-wa-${grp.remoteJid.replace(/[^a-zA-Z0-9]/g, '')}`,
                 name: grp.name,
@@ -889,13 +1117,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 accountId: grp.accountId,
                 accountName: grp.accountName,
                 remoteJid: grp.remoteJid,
-                activeForOffers: saved?.activeForOffers ?? prevLive?.activeForOffers ?? false,
+                activeForOffers: restoredActiveSegs.length > 0,
+                activeSegments: restoredActiveSegs,
                 isPriorityCapture: saved?.isPriorityCapture ?? prevLive?.isPriorityCapture ?? false,
                 isChannel: saved?.isChannel ?? prevLive?.isChannel ?? false,
                 membersCount: grp.membersCount,
                 maxCapacity: 1024,
                 inviteUrl: saved?.inviteUrl || prevLive?.inviteUrl || 'https://chat.whatsapp.com/',
-                segment: saved?.segment || prevLive?.segment || activeSegmentRef.current || 'Geral',
+                segment: saved?.segment || prevLive?.segment || DEFAULT_SEGMENT,
                 isOwner: grp.isOwner ?? saved?.isOwner ?? prevLive?.isOwner,
                 isAdmin: grp.isAdmin ?? saved?.isAdmin ?? prevLive?.isAdmin,
                 isOwnerOrAdmin:
@@ -919,6 +1148,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             const syncedMonGroups: MonitoringGroup[] = uniqueLiveList.map((grp) => {
               const saved = prefsSnapshot[`wa:${grp.remoteJid}`];
               const prevMon = prevByJid.get(grp.remoteJid);
+              const restoredMonSegs = Array.isArray(saved?.monitoredSegments)
+                ? dedupeSegmentNames(saved.monitoredSegments)
+                : Array.isArray(prevMon?.monitoredSegments)
+                ? dedupeSegmentNames(prevMon.monitoredSegments)
+                : getGroupMonitoredSegments(saved ?? prevMon);
               return {
                 id: `mon-wa-${grp.remoteJid.replace(/[^a-zA-Z0-9]/g, '')}`,
                 name: grp.name,
@@ -926,7 +1160,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 accountId: grp.accountId,
                 accountName: grp.accountName,
                 remoteJid: grp.remoteJid,
-                monitored: saved?.monitored ?? prevMon?.monitored ?? false,
+                monitored: restoredMonSegs.length > 0,
+                monitoredSegments: restoredMonSegs,
                 useGroupImage: saved?.useGroupImage ?? prevMon?.useGroupImage ?? false,
                 allowedMarketplaces:
                   saved?.allowedMarketplaces ?? prevMon?.allowedMarketplaces,
@@ -1084,20 +1319,34 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       applyGenerationRef.current += 1;
 
       setSegments(cleaned.segments);
-      setActiveSegment(cleaned.activeSegment);
+      if (!notifyNewCaptured) {
+        setActiveSegment(
+          cleaned.segments.includes(cleaned.activeSegment) ? cleaned.activeSegment : DEFAULT_SEGMENT
+        );
+      } else if (!cleaned.segments.includes(activeSegmentRef.current)) {
+        setActiveSegment(DEFAULT_SEGMENT);
+      }
       setTotalSentCount(cleaned.totalSentCount);
       setSavedGroupPrefs(cleaned.savedGroupPrefs || {});
       setProducts(cleaned.products);
       setCoupons(cleaned.coupons);
-      setTemplates(cleaned.templates);
+      setTemplatesBySegment(
+        cleaned.templatesBySegment || { [DEFAULT_SEGMENT]: cleaned.templates }
+      );
       setQueues(cleaned.queues);
       setSchedules(cleaned.schedules);
       setSentLogs(cleaned.sentLogs);
       setConvertedLinks(cleaned.convertedLinks);
-      setAutoDispatch(cleaned.autoDispatch);
-      setSiteCapture(cleaned.siteCapture);
+      setAutoDispatchBySegment(
+        cleaned.autoDispatchBySegment || { [DEFAULT_SEGMENT]: cleaned.autoDispatch }
+      );
+      setSiteCaptureBySegment(
+        cleaned.siteCaptureBySegment || { [DEFAULT_SEGMENT]: cleaned.siteCapture }
+      );
       setIntegrations(cleaned.integrations);
-      setMonitoringRules(cleaned.monitoringRules);
+      setMonitoringRulesBySegment(
+        cleaned.monitoringRulesBySegment || { [DEFAULT_SEGMENT]: cleaned.monitoringRules }
+      );
       setProfile(cleaned.profile);
 
       // Update non-Baileys accounts from server while keeping live Baileys socket status intact
@@ -1138,10 +1387,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 const norm = normalizeGroupJid(g.remoteJid);
                 const pref = serverPrefs[`wa:${norm}`];
                 const srv = serverWaByJid.get(norm);
+                const resolvedSegs = Array.isArray(pref?.activeSegments)
+                  ? dedupeSegmentNames(pref.activeSegments)
+                  : Array.isArray(srv?.activeSegments)
+                  ? dedupeSegmentNames(srv.activeSegments)
+                  : getGroupActiveSegments(pref ?? srv ?? g);
                 return {
                   ...g,
                   membersCount: Math.max(g.membersCount || 0, srv?.membersCount || 0),
-                  activeForOffers: pref?.activeForOffers ?? srv?.activeForOffers ?? g.activeForOffers,
+                  activeForOffers: resolvedSegs.length > 0,
+                  activeSegments: resolvedSegs,
                   isPriorityCapture:
                     pref?.isPriorityCapture ?? srv?.isPriorityCapture ?? g.isPriorityCapture,
                   isChannel: pref?.isChannel ?? srv?.isChannel ?? g.isChannel,
@@ -1176,9 +1431,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 const norm = normalizeGroupJid(m.remoteJid);
                 const pref = serverPrefs[`wa:${norm}`];
                 const srv = serverMonByJid.get(norm);
+                const resolvedMonSegs = Array.isArray(pref?.monitoredSegments)
+                  ? dedupeSegmentNames(pref.monitoredSegments)
+                  : Array.isArray(srv?.monitoredSegments)
+                  ? dedupeSegmentNames(srv.monitoredSegments)
+                  : getGroupMonitoredSegments(pref ?? srv ?? m);
                 return {
                   ...m,
-                  monitored: pref?.monitored ?? srv?.monitored ?? m.monitored,
+                  monitored: resolvedMonSegs.length > 0,
+                  monitoredSegments: resolvedMonSegs,
                   useGroupImage:
                     pref?.useGroupImage ?? srv?.useGroupImage ?? m.useGroupImage ?? false,
                   allowedMarketplaces:
@@ -1282,6 +1543,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [applyServerSnapshot, initial]);
 
   useEffect(() => {
+    const geralTemplates = templatesBySegment[DEFAULT_SEGMENT] || INITIAL_TEMPLATES;
+    const geralAutoDispatch = autoDispatchBySegment[DEFAULT_SEGMENT] || INITIAL_AUTO_DISPATCH;
+    const geralSiteCapture = siteCaptureBySegment[DEFAULT_SEGMENT] || INITIAL_SITE_CAPTURE;
+    const geralMonitoringRules =
+      monitoringRulesBySegment[DEFAULT_SEGMENT] || INITIAL_MONITORING_RULES;
+
     const snapshot: PersistedState = {
       cleanRealWhatsAppMigrationV5: true,
       stripFictionalProductsV6: true,
@@ -1295,15 +1562,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       savedGroupPrefs,
       products,
       coupons,
-      templates,
+      templates: geralTemplates,
       queues,
       schedules,
       sentLogs,
       convertedLinks,
-      autoDispatch,
-      siteCapture,
+      autoDispatch: geralAutoDispatch,
+      siteCapture: geralSiteCapture,
       integrations,
-      monitoringRules,
+      monitoringRules: geralMonitoringRules,
+      autoDispatchBySegment,
+      templatesBySegment,
+      siteCaptureBySegment,
+      monitoringRulesBySegment,
       profile,
     };
     const serialized = JSON.stringify(snapshot);
@@ -1358,15 +1629,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     savedGroupPrefs,
     products,
     coupons,
-    templates,
+    templatesBySegment,
     queues,
     schedules,
     sentLogs,
     convertedLinks,
-    autoDispatch,
-    siteCapture,
+    autoDispatchBySegment,
+    siteCaptureBySegment,
     integrations,
-    monitoringRules,
+    monitoringRulesBySegment,
     profile,
   ]);
 
@@ -1425,24 +1696,163 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const trimmed = name.trim();
     if (!trimmed || segments.includes(trimmed)) return;
     setSegments((prev) => [...prev, trimmed]);
-    notify('Segmento criado', `O segmento "${trimmed}" foi adicionado.`);
+    setAutoDispatchBySegment((prev) => ({
+      ...prev,
+      [trimmed]: prev[trimmed] || createDefaultAutoDispatchForSegment(),
+    }));
+    setTemplatesBySegment((prev) => ({
+      ...prev,
+      [trimmed]: prev[trimmed] || createDefaultTemplatesForSegment(),
+    }));
+    setSiteCaptureBySegment((prev) => ({
+      ...prev,
+      [trimmed]: prev[trimmed] || createDefaultSiteCaptureForSegment(trimmed),
+    }));
+    setMonitoringRulesBySegment((prev) => ({
+      ...prev,
+      [trimmed]: prev[trimmed] || createDefaultMonitoringRulesForSegment(),
+    }));
+    notify(
+      'Segmento criado',
+      `O segmento "${trimmed}" foi adicionado com produtos, grupos e configurações independentes.`
+    );
   };
 
   const renameSegment = (oldName: string, newName: string) => {
     const trimmed = newName.trim();
-    if (!trimmed || segments.includes(trimmed)) return;
+    if (!trimmed || segments.includes(trimmed) || oldName === DEFAULT_SEGMENT) return;
     setSegments((prev) => prev.map((s) => (s === oldName ? trimmed : s)));
     if (activeSegment === oldName) setActiveSegment(trimmed);
+
+    setAutoDispatchBySegment((prev) => renameSegmentInMap(prev, oldName, trimmed));
+    setTemplatesBySegment((prev) => renameSegmentInMap(prev, oldName, trimmed));
+    setSiteCaptureBySegment((prev) => renameSegmentInMap(prev, oldName, trimmed));
+    setMonitoringRulesBySegment((prev) => renameSegmentInMap(prev, oldName, trimmed));
+
+    setProducts((prev) =>
+      prev.map((p) => (p.segment === oldName ? { ...p, segment: trimmed } : p))
+    );
+    setQueues((prev) =>
+      prev.map((q) => (q.segment === oldName ? { ...q, segment: trimmed } : q))
+    );
+    setSchedules((prev) =>
+      prev.map((s) => (s.segment === oldName ? { ...s, segment: trimmed } : s))
+    );
+    setCoupons((prev) =>
+      prev.map((c) => (c.segment === oldName ? { ...c, segment: trimmed } : c))
+    );
+    setSentLogs((prev) =>
+      prev.map((l) => (l.segment === oldName ? { ...l, segment: trimmed } : l))
+    );
+    setDispatchGroups((prev) =>
+      prev.map((g) => {
+        const nextActive = replaceSegmentInList(getGroupActiveSegments(g), oldName, trimmed) || [];
+        return {
+          ...g,
+          segment: g.segment === oldName ? trimmed : g.segment,
+          activeSegments: nextActive,
+          activeForOffers: nextActive.length > 0,
+        };
+      })
+    );
+    setMonitoringGroups((prev) =>
+      prev.map((m) => {
+        const nextMon = replaceSegmentInList(getGroupMonitoredSegments(m), oldName, trimmed) || [];
+        return {
+          ...m,
+          monitoredSegments: nextMon,
+          monitored: nextMon.length > 0,
+        };
+      })
+    );
+    setSavedGroupPrefs((prev) => {
+      const next: Record<string, SavedGroupPreference> = {};
+      for (const [k, pref] of Object.entries(prev)) {
+        const nextActive = replaceSegmentInList(pref.activeSegments, oldName, trimmed);
+        const nextMon = replaceSegmentInList(pref.monitoredSegments, oldName, trimmed);
+        next[k] = {
+          ...pref,
+          segment: pref.segment === oldName ? trimmed : pref.segment,
+          ...(nextActive !== undefined
+            ? { activeSegments: nextActive, activeForOffers: nextActive.length > 0 }
+            : {}),
+          ...(nextMon !== undefined
+            ? { monitoredSegments: nextMon, monitored: nextMon.length > 0 }
+            : {}),
+        };
+      }
+      return next;
+    });
     notify('Segmento atualizado', `Renomeado para "${trimmed}".`);
   };
 
   const deleteSegment = (name: string) => {
-    if (name === 'Geral') {
+    if (name === DEFAULT_SEGMENT) {
       notify('Ação bloqueada', 'O segmento padrão "Geral" não pode ser removido.', 'error');
       return;
     }
     setSegments((prev) => prev.filter((s) => s !== name));
-    if (activeSegment === name) setActiveSegment('Geral');
+    if (activeSegment === name) setActiveSegment(DEFAULT_SEGMENT);
+
+    setAutoDispatchBySegment((prev) => deleteSegmentFromMap(prev, name));
+    setTemplatesBySegment((prev) => deleteSegmentFromMap(prev, name));
+    setSiteCaptureBySegment((prev) => deleteSegmentFromMap(prev, name));
+    setMonitoringRulesBySegment((prev) => deleteSegmentFromMap(prev, name));
+
+    setProducts((prev) =>
+      prev.map((p) => (p.segment === name ? { ...p, segment: DEFAULT_SEGMENT } : p))
+    );
+    setQueues((prev) =>
+      prev.map((q) => (q.segment === name ? { ...q, segment: DEFAULT_SEGMENT } : q))
+    );
+    setSchedules((prev) =>
+      prev.map((s) => (s.segment === name ? { ...s, segment: DEFAULT_SEGMENT } : s))
+    );
+    setCoupons((prev) =>
+      prev.map((c) => (c.segment === name ? { ...c, segment: DEFAULT_SEGMENT } : c))
+    );
+    setSentLogs((prev) =>
+      prev.map((l) => (l.segment === name ? { ...l, segment: DEFAULT_SEGMENT } : l))
+    );
+    setDispatchGroups((prev) =>
+      prev.map((g) => {
+        const nextActive = removeSegmentFromList(getGroupActiveSegments(g), name) || [];
+        return {
+          ...g,
+          segment: g.segment === name ? DEFAULT_SEGMENT : g.segment,
+          activeSegments: nextActive,
+          activeForOffers: nextActive.length > 0,
+        };
+      })
+    );
+    setMonitoringGroups((prev) =>
+      prev.map((m) => {
+        const nextMon = removeSegmentFromList(getGroupMonitoredSegments(m), name) || [];
+        return {
+          ...m,
+          monitoredSegments: nextMon,
+          monitored: nextMon.length > 0,
+        };
+      })
+    );
+    setSavedGroupPrefs((prev) => {
+      const next: Record<string, SavedGroupPreference> = {};
+      for (const [k, pref] of Object.entries(prev)) {
+        const nextActive = removeSegmentFromList(pref.activeSegments, name);
+        const nextMon = removeSegmentFromList(pref.monitoredSegments, name);
+        next[k] = {
+          ...pref,
+          segment: pref.segment === name ? DEFAULT_SEGMENT : pref.segment,
+          ...(nextActive !== undefined
+            ? { activeSegments: nextActive, activeForOffers: nextActive.length > 0 }
+            : {}),
+          ...(nextMon !== undefined
+            ? { monitoredSegments: nextMon, monitored: nextMon.length > 0 }
+            : {}),
+        };
+      }
+      return next;
+    });
     notify('Segmento removido', `O segmento "${name}" foi excluído.`, 'info');
   };
 
@@ -1624,19 +2034,30 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
     }
 
-    const tpl = getTemplateForPlatform(effectiveProduct.platform);
+    const normalizedTargets = dedupeSegmentNames(
+      targetSegments.length > 0 ? targetSegments : [activeSegment]
+    );
+    const primaryTargetSeg = normalizedTargets[0] || normalizeSegmentName(activeSegment);
+    const segTemplates = resolveSegmentConfig(
+      templatesBySegment,
+      INITIAL_TEMPLATES,
+      primaryTargetSeg,
+      createDefaultTemplatesForSegment
+    );
+    const tpl =
+      segTemplates.find((t) => t.platform === effectiveProduct.platform) ||
+      segTemplates[0] ||
+      INITIAL_TEMPLATES[0];
     const rendered = renderProductMessage(effectiveProduct, tpl, integrations);
-    const activeGroups = dispatchGroups.filter(
-      (g) =>
-        g.activeForOffers &&
-        (targetSegments.includes(g.segment) || targetSegments.includes('Geral'))
+    const activeGroups = dispatchGroups.filter((g) =>
+      normalizedTargets.some((seg) => isGroupActiveInSegment(g, seg))
     );
 
     if (activeGroups.length === 0) {
       const errMsg =
         dispatchGroups.length === 0
           ? 'Conecte seu WhatsApp via Baileys em Canais → WhatsApp e ative seus grupos em Grupos de Envio.'
-          : 'Vá em Grupos de Envio e ative a chave "Enviar Ofertas" nos grupos em que deseja disparar.';
+          : `Vá em Grupos de Envio no segmento "${primaryTargetSeg}" e ative a chave "Enviar Ofertas" nos grupos em que deseja disparar.`;
       notify('Nenhum grupo ativo para envio', errMsg, 'info');
       return { ok: false, sentCount: 0, message: rendered, error: errMsg };
     }
@@ -1675,6 +2096,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       artworkKey: effectiveProduct.artworkKey,
       customImageUrl: effectiveProduct.customImageUrl,
       affiliateUrl: effectiveProduct.affiliateUrl,
+      segment: primaryTargetSeg,
     };
 
     setSentLogs((prev) => [newLog, ...prev]);
@@ -1693,6 +2115,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     customImageUrl,
     enableLinkPreview = true,
     mentionAll = false,
+    segment,
   }: {
     title: string;
     message: string;
@@ -1702,12 +2125,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     customImageUrl?: string;
     enableLinkPreview?: boolean;
     mentionAll?: boolean;
+    segment?: string;
   }): Promise<{ ok: boolean; sentCount: number; message: string; error?: string }> => {
+    const targetSeg = normalizeSegmentName(segment || activeSegmentRef.current);
     const matchedGroups = groupIds?.length
       ? dispatchGroups.filter((g) => groupIds.includes(g.id))
       : groupsNames?.length
       ? dispatchGroups.filter((g) => groupsNames.includes(g.name))
-      : dispatchGroups.filter((g) => g.activeForOffers);
+      : dispatchGroups.filter((g) => isGroupActiveInSegment(g, targetSeg));
 
     if (matchedGroups.length === 0) {
       const errMsg =
@@ -1747,6 +2172,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       sentAt: nowFormatted,
       sentAtIso: now.toISOString(),
       customImageUrl,
+      segment: targetSeg,
     };
 
     setSentLogs((prev) => [newLog, ...prev]);
@@ -1766,10 +2192,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           const due = new Date(item.scheduledAt);
           if (isNaN(due.getTime()) || due > now) return item;
 
+          const itemSeg = normalizeSegmentName(item.segment);
           const targetGroups =
             item.groupIds.length > 0
               ? dispatchGroups.filter((g) => item.groupIds.includes(g.id))
-              : dispatchGroups.filter((g) => g.activeForOffers);
+              : dispatchGroups.filter((g) => isGroupActiveInSegment(g, itemSeg));
 
           if (targetGroups.length === 0) {
             return item;
@@ -1783,6 +2210,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             groupIds: targetGroups.map((g) => g.id),
             platform: item.platform,
             customImageUrl: item.imageUrl,
+            segment: itemSeg,
           });
 
           if (item.recurrence === 'Recorrente') {
@@ -1813,15 +2241,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       savedGroupPrefs,
       products,
       coupons,
-      templates,
+      templates: templatesBySegment[DEFAULT_SEGMENT] || INITIAL_TEMPLATES,
       queues,
       schedules,
       sentLogs,
       convertedLinks,
-      autoDispatch,
-      siteCapture,
+      autoDispatch: autoDispatchBySegment[DEFAULT_SEGMENT] || INITIAL_AUTO_DISPATCH,
+      siteCapture: siteCaptureBySegment[DEFAULT_SEGMENT] || INITIAL_SITE_CAPTURE,
       integrations,
-      monitoringRules,
+      monitoringRules: monitoringRulesBySegment[DEFAULT_SEGMENT] || INITIAL_MONITORING_RULES,
+      autoDispatchBySegment,
+      templatesBySegment,
+      siteCaptureBySegment,
+      monitoringRulesBySegment,
       profile,
     };
     return JSON.stringify(payload, null, 2);
@@ -1841,15 +2273,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setMonitoringGroups(cleaned.monitoringGroups);
       setProducts(cleaned.products);
       setCoupons(cleaned.coupons);
-      setTemplates(cleaned.templates);
+      setTemplatesBySegment(
+        cleaned.templatesBySegment || { [DEFAULT_SEGMENT]: cleaned.templates }
+      );
       setQueues(cleaned.queues);
       setSchedules(cleaned.schedules);
       setSentLogs(cleaned.sentLogs);
       setConvertedLinks(cleaned.convertedLinks);
-      setAutoDispatch(cleaned.autoDispatch);
-      setSiteCapture(cleaned.siteCapture);
+      setAutoDispatchBySegment(
+        cleaned.autoDispatchBySegment || { [DEFAULT_SEGMENT]: cleaned.autoDispatch }
+      );
+      setSiteCaptureBySegment(
+        cleaned.siteCaptureBySegment || { [DEFAULT_SEGMENT]: cleaned.siteCapture }
+      );
       setIntegrations(cleaned.integrations);
-      setMonitoringRules(cleaned.monitoringRules);
+      setMonitoringRulesBySegment(
+        cleaned.monitoringRulesBySegment || { [DEFAULT_SEGMENT]: cleaned.monitoringRules }
+      );
       setProfile(cleaned.profile);
       notify('Backup restaurado', 'Seus dados locais foram importados com sucesso.');
       return true;
@@ -1872,15 +2312,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setMonitoringGroups([]);
     setProducts(DEFAULT_PERSISTED.products);
     setCoupons(DEFAULT_PERSISTED.coupons);
-    setTemplates(DEFAULT_PERSISTED.templates);
+    setTemplatesBySegment({ [DEFAULT_SEGMENT]: DEFAULT_PERSISTED.templates });
     setQueues([]);
     setSchedules([]);
     setSentLogs([]);
     setConvertedLinks([]);
-    setAutoDispatch(DEFAULT_PERSISTED.autoDispatch);
-    setSiteCapture(DEFAULT_PERSISTED.siteCapture);
+    setAutoDispatchBySegment({ [DEFAULT_SEGMENT]: DEFAULT_PERSISTED.autoDispatch });
+    setSiteCaptureBySegment({ [DEFAULT_SEGMENT]: DEFAULT_PERSISTED.siteCapture });
     setIntegrations(DEFAULT_PERSISTED.integrations);
-    setMonitoringRules(DEFAULT_PERSISTED.monitoringRules);
+    setMonitoringRulesBySegment({ [DEFAULT_SEGMENT]: DEFAULT_PERSISTED.monitoringRules });
     setProfile(DEFAULT_PERSISTED.profile);
     void savePanelStateApi({
       clientVersion: serverVersionRef.current,
@@ -1943,6 +2383,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setIntegrations,
         monitoringRules,
         setMonitoringRules,
+        autoDispatchBySegment,
+        templatesBySegment,
+        siteCaptureBySegment,
+        monitoringRulesBySegment,
         profile,
         setProfile,
         syncWhatsAppGroupsFromAccount,

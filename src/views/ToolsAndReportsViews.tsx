@@ -42,6 +42,11 @@ import {
   truncateGroupOptionLabel,
 } from '../utils/memberMonitorAnalytics';
 import { MemberMonitorCharts } from '../components/MemberMonitorCharts';
+import {
+  DEFAULT_SEGMENT,
+  isOwnerGroupInSegment,
+  matchesSegment,
+} from '../utils/segmentScoping';
 import type { DispatchGroup } from '../types';
 
 /* ============================================================================
@@ -580,7 +585,7 @@ export const CommissionReportView: React.FC = () => {
  * 4. HISTÓRICO DE ENVIOS (Telas 47–48)
  * ========================================================================== */
 export const SentLogsView: React.FC = () => {
-  const { sentLogs, dispatchCustomMessage, setRoute, notify } = useApp();
+  const { sentLogs, dispatchCustomMessage, activeSegment, setRoute, notify } = useApp();
   const [platformFilter, setPlatformFilter] = useState('Todas as Plataformas');
   const [search, setSearch] = useState('');
   const [resendingId, setResendingId] = useState<string | null>(null);
@@ -590,6 +595,9 @@ export const SentLogsView: React.FC = () => {
   const [currentPage, setCurrentPage] = useState<number>(1);
 
   const filtered = sentLogs.filter((log) => {
+    if (!matchesSegment(log.segment, activeSegment)) {
+      return false;
+    }
     if (platformFilter !== 'Todas as Plataformas' && log.platform !== platformFilter) {
       return false;
     }
@@ -605,7 +613,7 @@ export const SentLogsView: React.FC = () => {
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [platformFilter, search, pageSize]);
+  }, [activeSegment, platformFilter, search, pageSize]);
 
   const displayedLogs = useMemo(() => {
     const start = (currentPage - 1) * pageSize;
@@ -639,6 +647,9 @@ export const SentLogsView: React.FC = () => {
         <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
           Envios
         </h1>
+        <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200/70 dark:border-emerald-800/60 px-2.5 py-0.5 rounded-lg">
+          {activeSegment}
+        </span>
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -790,6 +801,7 @@ export const SentLogsView: React.FC = () => {
                           groupsNames: item.groupsNames,
                           platform: item.platform,
                           customImageUrl: item.customImageUrl,
+                          segment: activeSegment,
                         });
                       } finally {
                         setResendingId(null);
@@ -847,7 +859,8 @@ export const SentLogsView: React.FC = () => {
  * 5. MONITORAMENTO DE MEMBROS REAL (Via Baileys Multi-Device)
  * ========================================================================== */
 export const MemberMonitorView: React.FC = () => {
-  const { dispatchGroups, accounts, syncWhatsAppGroupsFromAccount, setRoute } = useApp();
+  const { dispatchGroups, accounts, activeSegment, syncWhatsAppGroupsFromAccount, setRoute } =
+    useApp();
   const [selectedGroupId, setSelectedGroupId] = useState('all');
   const [period, setPeriod] = useState<MemberMonitorPeriod>('Últimos 7 dias');
   const [customStartDate, setCustomStartDate] = useState<string>(() => {
@@ -934,6 +947,11 @@ export const MemberMonitorView: React.FC = () => {
     [dispatchGroups, cachedFallbackGroups]
   );
 
+  const segmentEffectiveGroups = useMemo(
+    () => effectiveGroups.filter((g) => isOwnerGroupInSegment(g, activeSegment)),
+    [effectiveGroups, activeSegment]
+  );
+
   const handleRefreshLive = async () => {
     setSyncing(true);
     try {
@@ -947,7 +965,7 @@ export const MemberMonitorView: React.FC = () => {
   const summary = useMemo(
     () =>
       computeMemberMonitorSummary({
-        groups: effectiveGroups,
+        groups: segmentEffectiveGroups,
         memberEvents,
         selectedGroupId,
         period,
@@ -955,7 +973,7 @@ export const MemberMonitorView: React.FC = () => {
         customEndDate,
         onlyOwnerOrAdmin: true,
       }),
-    [effectiveGroups, memberEvents, selectedGroupId, period, customStartDate, customEndDate]
+    [segmentEffectiveGroups, memberEvents, selectedGroupId, period, customStartDate, customEndDate]
   );
 
   const {
@@ -1041,19 +1059,39 @@ export const MemberMonitorView: React.FC = () => {
       ) : ownedGroupsCount === 0 ? (
         <div className="rounded-2xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="text-xs sm:text-sm text-amber-900 dark:text-amber-200">
-            Nenhum grupo em que você é <strong>dono ou administrador</strong> foi encontrado na
-            conta conectada. O monitoramento de membros acompanha apenas grupos gerenciados por
-            você (grupos de terceiros em que você é apenas participante são filtrados
-            automaticamente).
+            {activeSegment !== DEFAULT_SEGMENT ? (
+              <span>
+                Nenhum grupo onde você é <strong>dono ou administrador</strong> está ativado no
+                segmento <strong>{activeSegment}</strong>. Ative os grupos deste nicho em{' '}
+                <strong>Grupos de Envio</strong> para acompanhar seus membros separadamente aqui.
+              </span>
+            ) : (
+              <span>
+                Nenhum grupo em que você é <strong>dono ou administrador</strong> foi encontrado na
+                conta conectada. O monitoramento de membros acompanha apenas grupos gerenciados por
+                você (grupos de terceiros em que você é apenas participante são filtrados
+                automaticamente).
+              </span>
+            )}
           </div>
-          <button
-            type="button"
-            disabled={syncing}
-            onClick={() => void handleRefreshLive()}
-            className="px-3.5 py-2 rounded-xl bg-[#15803D] text-white text-xs font-semibold shrink-0 disabled:opacity-60"
-          >
-            Verificar novamente
-          </button>
+          {activeSegment !== DEFAULT_SEGMENT ? (
+            <button
+              type="button"
+              onClick={() => setRoute('grupos-envio')}
+              className="px-3.5 py-2 rounded-xl bg-[#15803D] text-white text-xs font-semibold shrink-0"
+            >
+              Ir para Grupos de Envio
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={syncing}
+              onClick={() => void handleRefreshLive()}
+              className="px-3.5 py-2 rounded-xl bg-[#15803D] text-white text-xs font-semibold shrink-0 disabled:opacity-60"
+            >
+              Verificar novamente
+            </button>
+          )}
         </div>
       ) : null}
 

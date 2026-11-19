@@ -163,7 +163,7 @@ export const SettingsHubView: React.FC = () => {
  * 2. DISPARO AUTOMÁTICO (Telas 61–65)
  * ========================================================================== */
 export const AutoDispatchConfigView: React.FC = () => {
-  const { autoDispatch, setAutoDispatch, setRoute, notify } = useApp();
+  const { autoDispatch, setAutoDispatch, activeSegment, setRoute, notify } = useApp();
   const [runningNow, setRunningNow] = useState(false);
 
   const totalPct = Object.values(autoDispatch.distribution).reduce(
@@ -175,16 +175,17 @@ export const AutoDispatchConfigView: React.FC = () => {
   const handleRunAutoDispatchNow = async () => {
     setRunningNow(true);
     try {
-      const res = await runAutoDispatchNowApi();
+      const res = await runAutoDispatchNowApi(activeSegment);
       if (res.ok && res.sentProductsCount > 0) {
         notify(
-          `Disparo automático executado!`,
+          `Disparo automático executado (${activeSegment})!`,
           `${res.sentProductsCount} oferta(s) enviada(s) para ${res.sentGroupsCount} grupo(s).`
         );
       } else {
         notify(
           'Não foi possível disparar agora',
-          res.error || 'Verifique se há produtos salvos, WhatsApp conectado e grupos ativos.',
+          res.error ||
+            `Verifique se há produtos salvos, WhatsApp conectado e grupos ativos no segmento "${activeSegment}".`,
           'info'
         );
       }
@@ -197,7 +198,7 @@ export const AutoDispatchConfigView: React.FC = () => {
 
   return (
     <div className="space-y-6 max-w-3xl">
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-3 flex-wrap">
         <button
           type="button"
           onClick={() => setRoute('configuracoes')}
@@ -208,16 +209,20 @@ export const AutoDispatchConfigView: React.FC = () => {
         <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
           Disparo Automático
         </h1>
+        <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200/70 dark:border-emerald-800/60 px-2.5 py-0.5 rounded-lg">
+          Segmento: {activeSegment}
+        </span>
       </div>
 
       {/* Main Toggle Card */}
       <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 space-y-4">
         <h2 className="font-bold text-lg text-slate-900 dark:text-white">
-          Disparo Automático
+          Disparo Automático · {activeSegment}
         </h2>
         <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
-          Habilite o disparo automático para enviar os produtos salvos de acordo com as
-          configurações definidas abaixo (horário de Brasília).
+          Habilite o disparo automático para enviar os produtos salvos do segmento{' '}
+          <strong>{activeSegment}</strong> apenas para os grupos ativos deste segmento (horário de
+          Brasília).
         </p>
 
         <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
@@ -2467,7 +2472,8 @@ export const ProfileView: React.FC = () => {
 };
 
 export const SegmentsView: React.FC = () => {
-  const { segments, addSegment, renameSegment, deleteSegment } = useApp();
+  const { segments, activeSegment, setActiveSegment, addSegment, renameSegment, deleteSegment } =
+    useApp();
   const [newName, setNewName] = useState('');
   const [editingSeg, setEditingSeg] = useState<string | null>(null);
   const [editingValue, setEditingValue] = useState('');
@@ -2495,7 +2501,8 @@ export const SegmentsView: React.FC = () => {
             <span>Gerenciamento de Segmentos</span>
           </div>
           <p className="text-sm text-slate-500 mt-0.5">
-            Organize nichos diferentes (ex: Geral, Moda Feminina, Tech & Gamer).
+            Separe nichos diferentes (ex: Geral, Beleza, Tech &amp; Gamer) sem misturar produtos,
+            grupos ativos ou disparos automáticos.
           </p>
         </div>
 
@@ -2547,34 +2554,75 @@ export const SegmentsView: React.FC = () => {
                       </button>
                     </div>
                   ) : (
-                    seg
+                    <button
+                      type="button"
+                      onClick={() => setActiveSegment(seg)}
+                      className="inline-flex items-center gap-2 text-left hover:text-[#15803D]"
+                    >
+                      <span>{seg}</span>
+                      {activeSegment === seg && (
+                        <span className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 px-2 py-0.5 rounded-md">
+                          Ativo
+                        </span>
+                      )}
+                    </button>
                   )}
                 </td>
                 <td className="py-3 px-2 text-right">
-                  <div className="inline-flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setEditingSeg(seg);
-                        setEditingValue(seg);
-                      }}
-                      className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
-                    >
-                      <Pencil className="w-4 h-4" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => deleteSegment(seg)}
-                      className="p-1.5 rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  </div>
+                  {seg !== 'Geral' ? (
+                    <div className="inline-flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingSeg(seg);
+                          setEditingValue(seg);
+                        }}
+                        className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                      >
+                        <Pencil className="w-4 h-4" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteSegment(seg)}
+                        className="p-1.5 rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ) : (
+                    <span className="text-xs text-slate-400">Padrão</span>
+                  )}
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
+      </div>
+
+      {/* Shared vs Isolated Reference Card */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4 space-y-2">
+          <div className="text-xs font-bold uppercase tracking-wide text-emerald-700 dark:text-emerald-400">
+            Compartilhado (Toda a Conta)
+          </div>
+          <ul className="text-xs text-slate-600 dark:text-slate-300 space-y-1.5 leading-relaxed">
+            <li>• Contas conectadas (WhatsApp e Telegram)</li>
+            <li>• Plataformas de Afiliado (Shopee, ML, Amazon, Magalu, etc.)</li>
+            <li>• Vitrine de Ofertas (salva no segmento ativo)</li>
+            <li>• Ferramentas, Comissões e Perfil</li>
+          </ul>
+        </div>
+        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4 space-y-2">
+          <div className="text-xs font-bold uppercase tracking-wide text-sky-700 dark:text-sky-400">
+            Isolado por Segmento
+          </div>
+          <ul className="text-xs text-slate-600 dark:text-slate-300 space-y-1.5 leading-relaxed">
+            <li>• Produtos salvos, Favoritos e Meus Cupons</li>
+            <li>• Grupos ativos de Envio e Monitoramento</li>
+            <li>• Disparo Automático, Templates e Regras</li>
+            <li>• Agendamentos, Filas, Site, Envios e Dashboard</li>
+          </ul>
+        </div>
       </div>
     </div>
   );

@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { MessageSquare, Smartphone, Calendar, Users } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { SentLog } from '../types';
+import { isGroupActiveInSegment, matchesSegment } from '../utils/segmentScoping';
 
 type PeriodKey =
   | 'Hoje'
@@ -73,7 +74,7 @@ function parseLogDate(log: SentLog): Date | null {
 const SHORT_WEEKDAYS = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
 
 export const DashboardView: React.FC = () => {
-  const { sentLogs, accounts, schedules, dispatchGroups, setRoute } = useApp();
+  const { sentLogs, accounts, schedules, dispatchGroups, activeSegment, setRoute } = useApp();
   const [period, setPeriod] = useState<PeriodKey>('Últimos 7 dias');
   const [customStart, setCustomStart] = useState(() => {
     const d = new Date(Date.now() - 6 * 86400000);
@@ -82,11 +83,22 @@ export const DashboardView: React.FC = () => {
   const [customEnd, setCustomEnd] = useState(() => new Date().toISOString().slice(0, 10));
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
 
+  const segmentSentLogs = useMemo(
+    () => sentLogs.filter((log) => matchesSegment(log.segment, activeSegment)),
+    [sentLogs, activeSegment]
+  );
+  const activeGroupsInSegment = useMemo(
+    () => dispatchGroups.filter((g) => isGroupActiveInSegment(g, activeSegment)).length,
+    [dispatchGroups, activeSegment]
+  );
+
   const connectedCount = accounts.filter((a) => a.connected).length;
   const totalInstances = Math.max(1, accounts.length);
   const disconnectedCount = Math.max(0, accounts.length - connectedCount);
   const connectedRatio = accounts.length === 0 ? 0 : connectedCount / accounts.length;
-  const pendingSchedules = schedules.filter((s) => s.status === 'Pendente').length;
+  const pendingSchedules = schedules.filter(
+    (s) => s.status === 'Pendente' && matchesSegment(s.segment, activeSegment)
+  ).length;
 
   const { bars, displayedMessages } = useMemo(() => {
     const now = new Date();
@@ -113,7 +125,7 @@ export const DashboardView: React.FC = () => {
       rangeEnd = customEnd ? new Date(`${customEnd}T23:59:59`) : rangeEnd;
     }
 
-    const matchingLogs = sentLogs
+    const matchingLogs = segmentSentLogs
       .map((log) => ({ log, date: parseLogDate(log) }))
       .filter((item): item is { log: SentLog; date: Date } => {
         if (!item.date) return false;
@@ -167,7 +179,7 @@ export const DashboardView: React.FC = () => {
       addLogToBar(buckets[idx], log);
     }
     return { bars: buckets, displayedMessages: totalCount };
-  }, [sentLogs, period, customStart, customEnd]);
+  }, [segmentSentLogs, period, customStart, customEnd]);
 
   const rawMax = Math.max(
     0,
@@ -192,9 +204,14 @@ export const DashboardView: React.FC = () => {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between gap-3 flex-wrap">
-        <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
-          Visão Geral
-        </h1>
+        <div className="flex items-center gap-2.5">
+          <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
+            Visão Geral
+          </h1>
+          <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200/70 dark:border-emerald-800/60 px-2.5 py-0.5 rounded-lg">
+            {activeSegment}
+          </span>
+        </div>
         <button
           type="button"
           onClick={() => setRoute('grupos-envio')}
@@ -203,7 +220,7 @@ export const DashboardView: React.FC = () => {
           <Users className="w-4 h-4 text-[#15803D] dark:text-emerald-400" />
           <span>
             <strong>{dispatchGroups.length}</strong> grupo(s) sincronizado(s) ·{' '}
-            <strong>{dispatchGroups.filter((g) => g.activeForOffers).length}</strong> ativo(s)
+            <strong>{activeGroupsInSegment}</strong> ativo(s) em {activeSegment}
           </span>
         </button>
       </div>

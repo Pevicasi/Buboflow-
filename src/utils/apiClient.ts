@@ -524,16 +524,18 @@ export async function restoreSessionBackupsApi(payload: StoredSessionBackups): P
   return res.json();
 }
 
-export async function runAutoDispatchNowApi(): Promise<{
+export async function runAutoDispatchNowApi(segment?: string): Promise<{
   ok: boolean;
   sentProductsCount: number;
   sentGroupsCount: number;
   titles: string[];
+  segment?: string;
   error?: string;
 }> {
   const res = await fetch('/api/auto-dispatch/run-now', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(segment ? { segment } : {}),
   });
   return res.json();
 }

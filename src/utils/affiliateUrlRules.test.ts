@@ -53,6 +53,24 @@ import {
   pickStrictRoundRobinPage,
   resolveCategorySearchPlan,
 } from './catalogCategories';
+import {
+  DEFAULT_SEGMENT,
+  createDefaultAutoDispatchForSegment,
+  createDefaultMonitoringRulesForSegment,
+  createDefaultSiteCaptureForSegment,
+  deleteSegmentFromMap,
+  getGroupActiveSegments,
+  getGroupMonitoredSegments,
+  isGroupActiveInSegment,
+  isGroupMonitoredInSegment,
+  isOwnerGroupInSegment,
+  matchesSegment,
+  removeSegmentFromList,
+  renameSegmentInMap,
+  replaceSegmentInList,
+  resolveSegmentConfig,
+  toggleGroupSegmentMembership,
+} from './segmentScoping';
 
 test('sanitizeShopeeSubIds removes underscores and non-alphanumeric chars', () => {
   assert.deepEqual(sanitizeShopeeSubIds(['whatsapp_vip', 'grupo-01!', '  Promo Top  ']), [
@@ -1131,6 +1149,154 @@ test('computeMemberMonitorSummary strictly filters to owner/admin groups, suppor
   // Option truncation keeps mobile <select> compact
   assert.ok(truncateGroupOptionLabel(groups[2].name, 36).length <= 36);
 });
+
+test('segmentScoping isolates BELEZA from Geral while keeping legacy data in Geral', () => {
+  // Legacy products/logs without segment belong strictly to Geral
+  assert.equal(matchesSegment(undefined, DEFAULT_SEGMENT), true);
+  assert.equal(matchesSegment('', 'Geral'), true);
+  assert.equal(matchesSegment('Geral', 'geral'), true);
+  assert.equal(matchesSegment(undefined, 'BELEZA'), false);
+  assert.equal(matchesSegment('Geral', 'BELEZA'), false);
+  assert.equal(matchesSegment('BELEZA', 'beleza'), true);
+
+  // Legacy dispatch group with activeForOffers=true and no activeSegments is active ONLY in Geral
+  const legacyGroup = { activeForOffers: true };
+  assert.deepEqual(getGroupActiveSegments(legacyGroup), ['Geral']);
+  assert.equal(isGroupActiveInSegment(legacyGroup, 'Geral'), true);
+  assert.equal(isGroupActiveInSegment(legacyGroup, 'BELEZA'), false);
+
+  // Toggling BELEZA on does not disturb Geral; toggling Geral off leaves BELEZA intact
+  const withBeleza = toggleGroupSegmentMembership(getGroupActiveSegments(legacyGroup), 'BELEZA', true);
+  assert.deepEqual(withBeleza, ['Geral', 'BELEZA']);
+  assert.equal(isGroupActiveInSegment({ activeForOffers: true, activeSegments: withBeleza }, 'BELEZA'), true);
+  const onlyBeleza = toggleGroupSegmentMembership(withBeleza, 'Geral', false);
+  assert.deepEqual(onlyBeleza, ['BELEZA']);
+  assert.equal(isGroupActiveInSegment({ activeForOffers: true, activeSegments: onlyBeleza }, 'Geral'), false);
+  assert.equal(isGroupActiveInSegment({ activeForOffers: true, activeSegments: onlyBeleza }, 'BELEZA'), true);
+
+  // Legacy monitored group follows the exact same Geral-only default
+  const legacyMon = { monitored: true };
+  assert.deepEqual(getGroupMonitoredSegments(legacyMon), ['Geral']);
+  assert.equal(isGroupMonitoredInSegment(legacyMon, 'Geral'), true);
+  assert.equal(isGroupMonitoredInSegment(legacyMon, 'BELEZA'), false);
+
+  // New segment auto-dispatch defaults to disabled so it never fires unexpectedly
+  const geralAuto = resolveSegmentConfig(
+    { Geral: { ...INITIAL_AUTO_DISPATCH, enabled: true } },
+    { ...INITIAL_AUTO_DISPATCH, enabled: true },
+    'Geral',
+    createDefaultAutoDispatchForSegment
+  );
+  const belezaAuto = resolveSegmentConfig(
+    { Geral: { ...INITIAL_AUTO_DISPATCH, enabled: true } },
+    { ...INITIAL_AUTO_DISPATCH, enabled: true },
+    'BELEZA',
+    createDefaultAutoDispatchForSegment
+  );
+  assert.equal(geralAuto.enabled, true);
+  assert.equal(belezaAuto.enabled, false);
+
+  // Site capture slug is isolated per segment
+  const belezaSite = createDefaultSiteCaptureForSegment('BELEZA');
+  assert.ok(belezaSite.slug.includes('beleza'));
+  assert.equal(createDefaultMonitoringRulesForSegment().enabled, true);
+
+  // Member monitor owner group scoping: unassigned owner group appears in Geral, not BELEZA
+  assert.equal(
+    isOwnerGroupInSegment({ activeForOffers: false, activeSegments: [], segment: 'Geral' }, 'Geral'),
+    true
+  );
+  assert.equal(
+    isOwnerGroupInSegment({ activeForOffers: false, activeSegments: [], segment: 'Geral' }, 'BELEZA'),
+    false
+  );
+  assert.equal(
+    isOwnerGroupInSegment({ activeForOffers: true, activeSegments: ['BELEZA'], segment: 'Geral' }, 'BELEZA'),
+    true
+  );
+  assert.equal(
+    isOwnerGroupInSegment({ activeForOffers: true, activeSegments: ['BELEZA'], segment: 'Geral' }, 'Geral'),
+    false
+  );
+
+  // Rename and delete helpers preserve unrelated segments
+  const renamedMap = renameSegmentInMap({ Geral: 1, BELEZA: 2 }, 'BELEZA', 'Beleza VIP');
+  assert.deepEqual(renamedMap, { Geral: 1, 'Beleza VIP': 2 });
+  assert.deepEqual(deleteSegmentFromMap(renamedMap, 'Beleza VIP'), { Geral: 1 });
+  assert.deepEqual(replaceSegmentInList(['Geral', 'BELEZA'], 'BELEZA', 'Beleza VIP'), ['Geral', 'Beleza VIP']);
+  assert.deepEqual(removeSegmentFromList(['Geral', 'BELEZA'], 'BELEZA'), ['Geral']);
+});
+
+test('resolveActiveDispatchTargets filters dispatch groups strictly by targetSegment', () => {
+  const dispatchGroups = [
+    {
+      id: 'g-geral',
+      name: 'Grupo Geral',
+      channel: 'WhatsApp' as const,
+      accountId: 'acc-wa-1',
+      accountName: 'Conta 01',
+      membersCount: 10,
+      maxCapacity: 1024,
+      inviteUrl: '',
+      segment: 'Geral',
+      remoteJid: '120363000000000001@g.us',
+      activeForOffers: true,
+      activeSegments: ['Geral'],
+    },
+    {
+      id: 'g-beleza',
+      name: 'Grupo Beleza',
+      channel: 'WhatsApp' as const,
+      accountId: 'acc-wa-1',
+      accountName: 'Conta 01',
+      membersCount: 25,
+      maxCapacity: 1024,
+      inviteUrl: '',
+      segment: 'Geral',
+      remoteJid: '120363000000000002@g.us',
+      activeForOffers: true,
+      activeSegments: ['BELEZA'],
+    },
+    {
+      id: 'g-legacy',
+      name: 'Grupo Legado',
+      channel: 'WhatsApp' as const,
+      accountId: 'acc-wa-1',
+      accountName: 'Conta 01',
+      membersCount: 40,
+      maxCapacity: 1024,
+      inviteUrl: '',
+      segment: 'Geral',
+      remoteJid: '120363000000000003@g.us',
+      activeForOffers: true,
+    },
+  ];
+
+  const geralTargets = resolveActiveDispatchTargets({
+    dispatchGroups,
+    targetSegment: 'Geral',
+  });
+  assert.deepEqual(
+    geralTargets.waGroups.map((g) => g.name),
+    ['Grupo Geral', 'Grupo Legado']
+  );
+
+  const belezaTargets = resolveActiveDispatchTargets({
+    dispatchGroups,
+    targetSegment: 'BELEZA',
+  });
+  assert.deepEqual(
+    belezaTargets.waGroups.map((g) => g.name),
+    ['Grupo Beleza']
+  );
+
+  const emptySegTargets = resolveActiveDispatchTargets({
+    dispatchGroups,
+    targetSegment: 'TECH',
+  });
+  assert.equal(emptySegTargets.waGroups.length, 0);
+});
+
 
 
 

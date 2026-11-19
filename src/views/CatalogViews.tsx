@@ -48,6 +48,11 @@ import {
 } from '../utils/apiClient';
 import { needsAffiliateReconversion } from '../utils/affiliateUrlRules';
 import { FALLBACK_PLATFORM_CATEGORIES, PlatformCategory } from '../utils/catalogCategories';
+import {
+  isGroupActiveInSegment,
+  matchesSegment,
+  normalizeSegmentName,
+} from '../utils/segmentScoping';
 
 function getPlatformAccent(platform: Marketplace): string {
   switch (platform) {
@@ -241,11 +246,14 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
             artworkKey: 'earbuds',
             customImageUrl: item.imageUrl || undefined,
             isFavorite: products.some(
-              (p) => (p.id === item.id || p.originalUrl === item.originalUrl) && p.isFavorite
+              (p) =>
+                matchesSegment(p.segment, activeSegment) &&
+                (p.id === item.id || p.originalUrl === item.originalUrl) &&
+                p.isFavorite
             ),
             isPrioritized: false,
             salesRank: (targetPage - 1) * targetLimit + idx + 1,
-            segment: activeSegment,
+            segment: normalizeSegmentName(activeSegment),
             createdAt: new Date().toISOString(),
           }));
 
@@ -317,22 +325,28 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
   useEffect(() => {
     if (mode !== 'vitrine') {
       setCurrentPage(1);
+      setSelectedIds([]);
     }
-  }, [mode, priorityFilter, effectiveQuery, sortBy]);
+  }, [mode, activeSegment, priorityFilter, effectiveQuery, sortBy]);
+
+  const segmentProducts = useMemo(
+    () => products.filter((p) => matchesSegment(p.segment, activeSegment)),
+    [products, activeSegment]
+  );
 
   const sourceList = useMemo(() => {
     if (mode === 'vitrine') {
       return liveOffers.length > 0 ? liveOffers : [];
     }
-    return products;
-  }, [mode, liveOffers, products]);
+    return segmentProducts;
+  }, [mode, liveOffers, segmentProducts]);
 
   const catalogBaseList = useMemo(() => {
     if (mode === 'favoritos') {
-      return products.filter((p) => p.isFavorite);
+      return segmentProducts.filter((p) => p.isFavorite);
     }
-    return products;
-  }, [mode, products]);
+    return segmentProducts;
+  }, [mode, segmentProducts]);
 
   const platformCounts = useMemo(() => {
     const counts: Record<Marketplace, number> = {
@@ -472,24 +486,66 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
   };
 
   const saveLiveOfferToCatalog = (offer: Product) => {
-    if (products.some((p) => p.id === offer.id || p.originalUrl === offer.originalUrl)) {
-      notify('Já está nos seus Produtos', offer.title, 'info');
+    const seg = normalizeSegmentName(activeSegment);
+    if (
+      segmentProducts.some(
+        (p) =>
+          p.id === offer.id ||
+          (p.originalUrl && offer.originalUrl && p.originalUrl === offer.originalUrl)
+      )
+    ) {
+      notify(`Já está nos Produtos de "${seg}"`, offer.title, 'info');
       return;
     }
-    setProducts((prev) => [offer, ...prev]);
-    notify('Oferta salva em Produtos!', offer.title);
+    const idExistsGlobally = products.some((p) => p.id === offer.id);
+    const savedCopy: Product = {
+      ...offer,
+      id: idExistsGlobally
+        ? `${offer.id}-${Date.now().toString(36).slice(-4)}`
+        : offer.id,
+      segment: seg,
+      createdAt: new Date().toISOString(),
+    };
+    setProducts((prev) => [savedCopy, ...prev]);
+    notify(`Oferta salva em "${seg}"!`, offer.title);
   };
 
   const toggleFavorite = (id: string) => {
-    const inCatalog = products.some((p) => p.id === id);
-    if (!inCatalog) {
+    const seg = normalizeSegmentName(activeSegment);
+    const inSegmentCatalog = segmentProducts.find((p) => p.id === id);
+    if (!inSegmentCatalog) {
       const fromLive = liveOffers.find((o) => o.id === id);
       if (fromLive) {
-        setProducts((prev) => [{ ...fromLive, isFavorite: true }, ...prev]);
+        const existingByUrl = segmentProducts.find(
+          (p) => p.originalUrl && fromLive.originalUrl && p.originalUrl === fromLive.originalUrl
+        );
+        if (existingByUrl) {
+          const nextFav = !existingByUrl.isFavorite;
+          setProducts((prev) =>
+            prev.map((p) => (p.id === existingByUrl.id ? { ...p, isFavorite: nextFav } : p))
+          );
+          setLiveOffers((prev) =>
+            prev.map((o) => (o.id === id ? { ...o, isFavorite: nextFav } : o))
+          );
+          notify('Favoritos atualizados');
+          return;
+        }
+        const idExistsGlobally = products.some((p) => p.id === fromLive.id);
+        setProducts((prev) => [
+          {
+            ...fromLive,
+            id: idExistsGlobally
+              ? `${fromLive.id}-${Date.now().toString(36).slice(-4)}`
+              : fromLive.id,
+            segment: seg,
+            isFavorite: true,
+          },
+          ...prev,
+        ]);
         setLiveOffers((prev) =>
           prev.map((o) => (o.id === id ? { ...o, isFavorite: true } : o))
         );
-        notify('Salvo em Produtos Favoritos!', fromLive.title);
+        notify(`Salvo nos Favoritos de "${seg}"!`, fromLive.title);
         return;
       }
     }
@@ -510,20 +566,31 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
   };
 
   const addProductToFirstQueue = (product: Product) => {
-    if (!products.some((p) => p.id === product.id)) {
-      setProducts((prev) => [product, ...prev]);
+    const seg = normalizeSegmentName(activeSegment);
+    let targetProdId = product.id;
+    if (!segmentProducts.some((p) => p.id === product.id)) {
+      const idExistsGlobally = products.some((p) => p.id === product.id);
+      targetProdId = idExistsGlobally
+        ? `${product.id}-${Date.now().toString(36).slice(-4)}`
+        : product.id;
+      setProducts((prev) => [{ ...product, id: targetProdId, segment: seg }, ...prev]);
     }
-    if (queues.length === 0) {
-      notify('Crie uma fila primeiro', 'Vá em Filas de disparo para criar uma fila.', 'info');
+    const segQueues = queues.filter((q) => matchesSegment(q.segment, seg));
+    if (segQueues.length === 0) {
+      notify(
+        'Crie uma fila neste segmento primeiro',
+        `Vá em Filas de disparo no segmento "${seg}" para criar uma fila.`,
+        'info'
+      );
       return;
     }
-    const targetQueue = queues[0];
+    const targetQueue = segQueues[0];
     setQueues((prev) =>
-      prev.map((q, idx) =>
-        idx === 0
+      prev.map((q) =>
+        q.id === targetQueue.id
           ? {
               ...q,
-              productIds: [...q.productIds, product.id],
+              productIds: [...q.productIds, targetProdId],
               totalCount: q.totalCount + 1,
             }
           : q
@@ -605,8 +672,9 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
     const rendered = renderProductMessage(sendModalProduct, tpl, integrations);
 
     if (sendTiming === 'schedule') {
+      const targets = selectedSegments.length > 0 ? selectedSegments : [activeSegment];
       const targetGroupIds = dispatchGroups
-        .filter((g) => g.activeForOffers)
+        .filter((g) => targets.some((seg) => isGroupActiveInSegment(g, seg)))
         .map((g) => g.id);
       setSchedules((prev) => [
         {
@@ -618,6 +686,7 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
           recurrence: 'Único',
           status: 'Pendente',
           platform: sendModalProduct.platform,
+          segment: normalizeSegmentName(targets[0] || activeSegment),
         },
         ...prev,
       ]);
@@ -748,6 +817,9 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
               ? 'Produtos Favoritos'
               : 'Vitrine de Ofertas'}
           </h1>
+          <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200/70 dark:border-emerald-800/60 px-2.5 py-0.5 rounded-lg">
+            {activeSegment}
+          </span>
         </div>
 
         <div className="flex items-center gap-2">
@@ -1057,11 +1129,22 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
           {displayedProducts.map((product) => {
             const isSelected = selectedIds.includes(product.id);
-            const isSavedInCatalog = products.some(
+            const isSavedInCatalog = segmentProducts.some(
               (p) =>
                 p.id === product.id ||
                 (p.originalUrl && product.originalUrl && p.originalUrl === product.originalUrl)
             );
+            const isFavoritedInSegment =
+              mode === 'vitrine'
+                ? segmentProducts.some(
+                    (p) =>
+                      p.isFavorite &&
+                      (p.id === product.id ||
+                        (p.originalUrl &&
+                          product.originalUrl &&
+                          p.originalUrl === product.originalUrl))
+                  )
+                : product.isFavorite;
             return (
               <div
                 key={product.id}
@@ -1106,12 +1189,12 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
                     <button
                       type="button"
                       onClick={() => toggleFavorite(product.id)}
-                      title={product.isFavorite ? 'Remover dos favoritos' : 'Favoritar'}
+                      title={isFavoritedInSegment ? 'Remover dos favoritos' : 'Favoritar'}
                       className="absolute bottom-3 right-3 w-8 h-8 rounded-full bg-white/95 dark:bg-slate-900/95 border border-slate-200/80 dark:border-slate-700/80 flex items-center justify-center shadow-xs hover:scale-105 transition-transform"
                     >
                       <Star
                         className={`w-4 h-4 ${
-                          product.isFavorite
+                          isFavoritedInSegment
                             ? 'fill-amber-400 text-amber-400'
                             : 'text-slate-400'
                         }`}
@@ -1858,7 +1941,8 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
  * CUPONS VIEW (Telas 26–29)
  * ========================================================================== */
 export const CouponsView: React.FC = () => {
-  const { coupons, setCoupons, dispatchGroups, dispatchCustomMessage, notify } = useApp();
+  const { coupons, setCoupons, dispatchGroups, dispatchCustomMessage, activeSegment, notify } =
+    useApp();
   const [tab, setTab] = useState<'meus' | 'vitrine'>('meus');
   const [codeSearch, setCodeSearch] = useState('');
   const [platformFilter, setPlatformFilter] = useState('Todas plataformas');
@@ -1874,7 +1958,10 @@ export const CouponsView: React.FC = () => {
   const [newAuto, setNewAuto] = useState(false);
 
   const visibleCoupons = coupons.filter((c) => {
-    if (tab === 'meus' && c.isShowcase) return false;
+    if (tab === 'meus') {
+      if (c.isShowcase) return false;
+      if (!matchesSegment(c.segment, activeSegment)) return false;
+    }
     if (tab === 'vitrine' && !c.isShowcase) return false;
     if (codeSearch.trim() && !c.code.toLowerCase().includes(codeSearch.trim().toLowerCase())) {
       return false;
@@ -1901,13 +1988,14 @@ export const CouponsView: React.FC = () => {
       isAutomatic: newAuto,
       isShowcase: false,
       expiresAt: '2026-12-31',
+      segment: normalizeSegmentName(activeSegment),
     };
     setCoupons((prev) => [item, ...prev]);
     setTab('meus');
     setModalOpen(false);
     setNewCode('');
     setNewDesc('');
-    notify('Cupom cadastrado!', `Código ${item.code} adicionado em Meus Cupons.`);
+    notify('Cupom cadastrado!', `Código ${item.code} adicionado em "${activeSegment}".`);
   };
 
   return (
@@ -2060,11 +2148,13 @@ export const CouponsView: React.FC = () => {
                 <button
                   type="button"
                   onClick={async () => {
-                    const activeGroups = dispatchGroups.filter((g) => g.activeForOffers);
+                    const activeGroups = dispatchGroups.filter((g) =>
+                      isGroupActiveInSegment(g, activeSegment)
+                    );
                     if (activeGroups.length === 0) {
                       notify(
-                        'Nenhum grupo de envio ativo',
-                        'Ative pelo menos um grupo real em Grupos de Envio para disparar.',
+                        `Nenhum grupo ativo em "${activeSegment}"`,
+                        'Ative pelo menos um grupo em Grupos de Envio neste segmento para disparar.',
                         'info'
                       );
                       return;
@@ -2078,6 +2168,7 @@ export const CouponsView: React.FC = () => {
                       groupsNames: activeGroups.map((g) => g.name),
                       groupIds: activeGroups.map((g) => g.id),
                       platform: c.platform,
+                      segment: activeSegment,
                     });
                   }}
                   className="flex-1 py-2 px-3 rounded-xl bg-[#15803D] hover:bg-emerald-800 text-white text-xs font-semibold flex items-center justify-center gap-1.5"

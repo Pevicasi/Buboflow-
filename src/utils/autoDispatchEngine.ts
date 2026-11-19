@@ -6,6 +6,11 @@ import {
   SavedGroupPreference,
   SentLog,
 } from '../types';
+import {
+  DEFAULT_SEGMENT,
+  isGroupActiveInSegment,
+  normalizeSegmentName,
+} from './segmentScoping';
 
 export function parseTimeToMinutes(hhmm: string, fallbackMinutes = 0): number {
   const match = String(hhmm || '')
@@ -324,13 +329,16 @@ export function resolveActiveDispatchTargets(state: {
   dispatchGroups?: DispatchGroup[];
   savedGroupPrefs?: Record<string, SavedGroupPreference>;
   activeSegment?: string;
+  targetSegment?: string;
 }): ResolvedAutoDispatchTargets {
   const waByJid = new Map<string, { remoteJid: string; name: string; accountId?: string }>();
   const tgByJid = new Map<string, { remoteJid: string; name: string; accountId?: string }>();
+  const seg = normalizeSegmentName(state.targetSegment ?? state.activeSegment ?? DEFAULT_SEGMENT);
 
   const groups = Array.isArray(state.dispatchGroups) ? state.dispatchGroups : [];
   for (const g of groups) {
-    if (!g || !g.activeForOffers || !g.remoteJid) continue;
+    if (!g || !g.remoteJid) continue;
+    if (!isGroupActiveInSegment(g, seg)) continue;
     const jid = String(g.remoteJid).trim();
     if (!jid) continue;
     if (g.channel === 'WhatsApp') {
@@ -348,10 +356,10 @@ export function resolveActiveDispatchTargets(state: {
     }
   }
 
-  // Fallback: if browser is closed and dispatchGroups was stripped on boot, check savedGroupPrefs for active WhatsApp groups
+  // Fallback: if browser is closed and dispatchGroups was stripped on boot, check savedGroupPrefs for active WhatsApp groups in this segment
   const prefs = state.savedGroupPrefs || {};
   for (const [key, pref] of Object.entries(prefs)) {
-    if (!pref?.activeForOffers) continue;
+    if (!pref || !isGroupActiveInSegment(pref, seg)) continue;
     if (key.startsWith('wa:')) {
       const jid = key.slice(3).trim();
       if (jid && !waByJid.has(jid.toLowerCase())) {

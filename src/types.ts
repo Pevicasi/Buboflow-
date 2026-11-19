@@ -82,6 +82,7 @@ export interface Coupon {
   isShowcase?: boolean;
   expiresAt: string;
   link?: string;
+  segment?: string;
 }
 
 export interface ChannelAccount {
@@ -110,6 +111,7 @@ export interface DispatchGroup {
   isAdmin?: boolean;
   isOwnerOrAdmin?: boolean;
   activeForOffers: boolean;
+  activeSegments?: string[];
   membersCount: number;
   maxCapacity: number;
   inviteUrl: string;
@@ -125,6 +127,7 @@ export interface MonitoringGroup {
   accountName: string;
   remoteJid?: string;
   monitored: boolean;
+  monitoredSegments?: string[];
   capturedToday: number;
   useGroupImage?: boolean;
   allowedMarketplaces?: Marketplace[];
@@ -132,7 +135,9 @@ export interface MonitoringGroup {
 
 export interface SavedGroupPreference {
   activeForOffers?: boolean;
+  activeSegments?: string[];
   monitored?: boolean;
+  monitoredSegments?: string[];
   useGroupImage?: boolean;
   allowedMarketplaces?: Marketplace[];
   segment?: string;
@@ -154,6 +159,7 @@ export interface ScheduledItem {
   status: 'Pendente' | 'Enviado';
   platform?: Marketplace;
   imageUrl?: string;
+  segment?: string;
 }
 
 export interface DispatchQueue {
@@ -197,6 +203,7 @@ export interface SentLog {
   artworkKey?: ProductArtworkKey;
   customImageUrl?: string;
   affiliateUrl?: string;
+  segment?: string;
 }
 
 export interface ConvertedLinkItem {

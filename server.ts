@@ -56,8 +56,25 @@ import {
   selectProductsForAutoDispatch,
 } from './src/utils/autoDispatchEngine.ts';
 import { renderProductMessage } from './src/utils/templateEngine.ts';
-import { INITIAL_INTEGRATIONS, INITIAL_TEMPLATES } from './src/data/initialData.ts';
+import {
+  INITIAL_AUTO_DISPATCH,
+  INITIAL_INTEGRATIONS,
+  INITIAL_MONITORING_RULES,
+  INITIAL_TEMPLATES,
+} from './src/data/initialData.ts';
 import { detectGroupAdminRole } from './src/utils/memberMonitorAnalytics.ts';
+import {
+  DEFAULT_SEGMENT,
+  createDefaultAutoDispatchForSegment,
+  createDefaultMonitoringRulesForSegment,
+  createDefaultTemplatesForSegment,
+  dedupeSegmentNames,
+  getGroupActiveSegments,
+  getGroupMonitoredSegments,
+  matchesSegment,
+  normalizeSegmentName,
+  resolveSegmentConfig,
+} from './src/utils/segmentScoping.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -918,7 +935,10 @@ function mergeRealProducts(primary: any[], secondary: any[]): any[] {
   const byKey = new Map<string, any>();
   const addItem = (p: any) => {
     if (!p || FICTIONAL_PRODUCT_IDS.has(String(p.id))) return;
-    const urlKey = p.originalUrl ? `url:${String(p.originalUrl).split('?')[0]}` : '';
+    const segKey = normalizeSegmentName(p.segment).toLowerCase();
+    const urlKey = p.originalUrl
+      ? `url:${segKey}::${String(p.originalUrl).split('?')[0]}`
+      : '';
     const idKey = `id:${p.id}`;
     if (urlKey && byKey.has(urlKey)) return;
     if (byKey.has(idKey)) return;
@@ -1017,17 +1037,19 @@ function extractTextFromWaMessage(msg: any): string {
 
 interface MonitoredGroupServerConfig {
   monitored: boolean;
+  monitoredSegments: string[];
   useGroupImage: boolean;
   allowedMarketplaces: string[] | null;
 }
 
 function getMonitoredGroupConfigOnServer(groupJid: string): MonitoredGroupServerConfig {
   const norm = normalizeServerGroupJid(groupJid);
-  if (!norm) return { monitored: false, useGroupImage: false, allowedMarketplaces: null };
+  if (!norm) {
+    return { monitored: false, monitoredSegments: [], useGroupImage: false, allowedMarketplaces: null };
+  }
   const st = panelStore.state;
-  if (!st) return { monitored: false, useGroupImage: false, allowedMarketplaces: null };
-  if (st.monitoringRules && st.monitoringRules.enabled === false) {
-    return { monitored: false, useGroupImage: false, allowedMarketplaces: null };
+  if (!st) {
+    return { monitored: false, monitoredSegments: [], useGroupImage: false, allowedMarketplaces: null };
   }
 
   const savedPref = st.savedGroupPrefs?.[`wa:${norm}`];
@@ -1035,7 +1057,23 @@ function getMonitoredGroupConfigOnServer(groupJid: string): MonitoredGroupServer
     ? st.monitoringGroups.find((g: any) => normalizeServerGroupJid(g?.remoteJid) === norm)
     : null;
 
-  const monitored = match ? Boolean(match.monitored) : Boolean(savedPref?.monitored);
+  const candidateSegments = match
+    ? getGroupMonitoredSegments(match)
+    : savedPref
+    ? getGroupMonitoredSegments(savedPref)
+    : [];
+
+  const enabledSegments = candidateSegments.filter((seg) => {
+    const segRules = resolveSegmentConfig(
+      st.monitoringRulesBySegment,
+      st.monitoringRules || INITIAL_MONITORING_RULES,
+      seg,
+      createDefaultMonitoringRulesForSegment
+    );
+    return segRules.enabled !== false;
+  });
+
+  const monitored = enabledSegments.length > 0;
   const useGroupImage = Boolean(match?.useGroupImage ?? savedPref?.useGroupImage ?? false);
   const rawMarkets =
     Array.isArray(match?.allowedMarketplaces) && match.allowedMarketplaces.length > 0
@@ -1046,6 +1084,7 @@ function getMonitoredGroupConfigOnServer(groupJid: string): MonitoredGroupServer
 
   return {
     monitored,
+    monitoredSegments: enabledSegments,
     useGroupImage,
     allowedMarketplaces: rawMarkets,
   };
@@ -1141,45 +1180,65 @@ async function processMonitoredGroupMessage(params: {
   if (candidateUrls.length === 0) return;
 
   const st = panelStore.state || {};
-  const rules = st.monitoringRules || {};
   const lowerText = text.toLowerCase();
-
-  if (Array.isArray(rules.restrictedWords) && rules.restrictedWords.length > 0) {
-    if (rules.restrictedWords.some((w: string) => w && lowerText.includes(w.toLowerCase()))) {
-      return;
-    }
-  }
-  if (Array.isArray(rules.allowedWords) && rules.allowedWords.length > 0) {
-    if (!rules.allowedWords.some((w: string) => w && lowerText.includes(w.toLowerCase()))) {
-      return;
-    }
-  }
-
-  const avoidHours = Math.max(0, Number(rules.avoidDuplicateHours) || 0);
-  const avoidMs = avoidHours * 3600_000;
   const credentials = st.integrations || {};
-  const activeSegment = st.activeSegment || 'Geral';
+
+  // Evaluate monitoring rules independently for each segment monitoring this group
+  const segmentPlans = groupCfg.monitoredSegments
+    .map((seg) => {
+      const rules = resolveSegmentConfig(
+        st.monitoringRulesBySegment,
+        st.monitoringRules || INITIAL_MONITORING_RULES,
+        seg,
+        createDefaultMonitoringRulesForSegment
+      );
+      if (rules.enabled === false) return null;
+      if (Array.isArray(rules.restrictedWords) && rules.restrictedWords.length > 0) {
+        if (rules.restrictedWords.some((w: string) => w && lowerText.includes(w.toLowerCase()))) {
+          return null;
+        }
+      }
+      if (Array.isArray(rules.allowedWords) && rules.allowedWords.length > 0) {
+        if (!rules.allowedWords.some((w: string) => w && lowerText.includes(w.toLowerCase()))) {
+          return null;
+        }
+      }
+      const avoidHours = Math.max(0, Number(rules.avoidDuplicateHours) || 0);
+      return { segment: seg, avoidMs: avoidHours * 3600_000 };
+    })
+    .filter(Boolean) as { segment: string; avoidMs: number }[];
+
+  if (segmentPlans.length === 0) return;
+
+  const existingProducts: any[] = Array.isArray(st.products) ? st.products : [];
 
   for (const targetUrl of candidateUrls.slice(0, 2)) {
-    const dedupeKey = targetUrl.split('?')[0].toLowerCase();
-    const lastTs = recentCapturedUrls.get(dedupeKey);
-    if (avoidMs > 0 && lastTs && Date.now() - lastTs < avoidMs) {
-      continue;
-    }
+    const cleanBaseUrl = targetUrl.split('?')[0].toLowerCase();
 
-    const existingProducts: any[] = Array.isArray(st.products) ? st.products : [];
-    const alreadyExists = existingProducts.some((p) => {
-      const pUrl = String(p?.originalUrl || '').split('?')[0].toLowerCase();
-      if (pUrl && pUrl === dedupeKey) {
-        if (avoidMs === 0) return true;
-        const createdTs = Date.parse(String(p?.createdAt || ''));
-        return !Number.isFinite(createdTs) || Date.now() - createdTs < avoidMs;
+    const eligiblePlans = segmentPlans.filter(({ segment, avoidMs }) => {
+      const dedupeKey = `${segment.toLowerCase()}::${cleanBaseUrl}`;
+      const lastTs = recentCapturedUrls.get(dedupeKey);
+      if (avoidMs > 0 && lastTs && Date.now() - lastTs < avoidMs) {
+        return false;
       }
-      return false;
+      const alreadyExists = existingProducts.some((p) => {
+        if (!matchesSegment(p?.segment, segment)) return false;
+        const pUrl = String(p?.originalUrl || '').split('?')[0].toLowerCase();
+        if (pUrl && pUrl === cleanBaseUrl) {
+          if (avoidMs === 0) return true;
+          const createdTs = Date.parse(String(p?.createdAt || ''));
+          return !Number.isFinite(createdTs) || Date.now() - createdTs < avoidMs;
+        }
+        return false;
+      });
+      return !alreadyExists;
     });
-    if (alreadyExists) continue;
 
-    recentCapturedUrls.set(dedupeKey, Date.now());
+    if (eligiblePlans.length === 0) continue;
+
+    for (const plan of eligiblePlans) {
+      recentCapturedUrls.set(`${plan.segment.toLowerCase()}::${cleanBaseUrl}`, Date.now());
+    }
 
     try {
       const extracted = await extractOfferFromUrl(targetUrl, credentials, text);
@@ -1216,8 +1275,9 @@ async function processMonitoredGroupMessage(params: {
           ? groupImageUrl
           : extracted.imageUrl || undefined;
 
-      const capturedProduct = {
-        id: `prod-mon-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      const createdAtIso = new Date().toISOString();
+      const newCapturedProducts = eligiblePlans.map((plan, idx) => ({
+        id: `prod-mon-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
         title: extracted.title,
         platform: extracted.platform,
         category: 'Capturado no Monitoramento',
@@ -1234,9 +1294,9 @@ async function processMonitoredGroupMessage(params: {
         isFavorite: false,
         isPrioritized: false,
         salesRank: 1,
-        segment: activeSegment,
-        createdAt: new Date().toISOString(),
-      };
+        segment: plan.segment,
+        createdAt: createdAtIso,
+      }));
 
       const curState = panelStore.state || {};
       const curList = Array.isArray(curState.products) ? curState.products : [];
@@ -1250,16 +1310,18 @@ async function processMonitoredGroupMessage(params: {
 
       panelStore.state = {
         ...curState,
-        products: [capturedProduct, ...curList],
+        products: [...newCapturedProducts, ...curList],
         monitoringGroups: updatedMonitoring,
       };
       panelStore.hasServerState = true;
       panelStore.version += 1;
-      panelStore.updatedAt = new Date().toISOString();
+      panelStore.updatedAt = createdAtIso;
       saveStoredPanelState();
 
       console.log(
-        `[Monitoramento] Capturado (${extracted.platform}) do grupo ${normJid}: ${extracted.title}${
+        `[Monitoramento] Capturado (${extracted.platform}) do grupo ${normJid} para [${eligiblePlans
+          .map((p) => p.segment)
+          .join(', ')}]: ${extracted.title}${
           chosenImageUrl ? ' [com foto real]' : ' [sem foto]'
         }`
       );
@@ -4219,11 +4281,21 @@ async function startServer() {
         for (const k of allPrefKeys) {
           const cp = curPrefs[k] || {};
           const ip = incPrefs[k] || {};
+          const mergedActiveSegments = dedupeSegmentNames([
+            ...getGroupActiveSegments(cp),
+            ...getGroupActiveSegments(ip),
+          ]);
+          const mergedMonitoredSegments = dedupeSegmentNames([
+            ...getGroupMonitoredSegments(cp),
+            ...getGroupMonitoredSegments(ip),
+          ]);
           mergedPrefs[k] = {
             ...ip,
             ...cp,
-            activeForOffers: Boolean(cp.activeForOffers || ip.activeForOffers),
-            monitored: Boolean(cp.monitored || ip.monitored),
+            activeForOffers: mergedActiveSegments.length > 0,
+            activeSegments: mergedActiveSegments,
+            monitored: mergedMonitoredSegments.length > 0,
+            monitoredSegments: mergedMonitoredSegments,
             useGroupImage: Boolean(cp.useGroupImage ?? ip.useGroupImage ?? false),
             allowedMarketplaces: cp.allowedMarketplaces ?? ip.allowedMarketplaces,
             isPriorityCapture: Boolean(cp.isPriorityCapture || ip.isPriorityCapture),
@@ -4233,14 +4305,18 @@ async function startServer() {
           ? cur.monitoringGroups.map((m: any) => {
               const norm = normalizeServerGroupJid(m?.remoteJid);
               const pref = norm ? mergedPrefs[`wa:${norm}`] : null;
-              return pref
-                ? {
-                    ...m,
-                    monitored: Boolean(m.monitored || pref.monitored),
-                    useGroupImage: Boolean(m.useGroupImage ?? pref.useGroupImage ?? false),
-                    allowedMarketplaces: m.allowedMarketplaces ?? pref.allowedMarketplaces,
-                  }
-                : m;
+              if (!pref) return m;
+              const segs = dedupeSegmentNames([
+                ...getGroupMonitoredSegments(m),
+                ...getGroupMonitoredSegments(pref),
+              ]);
+              return {
+                ...m,
+                monitored: segs.length > 0,
+                monitoredSegments: segs,
+                useGroupImage: Boolean(m.useGroupImage ?? pref.useGroupImage ?? false),
+                allowedMarketplaces: m.allowedMarketplaces ?? pref.allowedMarketplaces,
+              };
             })
           : incoming.monitoringGroups || [];
         const mergedIntegrations = mergeNonEmptyCreds(
@@ -4253,6 +4329,22 @@ async function startServer() {
           savedGroupPrefs: mergedPrefs,
           monitoringGroups: mergedMonitoringGroups,
           integrations: mergedIntegrations,
+          autoDispatchBySegment: {
+            ...(incoming.autoDispatchBySegment || {}),
+            ...(cur.autoDispatchBySegment || {}),
+          },
+          templatesBySegment: {
+            ...(incoming.templatesBySegment || {}),
+            ...(cur.templatesBySegment || {}),
+          },
+          siteCaptureBySegment: {
+            ...(incoming.siteCaptureBySegment || {}),
+            ...(cur.siteCaptureBySegment || {}),
+          },
+          monitoringRulesBySegment: {
+            ...(incoming.monitoringRulesBySegment || {}),
+            ...(cur.monitoringRulesBySegment || {}),
+          },
           sentLogs:
             cur.sentLogs?.length >= (incoming.sentLogs?.length || 0)
               ? cur.sentLogs
@@ -4276,6 +4368,7 @@ async function startServer() {
 
       // Normal browser edit: preserve any server-captured products & server auto-dispatched logs added while client was slightly behind
       const prevAutoDispatch = panelStore.state?.autoDispatch;
+      const prevAutoDispatchBySegment = panelStore.state?.autoDispatchBySegment || {};
       const serverProducts: any[] = Array.isArray(panelStore.state.products)
         ? panelStore.state.products
         : [];
@@ -4324,15 +4417,33 @@ async function startServer() {
       panelStore.updatedAt = new Date().toISOString();
       saveStoredPanelState();
 
-      // If auto-dispatch was just enabled or interval shortened, adjust next run promptly
-      const nextAuto = panelStore.state?.autoDispatch;
-      if (nextAuto?.enabled) {
-        if (!prevAutoDispatch?.enabled) {
-          autoDispatchRuntime.nextRunAt = Date.now() + 10_000;
-        } else {
-          const maxMs = Math.max(1, Number(nextAuto.maxIntervalMinutes) || 6) * 60_000;
-          if (autoDispatchRuntime.nextRunAt > Date.now() + maxMs) {
-            autoDispatchRuntime.nextRunAt = Date.now() + maxMs;
+      // If auto-dispatch was just enabled or interval shortened for any segment, adjust that segment's next run promptly
+      const allSegments = dedupeSegmentNames([
+        DEFAULT_SEGMENT,
+        ...(Array.isArray(panelStore.state?.segments) ? panelStore.state.segments : []),
+      ]);
+      for (const seg of allSegments) {
+        const prevCfg = resolveSegmentConfig(
+          prevAutoDispatchBySegment,
+          prevAutoDispatch || INITIAL_AUTO_DISPATCH,
+          seg,
+          createDefaultAutoDispatchForSegment
+        );
+        const nextCfg = resolveSegmentConfig(
+          panelStore.state?.autoDispatchBySegment,
+          panelStore.state?.autoDispatch || INITIAL_AUTO_DISPATCH,
+          seg,
+          createDefaultAutoDispatchForSegment
+        );
+        if (nextCfg?.enabled) {
+          const rt = getAutoDispatchSegmentRuntime(seg);
+          if (!prevCfg?.enabled) {
+            rt.nextRunAt = Date.now() + 10_000;
+          } else {
+            const maxMs = Math.max(1, Number(nextCfg.maxIntervalMinutes) || 6) * 60_000;
+            if (rt.nextRunAt > Date.now() + maxMs) {
+              rt.nextRunAt = Date.now() + maxMs;
+            }
           }
         }
       }
@@ -5822,14 +5933,33 @@ async function startServer() {
     };
   }
 
-  const autoDispatchRuntime = {
-    running: false,
-    nextRunAt: Date.now() + 25_000,
-    lastRunAt: 0,
-    recentProductIds: [] as string[],
-  };
+  interface AutoDispatchSegmentRuntime {
+    running: boolean;
+    nextRunAt: number;
+    lastRunAt: number;
+    recentProductIds: string[];
+  }
 
-  async function runAutoDispatchCycle(options: { manual?: boolean } = {}): Promise<{
+  const autoDispatchRuntimeBySegment = new Map<string, AutoDispatchSegmentRuntime>();
+
+  function getAutoDispatchSegmentRuntime(segment?: string): AutoDispatchSegmentRuntime {
+    const key = normalizeSegmentName(segment).toLowerCase();
+    let rt = autoDispatchRuntimeBySegment.get(key);
+    if (!rt) {
+      rt = {
+        running: false,
+        nextRunAt: Date.now() + 25_000,
+        lastRunAt: 0,
+        recentProductIds: [],
+      };
+      autoDispatchRuntimeBySegment.set(key, rt);
+    }
+    return rt;
+  }
+
+  async function runAutoDispatchCycle(
+    options: { manual?: boolean; segment?: string } = {}
+  ): Promise<{
     ok: boolean;
     skipped?: boolean;
     reason?: string;
@@ -5838,18 +5968,6 @@ async function startServer() {
     titles: string[];
     error?: string;
   }> {
-    if (autoDispatchRuntime.running) {
-      return {
-        ok: false,
-        skipped: true,
-        reason: 'already_running',
-        sentProductsCount: 0,
-        sentGroupsCount: 0,
-        titles: [],
-        error: 'Já existe um disparo automático em execução.',
-      };
-    }
-
     const st = panelStore.state;
     if (!st) {
       return {
@@ -5863,7 +5981,29 @@ async function startServer() {
       };
     }
 
-    const cfg = st.autoDispatch;
+    const targetSegment = normalizeSegmentName(
+      options.segment || st.activeSegment || DEFAULT_SEGMENT
+    );
+    const segmentRuntime = getAutoDispatchSegmentRuntime(targetSegment);
+
+    if (segmentRuntime.running) {
+      return {
+        ok: false,
+        skipped: true,
+        reason: 'already_running',
+        sentProductsCount: 0,
+        sentGroupsCount: 0,
+        titles: [],
+        error: `Já existe um disparo automático em execução no segmento "${targetSegment}".`,
+      };
+    }
+
+    const cfg = resolveSegmentConfig(
+      st.autoDispatchBySegment,
+      st.autoDispatch || INITIAL_AUTO_DISPATCH,
+      targetSegment,
+      createDefaultAutoDispatchForSegment
+    );
     if (!options.manual && !cfg?.enabled) {
       return {
         ok: false,
@@ -5875,24 +6015,7 @@ async function startServer() {
       };
     }
 
-    const effectiveCfg = cfg || {
-      enabled: true,
-      startTime: '07:00',
-      endTime: '22:00',
-      minIntervalMinutes: 2,
-      maxIntervalMinutes: 6,
-      minProductsPerRun: 1,
-      maxProductsPerRun: 1,
-      distribution: {
-        Shopee: 0,
-        'Mercado Livre': 0,
-        Amazon: 0,
-        Magalu: 0,
-        Netshoes: 0,
-        AliExpress: 0,
-      },
-      sendOrder: 'Aleatório' as const,
-    };
+    const effectiveCfg = cfg || createDefaultAutoDispatchForSegment();
 
     const brTime = getBrazilTimeInfo(new Date());
     const inWindow = isWithinDispatchWindow(
@@ -5915,7 +6038,7 @@ async function startServer() {
     const targets = resolveActiveDispatchTargets({
       dispatchGroups: st.dispatchGroups,
       savedGroupPrefs: st.savedGroupPrefs,
-      activeSegment: st.activeSegment,
+      targetSegment,
     });
 
     const accounts: any[] = Array.isArray(st.accounts) ? st.accounts : [];
@@ -5940,8 +6063,7 @@ async function startServer() {
         sentProductsCount: 0,
         sentGroupsCount: 0,
         titles: [],
-        error:
-          'Nenhum grupo com "Enviar Ofertas" ativado. Ative ao menos um grupo em Grupos de Envio.',
+        error: `Nenhum grupo com "Enviar Ofertas" ativado no segmento "${targetSegment}". Ative ao menos um grupo em Grupos de Envio.`,
       };
     }
 
@@ -5958,12 +6080,17 @@ async function startServer() {
       };
     }
 
-    const productsList = Array.isArray(st.products) ? st.products : [];
+    const productsList = (Array.isArray(st.products) ? st.products : []).filter((p: any) =>
+      matchesSegment(p?.segment, targetSegment)
+    );
+    const segmentSentLogs = (Array.isArray(st.sentLogs) ? st.sentLogs : []).filter((l: any) =>
+      matchesSegment(l?.segment, targetSegment)
+    );
     const chosenProducts = selectProductsForAutoDispatch({
       products: productsList,
       config: effectiveCfg,
-      sentLogs: Array.isArray(st.sentLogs) ? st.sentLogs : [],
-      recentAutoProductIds: autoDispatchRuntime.recentProductIds,
+      sentLogs: segmentSentLogs,
+      recentAutoProductIds: segmentRuntime.recentProductIds,
     });
 
     if (chosenProducts.length === 0) {
@@ -5974,16 +6101,22 @@ async function startServer() {
         sentProductsCount: 0,
         sentGroupsCount: 0,
         titles: [],
-        error: 'Nenhum produto salvo na aba Produtos para disparar.',
+        error: `Nenhum produto salvo na aba Produtos do segmento "${targetSegment}" para disparar.`,
       };
     }
 
-    autoDispatchRuntime.running = true;
+    segmentRuntime.running = true;
     try {
       const integrations = st.integrations || INITIAL_INTEGRATIONS;
+      const segmentTemplates = resolveSegmentConfig(
+        st.templatesBySegment,
+        st.templates || INITIAL_TEMPLATES,
+        targetSegment,
+        createDefaultTemplatesForSegment
+      );
       const templates =
-        Array.isArray(st.templates) && st.templates.length > 0
-          ? st.templates
+        Array.isArray(segmentTemplates) && segmentTemplates.length > 0
+          ? segmentTemplates
           : INITIAL_TEMPLATES;
 
       let sentProductsCount = 0;
@@ -6117,10 +6250,10 @@ async function startServer() {
           totalGroupDeliveries += deliveredForProduct;
           sentTitles.push(prod.title);
 
-          autoDispatchRuntime.recentProductIds.push(prod.id);
-          if (autoDispatchRuntime.recentProductIds.length >= productsList.length) {
-            // Reset cycle once every saved product has had a turn
-            autoDispatchRuntime.recentProductIds = [prod.id];
+          segmentRuntime.recentProductIds.push(prod.id);
+          if (segmentRuntime.recentProductIds.length >= productsList.length) {
+            // Reset cycle once every saved product in this segment has had a turn
+            segmentRuntime.recentProductIds = [prod.id];
           }
 
           const now = new Date();
@@ -6144,6 +6277,7 @@ async function startServer() {
             artworkKey: prod.artworkKey,
             customImageUrl: prod.customImageUrl,
             affiliateUrl: prod.affiliateUrl,
+            segment: targetSegment,
           };
 
           const curState = panelStore.state || {};
@@ -6161,7 +6295,7 @@ async function startServer() {
           saveStoredPanelState();
 
           console.log(
-            `[Disparo Automático] Enviado e removido da fila de Produtos (${prod.platform}) "${prod.title.slice(0, 50)}" para ${deliveredForProduct} grupo(s) [${brTime.formattedHHMM} BRT].`
+            `[Disparo Automático][${targetSegment}] Enviado e removido da fila de Produtos (${prod.platform}) "${prod.title.slice(0, 50)}" para ${deliveredForProduct} grupo(s) [${brTime.formattedHHMM} BRT].`
           );
         }
 
@@ -6175,8 +6309,8 @@ async function startServer() {
         effectiveCfg.minIntervalMinutes || 2,
         effectiveCfg.maxIntervalMinutes || 6
       );
-      autoDispatchRuntime.lastRunAt = Date.now();
-      autoDispatchRuntime.nextRunAt = Date.now() + nextIntervalMin * 60_000;
+      segmentRuntime.lastRunAt = Date.now();
+      segmentRuntime.nextRunAt = Date.now() + nextIntervalMin * 60_000;
 
       return {
         ok: sentProductsCount > 0,
@@ -6186,13 +6320,17 @@ async function startServer() {
         error: sentProductsCount === 0 ? lastError || 'Não foi possível entregar a oferta.' : undefined,
       };
     } finally {
-      autoDispatchRuntime.running = false;
+      segmentRuntime.running = false;
     }
   }
 
-  app.post('/api/auto-dispatch/run-now', async (_req, res) => {
+  app.post('/api/auto-dispatch/run-now', async (req, res) => {
     try {
-      const result = await runAutoDispatchCycle({ manual: true });
+      const requestedSegment =
+        typeof req.body?.segment === 'string' && req.body.segment.trim()
+          ? req.body.segment.trim()
+          : undefined;
+      const result = await runAutoDispatchCycle({ manual: true, segment: requestedSegment });
       res.json(result);
     } catch (err: any) {
       res.status(500).json({
@@ -6395,13 +6533,29 @@ async function startServer() {
     void reconvertStaleProductAffiliatesInStore().catch(() => {});
   }, 1500);
 
-  // 24/7 Server-Side Auto-Dispatch Scheduler (runs even when no browser tab is open)
+  // 24/7 Server-Side Auto-Dispatch Scheduler per Segment (runs even when no browser tab is open)
   setInterval(() => {
-    if (autoDispatchRuntime.running) return;
-    if (Date.now() < autoDispatchRuntime.nextRunAt) return;
-    void runAutoDispatchCycle({ manual: false }).catch((err: any) => {
-      console.warn('[Disparo Automático] Erro no ciclo automático:', err?.message || err);
-    });
+    const st = panelStore.state;
+    if (!st) return;
+    const allSegments = dedupeSegmentNames([
+      DEFAULT_SEGMENT,
+      ...(Array.isArray(st.segments) ? st.segments : []),
+    ]);
+    const now = Date.now();
+    for (const seg of allSegments) {
+      const cfg = resolveSegmentConfig(
+        st.autoDispatchBySegment,
+        st.autoDispatch || INITIAL_AUTO_DISPATCH,
+        seg,
+        createDefaultAutoDispatchForSegment
+      );
+      if (!cfg?.enabled) continue;
+      const rt = getAutoDispatchSegmentRuntime(seg);
+      if (rt.running || now < rt.nextRunAt) continue;
+      void runAutoDispatchCycle({ manual: false, segment: seg }).catch((err: any) => {
+        console.warn(`[Disparo Automático][${seg}] Erro no ciclo automático:`, err?.message || err);
+      });
+    }
   }, 15_000);
 
   app.listen(PORT, '0.0.0.0', () => {

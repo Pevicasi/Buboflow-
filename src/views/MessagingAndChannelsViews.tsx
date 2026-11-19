@@ -53,6 +53,15 @@ import {
   sendWhatsAppApi,
   verifyTelegramBotApi,
 } from '../utils/apiClient';
+import {
+  getGroupActiveSegments,
+  getGroupMonitoredSegments,
+  isGroupActiveInSegment,
+  isGroupMonitoredInSegment,
+  matchesSegment,
+  normalizeSegmentName,
+  toggleGroupSegmentMembership,
+} from '../utils/segmentScoping';
 
 /* ============================================================================
  * 1. WHATSAPP & TELEGRAM ACCOUNTS VIEW (Telas 6–7 + Conexão Real QR/Bot API)
@@ -1433,6 +1442,7 @@ export const SendMessageComposerView: React.FC = () => {
     dispatchGroups,
     products,
     integrations,
+    activeSegment,
     getTemplateForPlatform,
     dispatchCustomMessage,
     setSchedules,
@@ -1440,7 +1450,7 @@ export const SendMessageComposerView: React.FC = () => {
   } = useApp();
 
   const [selectedGroupIds, setSelectedGroupIds] = useState<string[]>(() =>
-    dispatchGroups.filter((g) => g.activeForOffers).map((g) => g.id)
+    dispatchGroups.filter((g) => isGroupActiveInSegment(g, activeSegment)).map((g) => g.id)
   );
   const [groupDropdownOpen, setGroupDropdownOpen] = useState(false);
   const [mentionAll, setMentionAll] = useState(false);
@@ -1455,12 +1465,20 @@ export const SendMessageComposerView: React.FC = () => {
   const [lastSentText, setLastSentText] = useState<string | null>(null);
 
   React.useEffect(() => {
+    setSelectedGroupIds(
+      dispatchGroups.filter((g) => isGroupActiveInSegment(g, activeSegment)).map((g) => g.id)
+    );
+  }, [activeSegment]);
+
+  React.useEffect(() => {
     setSelectedGroupIds((prev) => {
       const valid = prev.filter((id) => dispatchGroups.some((g) => g.id === id));
       if (valid.length > 0) return valid;
-      return dispatchGroups.filter((g) => g.activeForOffers).map((g) => g.id);
+      return dispatchGroups
+        .filter((g) => isGroupActiveInSegment(g, activeSegment))
+        .map((g) => g.id);
     });
-  }, [dispatchGroups]);
+  }, [dispatchGroups, activeSegment]);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1543,10 +1561,11 @@ export const SendMessageComposerView: React.FC = () => {
           recurrence,
           status: 'Pendente',
           imageUrl: uploadedImage || undefined,
+          segment: normalizeSegmentName(activeSegment),
         },
         ...prev,
       ]);
-      notify('Mensagem agendada!', 'Disponível na aba Agendamentos.');
+      notify('Mensagem agendada!', `Disponível na aba Agendamentos (${activeSegment}).`);
       return;
     }
 
@@ -1560,6 +1579,7 @@ export const SendMessageComposerView: React.FC = () => {
         customImageUrl: uploadedImage || undefined,
         enableLinkPreview: linkPreview,
         mentionAll,
+        segment: activeSegment,
       });
       if (res.ok) {
         setLastSentText(finalMsg);
@@ -2081,10 +2101,13 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
   };
 
   if (mode === 'envio') {
-    const activeCount = dispatchGroups.filter((g) => g.activeForOffers).length;
+    const activeCount = dispatchGroups.filter((g) =>
+      isGroupActiveInSegment(g, activeSegment)
+    ).length;
     const filtered = dispatchGroups.filter((g) => {
-      if (statusFilter === 'Enviar Ofertas' && !g.activeForOffers) return false;
-      if (statusFilter === 'Não Enviar Ofertas' && g.activeForOffers) return false;
+      const activeHere = isGroupActiveInSegment(g, activeSegment);
+      if (statusFilter === 'Enviar Ofertas' && !activeHere) return false;
+      if (statusFilter === 'Não Enviar Ofertas' && activeHere) return false;
       if (platformFilter !== 'Todas as Plataformas' && g.channel !== platformFilter) {
         return false;
       }
@@ -2098,17 +2121,31 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
     });
 
     const toggleGroupActive = (group: DispatchGroup) => {
-      if (!group.activeForOffers && activeCount >= maxLimit) {
+      const currentlyActive = isGroupActiveInSegment(group, activeSegment);
+      if (!currentlyActive && activeCount >= maxLimit) {
         notify('Limite atingido', `Máximo de ${maxLimit} grupos ativos simultâneos.`, 'error');
         return;
       }
       setDispatchGroups((prev) =>
-        prev.map((g) =>
-          g.id === group.id ? { ...g, activeForOffers: !g.activeForOffers } : g
-        )
+        prev.map((g) => {
+          if (g.id !== group.id) return g;
+          const nextSegs = toggleGroupSegmentMembership(
+            getGroupActiveSegments(g),
+            activeSegment,
+            !currentlyActive
+          );
+          return {
+            ...g,
+            activeSegments: nextSegs,
+            activeForOffers: nextSegs.length > 0,
+            segment: nextSegs[0] || g.segment || activeSegment,
+          };
+        })
       );
       notify(
-        !group.activeForOffers ? 'Envio ativado no grupo' : 'Envio pausado no grupo',
+        !currentlyActive
+          ? `Envio ativado em "${activeSegment}"`
+          : `Envio pausado em "${activeSegment}"`,
         group.name
       );
     };
@@ -2121,6 +2158,8 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
         accounts.find((a) => a.channel === newChannel) ||
         accounts[0] || { id: 'acc-wa-1', name: 'CONTA 01' };
 
+      const activateNow = activeCount < maxLimit;
+      const seg = normalizeSegmentName(activeSegment);
       setDispatchGroups((prev) => [
         ...prev,
         {
@@ -2131,11 +2170,12 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
           accountName: matchingAcc.name,
           remoteJid: newRemoteJid.trim() || undefined,
           isChannel: newIsChannel,
-          activeForOffers: activeCount < maxLimit,
+          activeForOffers: activateNow,
+          activeSegments: activateNow ? [seg] : [],
           membersCount: 1,
           maxCapacity: newChannel === 'Telegram' ? 200000 : newIsChannel ? 5000 : 1024,
           inviteUrl: newInvite.trim(),
-          segment: activeSegment,
+          segment: seg,
         },
       ]);
       setNewName('');
@@ -2152,6 +2192,9 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
             <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
               Grupos de Envio
             </h1>
+            <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200/70 dark:border-emerald-800/60 px-2.5 py-0.5 rounded-lg">
+              {activeSegment}
+            </span>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -2310,17 +2353,27 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                     </td>
                   </tr>
                 ) : (
-                  filtered.map((g) => (
+                  filtered.map((g) => {
+                    const activeHere = isGroupActiveInSegment(g, activeSegment);
+                    const otherSegments = getGroupActiveSegments(g).filter(
+                      (s) => !matchesSegment(s, activeSegment)
+                    );
+                    return (
                     <tr
                       key={g.id}
                       className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40 transition-colors"
                     >
                       <td className="py-3.5 px-4 font-medium text-slate-900 dark:text-white">
                         <div>{g.name}</div>
-                        <div className="flex items-center gap-2 mt-0.5">
+                        <div className="flex flex-wrap items-center gap-2 mt-0.5">
                           {g.isChannel && (
                             <span className="text-xs text-sky-600 dark:text-sky-400 font-medium">
                               Canal
+                            </span>
+                          )}
+                          {otherSegments.length > 0 && (
+                            <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                              Ativo em: {otherSegments.join(', ')}
                             </span>
                           )}
                           {g.remoteJid ? (
@@ -2351,23 +2404,24 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                         <button
                           type="button"
                           role="switch"
-                          aria-checked={g.activeForOffers}
+                          aria-checked={activeHere}
                           onClick={() => toggleGroupActive(g)}
                           className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                            g.activeForOffers
+                            activeHere
                               ? 'bg-[#15803D]'
                               : 'bg-slate-200 dark:bg-slate-700'
                           }`}
                         >
                           <span
                             className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                              g.activeForOffers ? 'translate-x-6' : 'translate-x-1'
+                              activeHere ? 'translate-x-6' : 'translate-x-1'
                             }`}
                           />
                         </button>
                       </td>
                     </tr>
-                  ))
+                    );
+                  })
                 )}
               </tbody>
             </table>
@@ -2519,10 +2573,13 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
   }
 
   // MONITORAMENTO MODE
-  const monitoredCount = monitoringGroups.filter((g) => g.monitored).length;
+  const monitoredCount = monitoringGroups.filter((g) =>
+    isGroupMonitoredInSegment(g, activeSegment)
+  ).length;
   const filteredMon = monitoringGroups.filter((g) => {
-    if (statusFilter === 'Monitorados' && !g.monitored) return false;
-    if (statusFilter === 'Não Monitorados' && g.monitored) return false;
+    const monHere = isGroupMonitoredInSegment(g, activeSegment);
+    if (statusFilter === 'Monitorados' && !monHere) return false;
+    if (statusFilter === 'Não Monitorados' && monHere) return false;
     if (platformFilter !== 'Todas as Plataformas' && g.channel !== platformFilter) {
       return false;
     }
@@ -2543,6 +2600,9 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
           <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
             Grupos de Monitoramento
           </h1>
+          <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200/70 dark:border-emerald-800/60 px-2.5 py-0.5 rounded-lg">
+            {activeSegment}
+          </span>
         </div>
         <button
           type="button"
@@ -2657,6 +2717,10 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                 </tr>
               ) : (
                 filteredMon.map((g) => {
+                  const monHere = isGroupMonitoredInSegment(g, activeSegment);
+                  const otherMonSegs = getGroupMonitoredSegments(g).filter(
+                    (s) => !matchesSegment(s, activeSegment)
+                  );
                   const activeMarkets =
                     g.allowedMarketplaces && g.allowedMarketplaces.length > 0
                       ? g.allowedMarketplaces
@@ -2674,6 +2738,11 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                           {g.useGroupImage && (
                             <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
                               • Foto do grupo
+                            </span>
+                          )}
+                          {otherMonSegs.length > 0 && (
+                            <span className="text-slate-500 dark:text-slate-400">
+                              • Monitorado em: {otherMonSegs.join(', ')}
                             </span>
                           )}
                         </div>
@@ -2696,9 +2765,9 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                         <button
                           type="button"
                           role="switch"
-                          aria-checked={g.monitored}
+                          aria-checked={monHere}
                           onClick={() => {
-                            if (!g.monitored && monitoredCount >= maxLimit) {
+                            if (!monHere && monitoredCount >= maxLimit) {
                               notify(
                                 'Limite atingido',
                                 `Máximo de ${maxLimit} grupos monitorados.`,
@@ -2707,19 +2776,34 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                               return;
                             }
                             setMonitoringGroups((prev) =>
-                              prev.map((m) =>
-                                m.id === g.id ? { ...m, monitored: !m.monitored } : m
-                              )
+                              prev.map((m) => {
+                                if (m.id !== g.id) return m;
+                                const nextMonSegs = toggleGroupSegmentMembership(
+                                  getGroupMonitoredSegments(m),
+                                  activeSegment,
+                                  !monHere
+                                );
+                                return {
+                                  ...m,
+                                  monitoredSegments: nextMonSegs,
+                                  monitored: nextMonSegs.length > 0,
+                                };
+                              })
                             );
-                            notify('Monitoramento atualizado', g.name);
+                            notify(
+                              !monHere
+                                ? `Monitoramento ativado em "${activeSegment}"`
+                                : `Monitoramento pausado em "${activeSegment}"`,
+                              g.name
+                            );
                           }}
                           className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                            g.monitored ? 'bg-[#15803D]' : 'bg-slate-200 dark:bg-slate-700'
+                            monHere ? 'bg-[#15803D]' : 'bg-slate-200 dark:bg-slate-700'
                           }`}
                         >
                           <span
                             className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                              g.monitored ? 'translate-x-6' : 'translate-x-1'
+                              monHere ? 'translate-x-6' : 'translate-x-1'
                             }`}
                           />
                         </button>
@@ -2889,12 +2973,20 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
  * 4. AGENDAMENTOS & FILAS DE DISPARO (Telas 39–42)
  * ========================================================================== */
 export const SchedulesView: React.FC = () => {
-  const { schedules, setSchedules, dispatchGroups, dispatchCustomMessage, setRoute, notify } =
-    useApp();
+  const {
+    schedules,
+    setSchedules,
+    dispatchGroups,
+    dispatchCustomMessage,
+    activeSegment,
+    setRoute,
+    notify,
+  } = useApp();
   const [filter, setFilter] = useState('Todos');
   const [search, setSearch] = useState('');
 
   const filtered = schedules.filter((s) => {
+    if (!matchesSegment(s.segment, activeSegment)) return false;
     if (filter !== 'Todos' && s.recurrence !== filter) return false;
     if (
       search.trim() &&
@@ -2914,6 +3006,9 @@ export const SchedulesView: React.FC = () => {
           <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
             Agendamentos
           </h1>
+          <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200/70 dark:border-emerald-800/60 px-2.5 py-0.5 rounded-lg">
+            {activeSegment}
+          </span>
         </div>
         <button
           type="button"
@@ -2987,11 +3082,11 @@ export const SchedulesView: React.FC = () => {
                       const matched =
                         sch.groupIds.length > 0
                           ? dispatchGroups.filter((g) => sch.groupIds.includes(g.id))
-                          : dispatchGroups.filter((g) => g.activeForOffers);
+                          : dispatchGroups.filter((g) => isGroupActiveInSegment(g, activeSegment));
                       if (matched.length === 0) {
                         notify(
                           'Ative um grupo real antes de disparar',
-                          'Nenhum grupo conectado ativo encontrado.',
+                          `Nenhum grupo conectado ativo encontrado no segmento "${activeSegment}".`,
                           'info'
                         );
                         return;
@@ -3002,6 +3097,7 @@ export const SchedulesView: React.FC = () => {
                         groupsNames: matched.map((g) => g.name),
                         groupIds: matched.map((g) => g.id),
                         platform: sch.platform,
+                        segment: activeSegment,
                       });
                       setSchedules((prev) =>
                         prev.map((item) =>
@@ -3043,7 +3139,10 @@ export const DispatchQueuesView: React.FC = () => {
   const [newQueueName, setNewQueueName] = useState('');
   const [newQueueInterval, setNewQueueInterval] = useState('15');
 
+  const segmentProducts = products.filter((p) => matchesSegment(p.segment, activeSegment));
+
   const filtered = queues.filter((q) => {
+    if (!matchesSegment(q.segment, activeSegment)) return false;
     if (statusFilter === 'Ativa' && !q.active) return false;
     if (statusFilter === 'Pausada' && q.active) return false;
     if (search.trim() && !q.name.toLowerCase().includes(search.trim().toLowerCase())) {
@@ -3331,7 +3430,12 @@ export const DispatchQueuesView: React.FC = () => {
             </div>
 
             <div className="space-y-2 max-h-72 overflow-y-auto">
-              {products.map((p) => {
+              {segmentProducts.length === 0 ? (
+                <p className="text-xs text-slate-500 py-6 text-center">
+                  Nenhum produto salvo no segmento <strong>{activeSegment}</strong>.
+                </p>
+              ) : (
+              segmentProducts.map((p) => {
                 const currentQueue =
                   queues.find((item) => item.id === manageQueue.id) || manageQueue;
                 const included = currentQueue.productIds.includes(p.id);
@@ -3374,7 +3478,8 @@ export const DispatchQueuesView: React.FC = () => {
                     </button>
                   </div>
                 );
-              })}
+              })
+              )}
             </div>
 
             <div className="flex justify-end">
