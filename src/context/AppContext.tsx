@@ -40,6 +40,10 @@ import {
 import { renderProductMessage } from '../utils/templateEngine';
 import { needsAffiliateReconversion } from '../utils/affiliateUrlRules';
 import {
+  groupWhatsAppTargetsByActiveAccount,
+  isWhatsAppAccountActiveForDispatch,
+} from '../utils/whatsappAccountDispatch';
+import {
   clearAllLocalSessionBackups,
   convertLinkApi,
   fetchWhatsAppGroupsApi,
@@ -68,6 +72,11 @@ import {
   replaceSegmentInList,
   resolveSegmentConfig,
 } from '../utils/segmentScoping';
+import { getGroupAllMatchKeys, getGroupExclusionKey } from '../utils/telegramSync';
+import {
+  DEFAULT_ML_COUPON_MAX_AGE_HOURS,
+  resolveEffectiveMlCoupon,
+} from '../utils/mercadoLivreCoupons';
 
 const STORAGE_KEY = 'buboflow_panel_state_v1';
 const SERVER_MIGRATED_KEY = 'buboflow_server_synced_v6';
@@ -146,12 +155,14 @@ function dedupeDispatchGroups(list: DispatchGroup[]): DispatchGroup[] {
         ...existing,
         ...normalized,
         id: normalized.id || existing.id,
+        username: normalized.username || existing.username,
         activeForOffers: mergedActiveSegments.length > 0,
         activeSegments: mergedActiveSegments,
         isPriorityCapture: Boolean(existing.isPriorityCapture || normalized.isPriorityCapture),
         isChannel: Boolean(existing.isChannel || normalized.isChannel),
         isOwner: normalized.isOwner ?? existing.isOwner,
         isAdmin: normalized.isAdmin ?? existing.isAdmin,
+        canPostMessages: normalized.canPostMessages ?? existing.canPostMessages,
         isOwnerOrAdmin:
           normalized.isOwnerOrAdmin ??
           existing.isOwnerOrAdmin ??
@@ -212,10 +223,13 @@ interface PersistedState {
   segments: string[];
   activeSegment: string;
   totalSentCount: number;
+  whatsappRotationEnabled?: boolean;
   accounts: ChannelAccount[];
   dispatchGroups: DispatchGroup[];
   monitoringGroups: MonitoringGroup[];
   savedGroupPrefs: Record<string, SavedGroupPreference>;
+  excludedDispatchGroupKeys?: string[];
+  excludedMonitoringGroupKeys?: string[];
   products: Product[];
   coupons: Coupon[];
   templates: MessageTemplate[];
@@ -241,10 +255,13 @@ const DEFAULT_PERSISTED: PersistedState = {
   segments: INITIAL_SEGMENTS,
   activeSegment: DEFAULT_SEGMENT,
   totalSentCount: 0,
+  whatsappRotationEnabled: false,
   accounts: INITIAL_ACCOUNTS,
   dispatchGroups: INITIAL_DISPATCH_GROUPS,
   monitoringGroups: INITIAL_MONITORING_GROUPS,
   savedGroupPrefs: {},
+  excludedDispatchGroupKeys: [],
+  excludedMonitoringGroupKeys: [],
   products: INITIAL_PRODUCTS,
   coupons: INITIAL_COUPONS,
   templates: INITIAL_TEMPLATES,
@@ -273,9 +290,18 @@ export interface AppContextValue extends PersistedState {
   addSegment: (name: string) => void;
   renameSegment: (oldName: string, newName: string) => void;
   deleteSegment: (name: string) => void;
+  whatsappRotationEnabled: boolean;
+  setWhatsappRotationEnabled: React.Dispatch<React.SetStateAction<boolean>>;
   setAccounts: React.Dispatch<React.SetStateAction<ChannelAccount[]>>;
   setDispatchGroups: React.Dispatch<React.SetStateAction<DispatchGroup[]>>;
   setMonitoringGroups: React.Dispatch<React.SetStateAction<MonitoringGroup[]>>;
+  excludedDispatchGroupKeys: string[];
+  excludedMonitoringGroupKeys: string[];
+  removeDispatchGroup: (group: DispatchGroup) => void;
+  removeMonitoringGroup: (group: MonitoringGroup) => void;
+  restoreExcludedDispatchGroups: () => Promise<void>;
+  restoreExcludedMonitoringGroups: () => Promise<void>;
+  unexcludeDispatchGroupKeys: (keys: string[]) => void;
   setProducts: React.Dispatch<React.SetStateAction<Product[]>>;
   setCoupons: React.Dispatch<React.SetStateAction<Coupon[]>>;
   setTemplates: React.Dispatch<React.SetStateAction<MessageTemplate[]>>;
@@ -327,17 +353,34 @@ function sanitizePersistedState(
     ...parsed,
     cleanRealWhatsAppMigrationV5: true,
     stripFictionalProductsV6: true,
+    whatsappRotationEnabled: Boolean(parsed.whatsappRotationEnabled),
     savedGroupPrefs: { ...(parsed.savedGroupPrefs || {}) },
+    excludedDispatchGroupKeys: Array.from(
+      new Set(
+        (parsed.excludedDispatchGroupKeys || [])
+          .filter((k): k is string => typeof k === 'string' && Boolean(k.trim()))
+      )
+    ),
+    excludedMonitoringGroupKeys: Array.from(
+      new Set(
+        (parsed.excludedMonitoringGroupKeys || [])
+          .filter((k): k is string => typeof k === 'string' && Boolean(k.trim()))
+      )
+    ),
     products: (parsed.products || []).filter(
       (p) => p && !FICTIONAL_PRODUCT_IDS.has(String(p.id))
     ),
   };
+
+  const excludedDispatchSet = new Set(merged.excludedDispatchGroupKeys || []);
+  const excludedMonitoringSet = new Set(merged.excludedMonitoringGroupKeys || []);
 
   // Preserve per-group user settings into savedGroupPrefs before hiding disconnected/legacy entries
   const cleanDispatch = dedupeDispatchGroups(
     (merged.dispatchGroups || []).filter((g) => {
       if (LEGACY_SCREENSHOT_GROUP_IDS.has(g.id)) return false;
       if (g.channel === 'WhatsApp' && !g.remoteJid?.trim()) return false;
+      if (getGroupAllMatchKeys(g).some((k) => excludedDispatchSet.has(k))) return false;
       return true;
     })
   );
@@ -346,6 +389,7 @@ function sanitizePersistedState(
     (merged.monitoringGroups || []).filter((m) => {
       if (LEGACY_SCREENSHOT_MON_IDS.has(m.id)) return false;
       if (m.channel === 'WhatsApp' && !m.remoteJid?.trim()) return false;
+      if (getGroupAllMatchKeys(m).some((k) => excludedMonitoringSet.has(k))) return false;
       return true;
     })
   );
@@ -516,6 +560,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [segments, setSegments] = useState<string[]>(initial.segments);
   const [activeSegment, setActiveSegment] = useState<string>(initial.activeSegment);
   const [totalSentCount, setTotalSentCount] = useState<number>(initial.totalSentCount);
+  const [whatsappRotationEnabled, setWhatsappRotationEnabled] = useState<boolean>(
+    Boolean(initial.whatsappRotationEnabled)
+  );
   const [accounts, setAccounts] = useState<ChannelAccount[]>(initial.accounts);
   const [dispatchGroups, setDispatchGroupsRaw] = useState<DispatchGroup[]>(initial.dispatchGroups);
   const [monitoringGroups, setMonitoringGroupsRaw] = useState<MonitoringGroup[]>(
@@ -523,6 +570,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
   const [savedGroupPrefs, setSavedGroupPrefs] = useState<Record<string, SavedGroupPreference>>(
     initial.savedGroupPrefs || {}
+  );
+  const [excludedDispatchGroupKeys, setExcludedDispatchGroupKeys] = useState<string[]>(
+    initial.excludedDispatchGroupKeys || []
+  );
+  const [excludedMonitoringGroupKeys, setExcludedMonitoringGroupKeys] = useState<string[]>(
+    initial.excludedMonitoringGroupKeys || []
   );
   const [products, setProducts] = useState<Product[]>(initial.products);
   const [coupons, setCoupons] = useState<Coupon[]>(initial.coupons);
@@ -680,10 +733,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const accountsRef = useRef(accounts);
   accountsRef.current = accounts;
+  const whatsappRotationEnabledRef = useRef(whatsappRotationEnabled);
+  whatsappRotationEnabledRef.current = whatsappRotationEnabled;
+  const waRotationCursorRef = useRef(0);
   const activeSegmentRef = useRef(activeSegment);
   activeSegmentRef.current = activeSegment;
   const savedGroupPrefsRef = useRef(savedGroupPrefs);
   savedGroupPrefsRef.current = savedGroupPrefs;
+  const excludedDispatchKeysRef = useRef(excludedDispatchGroupKeys);
+  excludedDispatchKeysRef.current = excludedDispatchGroupKeys;
+  const excludedMonitoringKeysRef = useRef(excludedMonitoringGroupKeys);
+  excludedMonitoringKeysRef.current = excludedMonitoringGroupKeys;
   const productsRef = useRef(products);
   productsRef.current = products;
   const waSyncInFlightRef = useRef<Promise<{ ok: boolean; count: number; error?: string }> | null>(
@@ -1088,6 +1148,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           }
 
           const prefsSnapshot = savedGroupPrefsRef.current;
+          const excludedDispatchSet = new Set(excludedDispatchKeysRef.current || []);
+          const excludedMonitoringSet = new Set(excludedMonitoringKeysRef.current || []);
           const uniqueLiveList = Array.from(canonicalGroups.values()).sort((a, b) =>
             a.name.localeCompare(b.name, 'pt-BR')
           );
@@ -1102,35 +1164,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               }
             }
 
-            const syncedWaGroups: DispatchGroup[] = uniqueLiveList.map((grp) => {
-              const saved = prefsSnapshot[`wa:${grp.remoteJid}`];
-              const prevLive = prevByJid.get(grp.remoteJid);
-              const restoredActiveSegs = Array.isArray(saved?.activeSegments)
-                ? dedupeSegmentNames(saved.activeSegments)
-                : Array.isArray(prevLive?.activeSegments)
-                ? dedupeSegmentNames(prevLive.activeSegments)
-                : getGroupActiveSegments(saved ?? prevLive);
-              return {
-                id: `grp-wa-${grp.remoteJid.replace(/[^a-zA-Z0-9]/g, '')}`,
-                name: grp.name,
-                channel: 'WhatsApp',
-                accountId: grp.accountId,
-                accountName: grp.accountName,
-                remoteJid: grp.remoteJid,
-                activeForOffers: restoredActiveSegs.length > 0,
-                activeSegments: restoredActiveSegs,
-                isPriorityCapture: saved?.isPriorityCapture ?? prevLive?.isPriorityCapture ?? false,
-                isChannel: saved?.isChannel ?? prevLive?.isChannel ?? false,
-                membersCount: grp.membersCount,
-                maxCapacity: 1024,
-                inviteUrl: saved?.inviteUrl || prevLive?.inviteUrl || 'https://chat.whatsapp.com/',
-                segment: saved?.segment || prevLive?.segment || DEFAULT_SEGMENT,
-                isOwner: grp.isOwner ?? saved?.isOwner ?? prevLive?.isOwner,
-                isAdmin: grp.isAdmin ?? saved?.isAdmin ?? prevLive?.isAdmin,
-                isOwnerOrAdmin:
-                  grp.isOwnerOrAdmin ?? saved?.isOwnerOrAdmin ?? prevLive?.isOwnerOrAdmin,
-              };
-            });
+            const syncedWaGroups: DispatchGroup[] = uniqueLiveList
+              .filter((grp) => !excludedDispatchSet.has(`wa:${grp.remoteJid}`))
+              .map((grp) => {
+                const saved = prefsSnapshot[`wa:${grp.remoteJid}`];
+                const prevLive = prevByJid.get(grp.remoteJid);
+                const restoredActiveSegs = Array.isArray(saved?.activeSegments)
+                  ? dedupeSegmentNames(saved.activeSegments)
+                  : Array.isArray(prevLive?.activeSegments)
+                  ? dedupeSegmentNames(prevLive.activeSegments)
+                  : getGroupActiveSegments(saved ?? prevLive);
+                return {
+                  id: `grp-wa-${grp.remoteJid.replace(/[^a-zA-Z0-9]/g, '')}`,
+                  name: grp.name,
+                  channel: 'WhatsApp',
+                  accountId: grp.accountId,
+                  accountName: grp.accountName,
+                  remoteJid: grp.remoteJid,
+                  activeForOffers: restoredActiveSegs.length > 0,
+                  activeSegments: restoredActiveSegs,
+                  isPriorityCapture: saved?.isPriorityCapture ?? prevLive?.isPriorityCapture ?? false,
+                  isChannel: saved?.isChannel ?? prevLive?.isChannel ?? false,
+                  membersCount: grp.membersCount,
+                  maxCapacity: 1024,
+                  inviteUrl: saved?.inviteUrl || prevLive?.inviteUrl || 'https://chat.whatsapp.com/',
+                  segment: saved?.segment || prevLive?.segment || DEFAULT_SEGMENT,
+                  isOwner: grp.isOwner ?? saved?.isOwner ?? prevLive?.isOwner,
+                  isAdmin: grp.isAdmin ?? saved?.isAdmin ?? prevLive?.isAdmin,
+                  isOwnerOrAdmin:
+                    grp.isOwnerOrAdmin ?? saved?.isOwnerOrAdmin ?? prevLive?.isOwnerOrAdmin,
+                };
+              });
 
             return [...nonWhatsApp, ...syncedWaGroups];
           });
@@ -1145,29 +1209,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               }
             }
 
-            const syncedMonGroups: MonitoringGroup[] = uniqueLiveList.map((grp) => {
-              const saved = prefsSnapshot[`wa:${grp.remoteJid}`];
-              const prevMon = prevByJid.get(grp.remoteJid);
-              const restoredMonSegs = Array.isArray(saved?.monitoredSegments)
-                ? dedupeSegmentNames(saved.monitoredSegments)
-                : Array.isArray(prevMon?.monitoredSegments)
-                ? dedupeSegmentNames(prevMon.monitoredSegments)
-                : getGroupMonitoredSegments(saved ?? prevMon);
-              return {
-                id: `mon-wa-${grp.remoteJid.replace(/[^a-zA-Z0-9]/g, '')}`,
-                name: grp.name,
-                channel: 'WhatsApp',
-                accountId: grp.accountId,
-                accountName: grp.accountName,
-                remoteJid: grp.remoteJid,
-                monitored: restoredMonSegs.length > 0,
-                monitoredSegments: restoredMonSegs,
-                useGroupImage: saved?.useGroupImage ?? prevMon?.useGroupImage ?? false,
-                allowedMarketplaces:
-                  saved?.allowedMarketplaces ?? prevMon?.allowedMarketplaces,
-                capturedToday: grp.capturedToday,
-              };
-            });
+            const syncedMonGroups: MonitoringGroup[] = uniqueLiveList
+              .filter((grp) => !excludedMonitoringSet.has(`wa:${grp.remoteJid}`))
+              .map((grp) => {
+                const saved = prefsSnapshot[`wa:${grp.remoteJid}`];
+                const prevMon = prevByJid.get(grp.remoteJid);
+                const restoredMonSegs = Array.isArray(saved?.monitoredSegments)
+                  ? dedupeSegmentNames(saved.monitoredSegments)
+                  : Array.isArray(prevMon?.monitoredSegments)
+                  ? dedupeSegmentNames(prevMon.monitoredSegments)
+                  : getGroupMonitoredSegments(saved ?? prevMon);
+                return {
+                  id: `mon-wa-${grp.remoteJid.replace(/[^a-zA-Z0-9]/g, '')}`,
+                  name: grp.name,
+                  channel: 'WhatsApp',
+                  accountId: grp.accountId,
+                  accountName: grp.accountName,
+                  remoteJid: grp.remoteJid,
+                  monitored: restoredMonSegs.length > 0,
+                  monitoredSegments: restoredMonSegs,
+                  useGroupImage: saved?.useGroupImage ?? prevMon?.useGroupImage ?? false,
+                  allowedMarketplaces:
+                    saved?.allowedMarketplaces ?? prevMon?.allowedMarketplaces,
+                  capturedToday: grp.capturedToday,
+                };
+              });
 
             return [...nonWhatsApp, ...syncedMonGroups];
           });
@@ -1327,7 +1393,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setActiveSegment(DEFAULT_SEGMENT);
       }
       setTotalSentCount(cleaned.totalSentCount);
+      setWhatsappRotationEnabled(Boolean(cleaned.whatsappRotationEnabled));
       setSavedGroupPrefs(cleaned.savedGroupPrefs || {});
+      setExcludedDispatchGroupKeys(cleaned.excludedDispatchGroupKeys || []);
+      setExcludedMonitoringGroupKeys(cleaned.excludedMonitoringGroupKeys || []);
       setProducts(cleaned.products);
       setCoupons(cleaned.coupons);
       setTemplatesBySegment(
@@ -1373,14 +1442,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       // Merge dispatchGroups prefs onto currently visible live groups (or hydrate persisted real WA groups on first load)
       setDispatchGroups((prev) => {
+        const excludedSet = new Set(cleaned.excludedDispatchGroupKeys || []);
         const serverPrefs = cleaned.savedGroupPrefs || {};
         const serverWaList = (cleaned.dispatchGroups || []).filter(
-          (g) => g.channel === 'WhatsApp' && g.remoteJid
+          (g) =>
+            g.channel === 'WhatsApp' &&
+            g.remoteJid &&
+            !getGroupAllMatchKeys(g).some((k) => excludedSet.has(k))
         );
         const serverWaByJid = new Map(
           serverWaList.map((g) => [normalizeGroupJid(g.remoteJid), g])
         );
-        const prevWa = prev.filter((g) => g.channel === 'WhatsApp');
+        const prevWa = prev.filter(
+          (g) =>
+            g.channel === 'WhatsApp' &&
+            !getGroupAllMatchKeys(g).some((k) => excludedSet.has(k))
+        );
         const liveWa =
           prevWa.length > 0
             ? prevWa.map((g) => {
@@ -1410,21 +1487,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               })
             : serverWaList;
         const nonWaFromServer = (cleaned.dispatchGroups || []).filter(
-          (g) => g.channel !== 'WhatsApp'
+          (g) =>
+            g.channel !== 'WhatsApp' &&
+            !getGroupAllMatchKeys(g).some((k) => excludedSet.has(k))
         );
         return [...nonWaFromServer, ...liveWa];
       });
 
       // Merge monitoringGroups flags & capturedToday onto currently visible live groups (or hydrate on first load)
       setMonitoringGroups((prev) => {
+        const excludedSet = new Set(cleaned.excludedMonitoringGroupKeys || []);
         const serverPrefs = cleaned.savedGroupPrefs || {};
         const serverMonList = (cleaned.monitoringGroups || []).filter(
-          (m) => m.channel === 'WhatsApp' && m.remoteJid
+          (m) =>
+            m.channel === 'WhatsApp' &&
+            m.remoteJid &&
+            !getGroupAllMatchKeys(m).some((k) => excludedSet.has(k))
         );
         const serverMonByJid = new Map(
           serverMonList.map((m) => [normalizeGroupJid(m.remoteJid), m])
         );
-        const prevMonWa = prev.filter((m) => m.channel === 'WhatsApp');
+        const prevMonWa = prev.filter(
+          (m) =>
+            m.channel === 'WhatsApp' &&
+            !getGroupAllMatchKeys(m).some((k) => excludedSet.has(k))
+        );
         const liveWa =
           prevMonWa.length > 0
             ? prevMonWa.map((m) => {
@@ -1446,12 +1533,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                     pref?.allowedMarketplaces ??
                     srv?.allowedMarketplaces ??
                     m.allowedMarketplaces,
-                  capturedToday: Math.max(m.capturedToday || 0, srv?.capturedToday || 0),
+                  capturedToday:
+                    typeof srv?.capturedToday === 'number'
+                      ? srv.capturedToday
+                      : m.capturedToday || 0,
                 };
               })
             : serverMonList;
         const nonWaFromServer = (cleaned.monitoringGroups || []).filter(
-          (m) => m.channel !== 'WhatsApp'
+          (m) =>
+            m.channel !== 'WhatsApp' &&
+            !getGroupAllMatchKeys(m).some((k) => excludedSet.has(k))
         );
         return [...nonWaFromServer, ...liveWa];
       });
@@ -1556,10 +1648,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       segments,
       activeSegment,
       totalSentCount,
+      whatsappRotationEnabled,
       accounts,
       dispatchGroups,
       monitoringGroups,
       savedGroupPrefs,
+      excludedDispatchGroupKeys,
+      excludedMonitoringGroupKeys,
       products,
       coupons,
       templates: geralTemplates,
@@ -1623,10 +1718,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     segments,
     activeSegment,
     totalSentCount,
+    whatsappRotationEnabled,
     accounts,
     dispatchGroups,
     monitoringGroups,
     savedGroupPrefs,
+    excludedDispatchGroupKeys,
+    excludedMonitoringGroupKeys,
     products,
     coupons,
     templatesBySegment,
@@ -1869,6 +1967,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     message: string;
     imageUrl?: string;
     enableLinkPreview?: boolean;
+    includeLinkPreviewDetails?: boolean;
     mentionAll?: boolean;
   }): Promise<{ ok: boolean; sentCount: number; error?: string }> => {
     const {
@@ -1876,6 +1975,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       message,
       imageUrl = '',
       enableLinkPreview = true,
+      includeLinkPreviewDetails = false,
       mentionAll = false,
     } = params;
 
@@ -1884,65 +1984,109 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const apiErrors: string[] = [];
     const currentAccounts = accountsRef.current;
 
-    // 1. Group WhatsApp targets by accountId
+    // 1. Route WhatsApp targets strictly through accounts enabled for offer dispatch
     const waGroupsWithJid = targetGroups.filter(
       (g) => g.channel === 'WhatsApp' && g.remoteJid?.trim()
     );
-    const waByAccount = new Map<string, string[]>();
-    for (const g of waGroupsWithJid) {
-      const list = waByAccount.get(g.accountId) || [];
-      list.push(g.remoteJid!.trim());
-      waByAccount.set(g.accountId, list);
-    }
-
-    for (const [accId, jids] of waByAccount.entries()) {
-      const acc =
-        currentAccounts.find((a) => a.id === accId && a.connected) ||
-        currentAccounts.find((a) => a.channel === 'WhatsApp' && a.connected) ||
-        currentAccounts.find((a) => a.id === accId) ||
-        currentAccounts.find((a) => a.channel === 'WhatsApp');
-
-      const provider = acc ? resolveAccountWaProvider(acc) : 'baileys';
-      const baseUrl = acc?.baseUrl || acc?.webhookUrl || '';
-      const hasConfig =
-        provider === 'baileys'
-          ? true
-          : provider === 'zapi'
-          ? Boolean(acc?.instanceName && acc?.apiToken)
-          : provider === 'webhook'
-          ? Boolean(baseUrl)
-          : Boolean(baseUrl && acc?.instanceName && acc?.apiToken);
-
-      if (!hasConfig) continue;
-
-      try {
-        const res = await fetch('/api/whatsapp/send', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            provider,
-            accountId: acc?.id || accId || 'acc-wa-1',
-            baseUrl,
-            instanceName: acc?.instanceName || '',
-            apiToken: acc?.apiToken || '',
-            clientToken: acc?.clientToken || '',
-            remoteJids: jids,
-            message,
-            imageUrl,
-            enableLinkPreview,
-            mentionAll,
-          }),
-        });
-        const data = await res.json();
-        if (data.ok) {
-          waDelivered += Number(data.sentCount || 0);
-        } else if (data.error) {
-          apiErrors.push(data.error);
-        } else if (Array.isArray(data.results) && data.results[0]?.error) {
-          apiErrors.push(data.results[0].error);
+    if (waGroupsWithJid.length > 0) {
+      const waAccounts = currentAccounts.filter((a) => a.channel === 'WhatsApp');
+      const waPlan = groupWhatsAppTargetsByActiveAccount(
+        waGroupsWithJid.map((g) => ({
+          remoteJid: g.remoteJid!.trim(),
+          name: g.name,
+          accountId: g.accountId,
+        })),
+        waAccounts,
+        undefined,
+        {
+          rotateAccounts: whatsappRotationEnabledRef.current,
+          rotationCursor: waRotationCursorRef.current,
         }
-      } catch (err: any) {
-        apiErrors.push(err.message || 'Falha de conexão com Baileys');
+      );
+
+      if (waPlan.allDisabled) {
+        apiErrors.push(
+          'Nenhum número de WhatsApp está ativo para envio de ofertas. Ative ao menos um número em Canais → WhatsApp.'
+        );
+      } else {
+        const batchesToSend =
+          waPlan.batches.length > 0
+            ? waPlan.batches
+            : // Fallback when account connected flag hasn't hydrated yet on client: keep active-only check on server
+              Array.from(
+                waGroupsWithJid.reduce((map, g) => {
+                  const list = map.get(g.accountId) || [];
+                  list.push(g.remoteJid!.trim());
+                  map.set(g.accountId, list);
+                  return map;
+                }, new Map<string, string[]>())
+              ).map(([accountId, remoteJids]) => ({ accountId, remoteJids, targets: [] }));
+
+        for (const batch of batchesToSend) {
+          const acc =
+            waAccounts.find(
+              (a) => a.id === batch.accountId && a.connected && isWhatsAppAccountActiveForDispatch(a)
+            ) ||
+            waAccounts.find((a) => a.connected && isWhatsAppAccountActiveForDispatch(a)) ||
+            waAccounts.find(
+              (a) => a.id === batch.accountId && isWhatsAppAccountActiveForDispatch(a)
+            ) ||
+            waAccounts.find((a) => isWhatsAppAccountActiveForDispatch(a));
+
+          if (waAccounts.length > 0 && !acc) {
+            apiErrors.push(
+              'Nenhum número de WhatsApp está ativo para envio de ofertas. Ative ao menos um número em Canais → WhatsApp.'
+            );
+            break;
+          }
+
+          const provider = acc ? resolveAccountWaProvider(acc) : 'baileys';
+          const baseUrl = acc?.baseUrl || acc?.webhookUrl || '';
+          const hasConfig =
+            provider === 'baileys'
+              ? true
+              : provider === 'zapi'
+              ? Boolean(acc?.instanceName && acc?.apiToken)
+              : provider === 'webhook'
+              ? Boolean(baseUrl)
+              : Boolean(baseUrl && acc?.instanceName && acc?.apiToken);
+
+          if (!hasConfig) continue;
+
+          try {
+            const res = await fetch('/api/whatsapp/send', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                provider,
+                accountId: acc?.id || batch.accountId || 'acc-wa-1',
+                baseUrl,
+                instanceName: acc?.instanceName || '',
+                apiToken: acc?.apiToken || '',
+                clientToken: acc?.clientToken || '',
+                remoteJids: batch.remoteJids,
+                message,
+                imageUrl,
+                enableLinkPreview,
+                includeLinkPreviewDetails,
+                mentionAll,
+              }),
+            });
+            const data = await res.json();
+            if (data.ok) {
+              waDelivered += Number(data.sentCount || 0);
+            } else if (data.error) {
+              apiErrors.push(data.error);
+            } else if (Array.isArray(data.results) && data.results[0]?.error) {
+              apiErrors.push(data.results[0].error);
+            }
+          } catch (err: any) {
+            apiErrors.push(err.message || 'Falha de conexão com Baileys');
+          }
+        }
+        if (waDelivered > 0 && whatsappRotationEnabledRef.current) {
+          waRotationCursorRef.current = waPlan.nextRotationCursor;
+        }
       }
     }
 
@@ -2038,6 +2182,36 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       targetSegments.length > 0 ? targetSegments : [activeSegment]
     );
     const primaryTargetSeg = normalizedTargets[0] || normalizeSegmentName(activeSegment);
+    const segAutoDispatch = resolveSegmentConfig(
+      autoDispatchBySegment,
+      INITIAL_AUTO_DISPATCH,
+      primaryTargetSeg,
+      createDefaultAutoDispatchForSegment
+    );
+
+    if (effectiveProduct.platform === 'Mercado Livre' || effectiveProduct.couponCode) {
+      const segCoupons = coupons.filter((c) => {
+        const cSeg = normalizeSegmentName(c.segment);
+        return cSeg.toLowerCase() === primaryTargetSeg.toLowerCase();
+      });
+      const maxAgeHours =
+        typeof segAutoDispatch.mlCouponMaxAgeHours === 'number'
+          ? segAutoDispatch.mlCouponMaxAgeHours
+          : DEFAULT_ML_COUPON_MAX_AGE_HOURS;
+      const couponResolution = resolveEffectiveMlCoupon({
+        product: effectiveProduct,
+        savedCoupons: segCoupons,
+        maxAgeHours,
+        now: new Date(),
+      });
+      if (couponResolution.changed) {
+        effectiveProduct = {
+          ...effectiveProduct,
+          couponCode: couponResolution.couponCode || undefined,
+        };
+      }
+    }
+
     const segTemplates = resolveSegmentConfig(
       templatesBySegment,
       INITIAL_TEMPLATES,
@@ -2069,6 +2243,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       message: rendered,
       imageUrl: resolvedImageUrl,
       enableLinkPreview: tpl.enableLinkPreview,
+      includeLinkPreviewDetails: Boolean(tpl.includeLinkPreviewDetails),
     });
 
     if (!delivery.ok || delivery.sentCount === 0) {
@@ -2228,6 +2403,86 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return () => clearInterval(timer);
   });
 
+  const removeDispatchGroup = useCallback(
+    (group: DispatchGroup) => {
+      const keysToExclude = getGroupAllMatchKeys(group);
+      const primaryKey = getGroupExclusionKey(group);
+      if (primaryKey && !keysToExclude.includes(primaryKey)) {
+        keysToExclude.push(primaryKey);
+      }
+      setDispatchGroupsRaw((prev) => prev.filter((g) => g.id !== group.id));
+      if (keysToExclude.length > 0) {
+        setExcludedDispatchGroupKeys((prev) => {
+          const next = Array.from(new Set([...prev, ...keysToExclude]));
+          excludedDispatchKeysRef.current = next;
+          return next;
+        });
+      }
+      notify(
+        'Grupo/canal excluído',
+        `"${group.name}" foi removido da lista de envio. Você pode restaurar quando quiser.`,
+        'info'
+      );
+    },
+    [notify]
+  );
+
+  const removeMonitoringGroup = useCallback(
+    (group: MonitoringGroup) => {
+      const keysToExclude = getGroupAllMatchKeys(group);
+      const primaryKey = getGroupExclusionKey(group);
+      if (primaryKey && !keysToExclude.includes(primaryKey)) {
+        keysToExclude.push(primaryKey);
+      }
+      setMonitoringGroupsRaw((prev) => prev.filter((m) => m.id !== group.id));
+      if (keysToExclude.length > 0) {
+        setExcludedMonitoringGroupKeys((prev) => {
+          const next = Array.from(new Set([...prev, ...keysToExclude]));
+          excludedMonitoringKeysRef.current = next;
+          return next;
+        });
+      }
+      notify(
+        'Grupo excluído do monitoramento',
+        `"${group.name}" foi removido da lista. Você pode restaurar quando quiser.`,
+        'info'
+      );
+    },
+    [notify]
+  );
+
+  const unexcludeDispatchGroupKeys = useCallback((keys: string[]) => {
+    if (!keys.length) return;
+    const dropSet = new Set(keys.map((k) => k.trim()).filter(Boolean));
+    setExcludedDispatchGroupKeys((prev) => {
+      const next = prev.filter((k) => !dropSet.has(k));
+      excludedDispatchKeysRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const restoreExcludedDispatchGroups = useCallback(async () => {
+    excludedDispatchKeysRef.current = [];
+    setExcludedDispatchGroupKeys([]);
+    await syncWhatsAppGroupsFromAccount(undefined, { silent: true });
+    notify(
+      'Exclusões limpas',
+      'Grupos do WhatsApp foram restaurados. Para canais do Telegram removidos, clique em "Importar Canais por @" ou "Sincronizar da API".',
+      'success'
+    );
+  }, [notify, syncWhatsAppGroupsFromAccount]);
+
+  const restoreExcludedMonitoringGroups = useCallback(async () => {
+    excludedMonitoringKeysRef.current = [];
+    setExcludedMonitoringGroupKeys([]);
+    await syncWhatsAppGroupsFromAccount(undefined, { silent: true });
+    notify(
+      'Grupos restaurados',
+      'Os grupos excluídos do monitoramento voltaram a aparecer na lista.',
+      'success'
+    );
+  }, [notify, syncWhatsAppGroupsFromAccount]);
+
   const exportBackupJson = () => {
     const payload: PersistedState = {
       cleanRealWhatsAppMigrationV5: true,
@@ -2235,10 +2490,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       segments,
       activeSegment,
       totalSentCount,
+      whatsappRotationEnabled,
       accounts,
       dispatchGroups,
       monitoringGroups,
       savedGroupPrefs,
+      excludedDispatchGroupKeys,
+      excludedMonitoringGroupKeys,
       products,
       coupons,
       templates: templatesBySegment[DEFAULT_SEGMENT] || INITIAL_TEMPLATES,
@@ -2267,8 +2525,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setSegments(cleaned.segments);
       setActiveSegment(cleaned.activeSegment);
       setTotalSentCount(cleaned.totalSentCount);
+      setWhatsappRotationEnabled(Boolean(cleaned.whatsappRotationEnabled));
       setAccounts(cleaned.accounts);
       setSavedGroupPrefs(cleaned.savedGroupPrefs);
+      setExcludedDispatchGroupKeys(cleaned.excludedDispatchGroupKeys || []);
+      setExcludedMonitoringGroupKeys(cleaned.excludedMonitoringGroupKeys || []);
       setDispatchGroups(cleaned.dispatchGroups);
       setMonitoringGroups(cleaned.monitoringGroups);
       setProducts(cleaned.products);
@@ -2306,8 +2567,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setSegments(DEFAULT_PERSISTED.segments);
     setActiveSegment(DEFAULT_PERSISTED.activeSegment);
     setTotalSentCount(0);
+    setWhatsappRotationEnabled(false);
     setAccounts(DEFAULT_PERSISTED.accounts);
     setSavedGroupPrefs({});
+    setExcludedDispatchGroupKeys([]);
+    setExcludedMonitoringGroupKeys([]);
     setDispatchGroups([]);
     setMonitoringGroups([]);
     setProducts(DEFAULT_PERSISTED.products);
@@ -2355,12 +2619,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         renameSegment,
         deleteSegment,
         totalSentCount,
+        whatsappRotationEnabled,
+        setWhatsappRotationEnabled,
         accounts,
         setAccounts,
         dispatchGroups,
         setDispatchGroups,
         monitoringGroups,
         setMonitoringGroups,
+        excludedDispatchGroupKeys,
+        excludedMonitoringGroupKeys,
+        removeDispatchGroup,
+        removeMonitoringGroup,
+        restoreExcludedDispatchGroups,
+        restoreExcludedMonitoringGroups,
+        unexcludeDispatchGroupKeys,
         savedGroupPrefs,
         products,
         setProducts,

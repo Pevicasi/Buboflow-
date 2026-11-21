@@ -79,6 +79,7 @@ export interface Coupon {
   platform: Marketplace;
   active: boolean;
   isAutomatic: boolean;
+  isSiteWide?: boolean;
   isShowcase?: boolean;
   expiresAt: string;
   link?: string;
@@ -91,6 +92,8 @@ export interface ChannelAccount {
   channel: 'WhatsApp' | 'Telegram';
   phoneOrHandle: string;
   connected: boolean;
+  /** When false on a WhatsApp account, this number stays connected but will not send offers. Defaults to true. */
+  activeForDispatch?: boolean;
   provider?: 'baileys' | 'evolution' | 'zapi' | 'webhook' | 'telegram-bot';
   baseUrl?: string;
   instanceName?: string;
@@ -106,10 +109,12 @@ export interface DispatchGroup {
   accountId: string;
   accountName: string;
   remoteJid?: string;
+  username?: string;
   isChannel?: boolean;
   isOwner?: boolean;
   isAdmin?: boolean;
   isOwnerOrAdmin?: boolean;
+  canPostMessages?: boolean;
   activeForOffers: boolean;
   activeSegments?: string[];
   membersCount: number;
@@ -147,6 +152,7 @@ export interface SavedGroupPreference {
   isOwner?: boolean;
   isAdmin?: boolean;
   isOwnerOrAdmin?: boolean;
+  canPostMessages?: boolean;
 }
 
 export interface ScheduledItem {
@@ -171,6 +177,8 @@ export interface DispatchQueue {
   productIds: string[];
   intervalMinutes: number;
   segment: string;
+  lastRunAt?: string;
+  nextRunAt?: string;
 }
 
 export interface TemplateCondition {
@@ -189,6 +197,7 @@ export interface MessageTemplate {
   body: string;
   ctaStyle: 'Padrão' | 'Urgência' | 'Direto' | 'Descontraído';
   enableLinkPreview: boolean;
+  includeLinkPreviewDetails?: boolean;
   conditions: TemplateCondition[];
 }
 
@@ -224,6 +233,8 @@ export interface AutoDispatchConfig {
   maxProductsPerRun: number;
   distribution: Record<Marketplace, number>;
   sendOrder: 'Aleatório' | 'Mais Recentes' | 'Priorizados Primeiro' | 'Maior Comissão';
+  mlCouponMaxAgeHours?: number;
+  prioritizeCouponProducts?: boolean;
 }
 
 export interface SiteCaptureConfig {
@@ -284,6 +295,8 @@ export interface MonitoringRulesConfig {
   restrictedWords: string[];
   allowedWords: string[];
   automationGroupId: string;
+  compareLowerPrice?: boolean;
+  compareMinSavingsPercent?: number;
 }
 
 export interface UserProfile {

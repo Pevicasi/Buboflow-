@@ -22,6 +22,8 @@ import {
   BookmarkCheck,
   ChevronLeft,
   ChevronRight,
+  ShieldCheck,
+  CheckCircle2,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import {
@@ -41,11 +43,13 @@ import {
   renderProductMessage,
 } from '../utils/templateEngine';
 import {
+  cleanupExpiredMlCouponsApi,
   convertLinkApi,
   extractOfferUrlApi,
   fetchPlatformCategoriesApi,
   searchPlatformsApi,
 } from '../utils/apiClient';
+import { DEFAULT_ML_COUPON_MAX_AGE_HOURS } from '../utils/mercadoLivreCoupons';
 import { needsAffiliateReconversion } from '../utils/affiliateUrlRules';
 import { FALLBACK_PLATFORM_CATEGORIES, PlatformCategory } from '../utils/catalogCategories';
 import {
@@ -1481,6 +1485,7 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
                     customImageUrl={previewProduct.customImageUrl}
                     showMedia
                     enableLinkPreview={tpl.enableLinkPreview}
+                    includeLinkPreviewDetails={Boolean(tpl.includeLinkPreviewDetails)}
                     previewDomain={getPreviewDomain(previewProduct.platform)}
                     time="22:54"
                   />
@@ -1941,21 +1946,87 @@ export const ProductsCatalogView: React.FC<CatalogListProps> = ({ mode }) => {
  * CUPONS VIEW (Telas 26–29)
  * ========================================================================== */
 export const CouponsView: React.FC = () => {
-  const { coupons, setCoupons, dispatchGroups, dispatchCustomMessage, activeSegment, notify } =
-    useApp();
+  const {
+    coupons,
+    setCoupons,
+    setProducts,
+    autoDispatch,
+    setAutoDispatch,
+    dispatchGroups,
+    dispatchCustomMessage,
+    activeSegment,
+    notify,
+  } = useApp();
   const [tab, setTab] = useState<'meus' | 'vitrine'>('meus');
   const [codeSearch, setCodeSearch] = useState('');
   const [platformFilter, setPlatformFilter] = useState('Todas plataformas');
   const [statusFilter, setStatusFilter] = useState('Ativos');
   const [typeFilter, setTypeFilter] = useState('Todos');
   const [modalOpen, setModalOpen] = useState(false);
+  const [cleaningMlCoupons, setCleaningMlCoupons] = useState(false);
 
   // Form
   const [newCode, setNewCode] = useState('');
   const [newDesc, setNewDesc] = useState('');
   const [newDiscountText, setNewDiscountText] = useState('R$ 20 OFF');
   const [newPlatform, setNewPlatform] = useState<Marketplace>('Shopee');
-  const [newAuto, setNewAuto] = useState(false);
+  const [newMinSpend, setNewMinSpend] = useState('');
+  const [newExpiresAt, setNewExpiresAt] = useState('2026-12-31');
+  const [newSiteWide, setNewSiteWide] = useState(false);
+
+  const mlCouponMaxAgeHours =
+    typeof autoDispatch.mlCouponMaxAgeHours === 'number'
+      ? autoDispatch.mlCouponMaxAgeHours
+      : DEFAULT_ML_COUPON_MAX_AGE_HOURS;
+  const prioritizeCouponProducts = autoDispatch.prioritizeCouponProducts !== false;
+
+  const handleCleanupExpiredMl = async () => {
+    setCleaningMlCoupons(true);
+    try {
+      const res = await cleanupExpiredMlCouponsApi({
+        maxAgeHours: mlCouponMaxAgeHours,
+        segment: activeSegment,
+      });
+      if (!res.ok) {
+        notify('Não foi possível limpar os cupons', res.error || 'Tente novamente.', 'error');
+        return;
+      }
+      if (Array.isArray(res.products)) {
+        setProducts(res.products);
+      }
+      if (Array.isArray(res.coupons)) {
+        setCoupons(res.coupons);
+      }
+      const removed = res.removedCount ?? 0;
+      const replaced = res.replacedCount ?? 0;
+      const kept = res.keptCount ?? 0;
+      notify(
+        'Limpeza de cupons vencidos concluída',
+        `${removed} expirado(s) removido(s), ${replaced} de site inteiro aplicado(s), ${kept} recente(s) mantido(s).`
+      );
+    } finally {
+      setCleaningMlCoupons(false);
+    }
+  };
+
+  const toggleCouponSiteWide = (coupon: Coupon) => {
+    const nextVal = !coupon.isSiteWide;
+    setCoupons((prev) =>
+      prev.map((item) =>
+        item.id === coupon.id
+          ? { ...item, isSiteWide: nextVal, isAutomatic: nextVal }
+          : item
+      )
+    );
+    notify(
+      nextVal
+        ? `${coupon.code} marcado como Site Inteiro`
+        : `${coupon.code} voltou para disparo manual`,
+      nextVal
+        ? 'Será aplicado automaticamente nas ofertas do Mercado Livre sem cupom (respeitando valor mínimo e validade).'
+        : 'Não será mais colado automaticamente em produtos; continua disponível para disparo manual.'
+    );
+  };
 
   const visibleCoupons = coupons.filter((c) => {
     if (tab === 'meus') {
@@ -1971,13 +2042,14 @@ export const CouponsView: React.FC = () => {
     }
     if (statusFilter === 'Ativos' && !c.active) return false;
     if (statusFilter === 'Inativos (expirados)' && c.active) return false;
-    if (typeFilter === 'Automático' && !c.isAutomatic) return false;
+    if (typeFilter === 'Site inteiro' && !c.isSiteWide) return false;
     return true;
   });
 
   const handleAddCoupon = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newCode.trim()) return;
+    const parsedMinSpend = Number(newMinSpend.replace(',', '.'));
     const item: Coupon = {
       id: `cup-${Date.now()}`,
       code: newCode.trim().toUpperCase(),
@@ -1985,9 +2057,11 @@ export const CouponsView: React.FC = () => {
       discountText: newDiscountText.trim() || 'Desconto Especial',
       platform: newPlatform,
       active: true,
-      isAutomatic: newAuto,
+      isAutomatic: newSiteWide,
+      isSiteWide: newSiteWide,
       isShowcase: false,
-      expiresAt: '2026-12-31',
+      minSpend: Number.isFinite(parsedMinSpend) && parsedMinSpend > 0 ? parsedMinSpend : undefined,
+      expiresAt: newExpiresAt.trim() || '2026-12-31',
       segment: normalizeSegmentName(activeSegment),
     };
     setCoupons((prev) => [item, ...prev]);
@@ -1995,6 +2069,8 @@ export const CouponsView: React.FC = () => {
     setModalOpen(false);
     setNewCode('');
     setNewDesc('');
+    setNewMinSpend('');
+    setNewSiteWide(false);
     notify('Cupom cadastrado!', `Código ${item.code} adicionado em "${activeSegment}".`);
   };
 
@@ -2008,8 +2084,116 @@ export const CouponsView: React.FC = () => {
           </h1>
         </div>
         <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
-          Cadastre e gerencie os cupons de desconto.
+          Cadastre seus cupons reais e gerencie a proteção contra cupons expirados nas ofertas.
         </p>
+      </div>
+
+      {/* Proteção de Cupons do Mercado Livre (Soluções 1 + 2 + Prioridade) */}
+      <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 space-y-4">
+        <div className="flex items-start gap-3">
+          <div className="w-10 h-10 rounded-xl bg-emerald-50 dark:bg-emerald-950/60 text-[#15803D] dark:text-emerald-400 flex items-center justify-center shrink-0">
+            <ShieldCheck className="w-5 h-5" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h2 className="font-bold text-base text-slate-900 dark:text-white">
+              Proteção de Cupons do Mercado Livre
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 leading-relaxed">
+              Mantém apenas o cupom original capturado junto com a oferta dentro do prazo limite
+              (removendo datas vencidas, palavras falsas e cupons de outros dias). Cupons de{' '}
+              <strong>Meus Cupons</strong> nunca são colados em produtos aleatórios, a menos que
+              você marque explicitamente <strong>Vale no site inteiro</strong>.
+            </p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {/* TTL selector */}
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 p-3.5 space-y-1.5">
+            <label
+              htmlFor="ml-coupon-ttl-select"
+              className="block text-xs font-semibold text-slate-800 dark:text-slate-100"
+            >
+              Validade do cupom capturado na oferta
+            </label>
+            <select
+              id="ml-coupon-ttl-select"
+              value={String(mlCouponMaxAgeHours)}
+              onChange={(e) => {
+                const hours = Number(e.target.value);
+                setAutoDispatch((prev) => ({ ...prev, mlCouponMaxAgeHours: hours }));
+                notify(
+                  'Prazo de validade atualizado',
+                  hours > 0
+                    ? `Cupons capturados no ML expiram automaticamente após ${hours} hora(s).`
+                    : 'Cupons capturados no ML valem até o fim do mesmo dia (23h59).'
+                );
+              }}
+              className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-800 dark:text-slate-100"
+            >
+              <option value="2">2 horas após a captura</option>
+              <option value="4">4 horas após a captura (Recomendado)</option>
+              <option value="6">6 horas após a captura</option>
+              <option value="0">Mesmo dia (até 23h59)</option>
+            </select>
+            <p className="text-[11px] text-slate-500 dark:text-slate-400">
+              Passou desse prazo, o cupom é removido e a oferta sai limpa sem cupom.
+            </p>
+          </div>
+
+          {/* Prioritize fresh coupon products toggle */}
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 p-3.5 flex items-center justify-between gap-3">
+            <div className="space-y-1">
+              <div className="text-xs font-semibold text-slate-800 dark:text-slate-100">
+                Priorizar ofertas com cupom ativo no envio
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
+                Produtos recém-capturados com cupom válido passam na frente da fila automática para
+                serem enviados antes de expirarem.
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={prioritizeCouponProducts}
+              aria-label="Priorizar ofertas com cupom ativo no envio"
+              onClick={() => {
+                const next = !prioritizeCouponProducts;
+                setAutoDispatch((prev) => ({ ...prev, prioritizeCouponProducts: next }));
+                notify(
+                  next
+                    ? 'Prioridade para ofertas com cupom ativada'
+                    : 'Prioridade para ofertas com cupom desativada'
+                );
+              }}
+              className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                prioritizeCouponProducts ? 'bg-[#15803D]' : 'bg-slate-300 dark:bg-slate-700'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  prioritizeCouponProducts ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2.5 pt-0.5">
+          <button
+            type="button"
+            disabled={cleaningMlCoupons}
+            onClick={() => void handleCleanupExpiredMl()}
+            className="px-4 py-2.5 rounded-xl bg-[#15803D] hover:bg-emerald-800 disabled:opacity-60 text-white text-xs sm:text-sm font-semibold inline-flex items-center gap-2 transition-colors"
+          >
+            {cleaningMlCoupons ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Sparkles className="w-4 h-4" />
+            )}
+            <span>Limpar cupons vencidos agora</span>
+          </button>
+        </div>
       </div>
 
       <button
@@ -2088,7 +2272,7 @@ export const CouponsView: React.FC = () => {
           className="rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-3.5 py-2.5 text-sm"
         >
           <option value="Todos">Todos</option>
-          <option value="Automático">Automático</option>
+          <option value="Site inteiro">Site inteiro (auto)</option>
         </select>
       </div>
 
@@ -2109,9 +2293,11 @@ export const CouponsView: React.FC = () => {
             >
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <div className="text-xs text-slate-500 dark:text-slate-400">
+                  <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
                     {c.platform} · {c.discountText}{' '}
-                    {c.isAutomatic ? '· Automático' : ''}
+                    {c.minSpend ? `· Mín. R$ ${c.minSpend}` : ''}
+                    {c.expiresAt ? ` · Até ${c.expiresAt}` : ''}
+                    {c.isSiteWide ? ' · Site inteiro (auto)' : ''}
                   </div>
                   <div className="mt-1 font-mono text-lg font-bold text-slate-900 dark:text-white">
                     {c.code}
@@ -2132,6 +2318,31 @@ export const CouponsView: React.FC = () => {
                   </button>
                 )}
               </div>
+
+              {!c.isShowcase && c.platform === 'Mercado Livre' && (
+                <div className="flex items-center justify-between gap-2 rounded-xl border border-slate-100 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 px-3 py-2">
+                  <span className="text-xs text-slate-600 dark:text-slate-300">
+                    {c.isSiteWide
+                      ? 'Vale no site inteiro (aplica em ofertas ML sem cupom)'
+                      : 'Somente disparo manual (não cola em produtos)'}
+                  </span>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={Boolean(c.isSiteWide)}
+                    onClick={() => toggleCouponSiteWide(c)}
+                    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                      c.isSiteWide ? 'bg-[#15803D]' : 'bg-slate-300 dark:bg-slate-700'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                        c.isSiteWide ? 'translate-x-5' : 'translate-x-0.5'
+                      }`}
+                    />
+                  </button>
+                </div>
+              )}
 
               <div className="flex items-center gap-2 pt-1">
                 <button
@@ -2248,6 +2459,34 @@ export const CouponsView: React.FC = () => {
                 </div>
               </div>
 
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
+                    Valor mínimo (R$)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={newMinSpend}
+                    onChange={(e) => setNewMinSpend(e.target.value)}
+                    placeholder="Opcional (ex: 79)"
+                    className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3 py-2 text-sm tabular-nums"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
+                    Validade
+                  </label>
+                  <input
+                    type="date"
+                    value={newExpiresAt}
+                    onChange={(e) => setNewExpiresAt(e.target.value)}
+                    className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3 py-2 text-sm tabular-nums"
+                  />
+                </div>
+              </div>
+
               <div>
                 <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
                   Regras / Descrição
@@ -2261,14 +2500,18 @@ export const CouponsView: React.FC = () => {
                 />
               </div>
 
-              <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200 cursor-pointer">
+              <label className="flex items-start gap-2.5 text-xs text-slate-700 dark:text-slate-200 cursor-pointer rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/40 p-3">
                 <input
                   type="checkbox"
-                  checked={newAuto}
-                  onChange={(e) => setNewAuto(e.target.checked)}
-                  className="w-4 h-4 rounded text-[#15803D]"
+                  checked={newSiteWide}
+                  onChange={(e) => setNewSiteWide(e.target.checked)}
+                  className="w-4 h-4 mt-0.5 rounded text-[#15803D]"
                 />
-                <span>Incluir automaticamente nos templates desta plataforma</span>
+                <span>
+                  <strong>Vale no site inteiro</strong> — aplicar automaticamente nas ofertas sem
+                  cupom (marque apenas se você confirmou que o cupom não é restrito a produtos
+                  selecionados).
+                </span>
               </label>
             </div>
 

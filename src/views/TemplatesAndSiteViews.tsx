@@ -68,6 +68,7 @@ export const TemplatesConfigView: React.FC = () => {
   const [tplBody, setTplBody] = useState('');
   const [tplCtaStyle, setTplCtaStyle] = useState<MessageTemplate['ctaStyle']>('Padrão');
   const [tplLinkPreview, setTplLinkPreview] = useState(true);
+  const [tplLinkPreviewDetails, setTplLinkPreviewDetails] = useState(false);
   const [tplConditions, setTplConditions] = useState<TemplateCondition[]>([]);
 
   const openNewTemplate = () => {
@@ -79,6 +80,7 @@ export const TemplatesConfigView: React.FC = () => {
     );
     setTplCtaStyle('Padrão');
     setTplLinkPreview(true);
+    setTplLinkPreviewDetails(false);
     setTplConditions(DEFAULT_TEMPLATE_CONDITIONS.map((c) => ({ ...c })));
     setEditorOpen(true);
   };
@@ -90,6 +92,7 @@ export const TemplatesConfigView: React.FC = () => {
     setTplBody(tpl.body);
     setTplCtaStyle(tpl.ctaStyle);
     setTplLinkPreview(tpl.enableLinkPreview);
+    setTplLinkPreviewDetails(Boolean(tpl.includeLinkPreviewDetails));
     setTplConditions(tpl.conditions.map((c) => ({ ...c })));
     setEditorOpen(true);
   };
@@ -109,6 +112,7 @@ export const TemplatesConfigView: React.FC = () => {
       body: tplBody,
       ctaStyle: tplCtaStyle,
       enableLinkPreview: tplLinkPreview,
+      includeLinkPreviewDetails: tplLinkPreview && tplLinkPreviewDetails,
       conditions: tplConditions,
     };
 
@@ -132,6 +136,7 @@ export const TemplatesConfigView: React.FC = () => {
     setTplBody(preset.body);
     setTplCtaStyle('Padrão');
     setTplLinkPreview(true);
+    setTplLinkPreviewDetails(false);
     setTplConditions((preset.conditions || DEFAULT_TEMPLATE_CONDITIONS).map((c) => ({ ...c })));
     setEditorOpen(true);
   };
@@ -143,6 +148,7 @@ export const TemplatesConfigView: React.FC = () => {
     body: tplBody,
     ctaStyle: tplCtaStyle,
     enableLinkPreview: tplLinkPreview,
+    includeLinkPreviewDetails: tplLinkPreview && tplLinkPreviewDetails,
     conditions: tplConditions,
   };
 
@@ -505,7 +511,11 @@ export const TemplatesConfigView: React.FC = () => {
                     <input
                       type="checkbox"
                       checked={tplLinkPreview}
-                      onChange={(e) => setTplLinkPreview(e.target.checked)}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setTplLinkPreview(checked);
+                        if (!checked) setTplLinkPreviewDetails(false);
+                      }}
                       className="mt-0.5 w-4 h-4 rounded text-[#15803D]"
                     />
                     <div className="text-xs">
@@ -513,11 +523,33 @@ export const TemplatesConfigView: React.FC = () => {
                         Habilitar preview de link
                       </div>
                       <div className="text-slate-500 mt-0.5">
-                        Envia com preview leve evitando encher a galeria.
+                        Envia com preview leve (foto + loja) sem encher a galeria. Desmarque para enviar apenas a foto direta com legenda.
                       </div>
                     </div>
                   </label>
                 </div>
+
+                <label
+                  className={`rounded-xl border border-slate-200 dark:border-slate-700 p-3 flex items-start gap-2.5 transition-opacity ${
+                    tplLinkPreview ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    disabled={!tplLinkPreview}
+                    checked={tplLinkPreview && tplLinkPreviewDetails}
+                    onChange={(e) => setTplLinkPreviewDetails(e.target.checked)}
+                    className="mt-0.5 w-4 h-4 rounded text-[#15803D]"
+                  />
+                  <div className="text-xs">
+                    <div className="font-semibold text-slate-900 dark:text-white">
+                      Exibir título e preço no preview do link
+                    </div>
+                    <div className="text-slate-500 mt-0.5">
+                      Opcional. Desmarcado por padrão: exibe só o nome da loja abaixo da foto (exigido pelo WhatsApp para mostrar a imagem sem duplicar nome e preço).
+                    </div>
+                  </div>
+                </label>
               </div>
 
               {/* Right Live Mockup Column */}
@@ -528,6 +560,7 @@ export const TemplatesConfigView: React.FC = () => {
                   customImageUrl={editorDemoProduct.customImageUrl}
                   showMedia
                   enableLinkPreview={tplLinkPreview}
+                  includeLinkPreviewDetails={tplLinkPreview && tplLinkPreviewDetails}
                   previewDomain={getPreviewDomain(tplPlatform)}
                   time="23:03"
                 />

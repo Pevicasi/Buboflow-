@@ -47,10 +47,13 @@ import {
   detectMarketplaceFromUrl,
 } from '../utils/templateEngine';
 import {
+  createAutomationGroupApi,
   disconnectMlExtensionApi,
+  executeAutomationCommandApi,
   fetchMlExtensionPackageApi,
   runAutoDispatchNowApi,
   getMlExtensionStatusApi,
+  sendAutomationGroupWelcomeApi,
   MlExtensionStatus,
   testPlatformApi,
 } from '../utils/apiClient';
@@ -536,6 +539,95 @@ export const AutoDispatchConfigView: React.FC = () => {
           <span>Salvar Ordem de Envio</span>
         </button>
       </div>
+
+      {/* Regras de Cupons no Disparo Automático */}
+      <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 space-y-4">
+        <div>
+          <h2 className="font-bold text-base text-slate-900 dark:text-white">
+            Regras de Cupons no Disparo Automático
+          </h2>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+            Priorize ofertas com cupom recente para evitar que expirem na fila e defina por quanto
+            tempo um cupom capturado no Mercado Livre permanece válido. Sincronizado com a aba
+            Cupons.
+          </p>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 p-3.5 flex items-center justify-between gap-3">
+            <div className="space-y-1">
+              <div className="text-xs font-semibold text-slate-800 dark:text-slate-100">
+                Priorizar ofertas com cupom ativo
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
+                Envia primeiro os produtos que vieram com cupom válido recente, antes que o cupom
+                esgote ou expire.
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={autoDispatch.prioritizeCouponProducts !== false}
+              aria-label="Priorizar ofertas com cupom ativo"
+              onClick={() => {
+                const next = !(autoDispatch.prioritizeCouponProducts !== false);
+                setAutoDispatch((prev) => ({ ...prev, prioritizeCouponProducts: next }));
+                notify(
+                  next
+                    ? 'Prioridade para ofertas com cupom ativada'
+                    : 'Prioridade para ofertas com cupom desativada'
+                );
+              }}
+              className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                autoDispatch.prioritizeCouponProducts !== false
+                  ? 'bg-[#15803D]'
+                  : 'bg-slate-300 dark:bg-slate-700'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  autoDispatch.prioritizeCouponProducts !== false
+                    ? 'translate-x-6'
+                    : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
+
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 p-3.5 space-y-1.5">
+            <label
+              htmlFor="autodispatch-ml-coupon-ttl"
+              className="block text-xs font-semibold text-slate-800 dark:text-slate-100"
+            >
+              Validade do cupom capturado (Mercado Livre)
+            </label>
+            <select
+              id="autodispatch-ml-coupon-ttl"
+              value={String(
+                typeof autoDispatch.mlCouponMaxAgeHours === 'number'
+                  ? autoDispatch.mlCouponMaxAgeHours
+                  : 4
+              )}
+              onChange={(e) => {
+                const hours = Number(e.target.value);
+                setAutoDispatch((prev) => ({ ...prev, mlCouponMaxAgeHours: hours }));
+                notify(
+                  'Prazo de validade atualizado',
+                  hours > 0
+                    ? `Cupons capturados no ML expiram após ${hours} hora(s).`
+                    : 'Cupons capturados no ML valem até o fim do mesmo dia (23h59).'
+                );
+              }}
+              className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-800 dark:text-slate-100"
+            >
+              <option value="2">2 horas após a captura</option>
+              <option value="4">4 horas após a captura (Recomendado)</option>
+              <option value="6">6 horas após a captura</option>
+              <option value="0">Mesmo dia (até 23h59)</option>
+            </select>
+          </div>
+        </div>
+      </div>
     </div>
   );
 };
@@ -598,65 +690,216 @@ const CHAT_COMMANDS = [
     desc: 'Envie salvar_prioridade: seguido do link para salvar no topo da fila.',
     example: 'salvar_prioridade: https://shopee.com.br/produto',
   },
+  {
+    tag: 'status',
+    title: 'Status do Segmento',
+    desc: 'Mostra no grupo se o disparo automático está ativo, quantos grupos estão ligados e quantas ofertas estão na fila.',
+    example: 'status',
+  },
+  {
+    tag: 'ajuda',
+    title: 'Lista Rápida de Comandos',
+    desc: 'Envia o resumo de todos os comandos aceitos direto no grupo de automação.',
+    example: 'ajuda',
+  },
 ];
 
 export const AutomationGroupConfigView: React.FC = () => {
   const {
+    activeSegment,
     monitoringRules,
     setMonitoringRules,
     monitoringGroups,
+    setMonitoringGroups,
     dispatchGroups,
-    setAutoDispatch,
-    dispatchCustomMessage,
-    integrations,
+    setDispatchGroups,
+    accounts,
     setRoute,
     notify,
   } = useApp();
 
-  const [testCmd, setTestCmd] = useState('converter: https://shopee.com.br/achadinho-top');
-  const [cmdOutput, setCmdOutput] = useState<string | null>(null);
+  const [testCmd, setTestCmd] = useState('status');
+  const [runningCmd, setRunningCmd] = useState(false);
+  const [creatingGroup, setCreatingGroup] = useState(false);
+  const [sendingWelcome, setSendingWelcome] = useState(false);
+  const [sendTestReplyToWa, setSendTestReplyToWa] = useState(false);
+  const [cmdResult, setCmdResult] = useState<{
+    ok: boolean;
+    replyText: string;
+    previewText?: string;
+    previewImageUrl?: string;
+  } | null>(null);
 
-  const runSimulatedCommand = (e: React.FormEvent) => {
-    e.preventDefault();
-    const raw = testCmd.trim();
-    if (!raw) return;
+  // Deduplicate all available WhatsApp groups (monitoring + dispatch) so any real WA group can be chosen
+  const selectableWaGroups = React.useMemo(() => {
+    const byJid = new Map<string, { id: string; name: string; accountName: string; remoteJid: string }>();
+    for (const g of monitoringGroups) {
+      if (g.channel !== 'WhatsApp' || !g.remoteJid) continue;
+      const norm = g.remoteJid.trim().toLowerCase();
+      byJid.set(norm, {
+        id: g.id,
+        name: g.name,
+        accountName: g.accountName,
+        remoteJid: g.remoteJid,
+      });
+    }
+    for (const g of dispatchGroups) {
+      if (g.channel !== 'WhatsApp' || !g.remoteJid) continue;
+      const norm = g.remoteJid.trim().toLowerCase();
+      if (!byJid.has(norm)) {
+        byJid.set(norm, {
+          id: g.id,
+          name: g.name,
+          accountName: g.accountName,
+          remoteJid: g.remoteJid,
+        });
+      }
+    }
+    return Array.from(byJid.values()).sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+  }, [monitoringGroups, dispatchGroups]);
 
-    if (raw === 'envio_automatico_on') {
-      setAutoDispatch((prev) => ({ ...prev, enabled: true }));
-      setCmdOutput('✅ Envio automático ativado com sucesso!');
-      return;
-    }
-    if (raw === 'envio_automatico_off') {
-      setAutoDispatch((prev) => ({ ...prev, enabled: false }));
-      setCmdOutput('⏸️ Envio automático pausado.');
-      return;
-    }
-    if (raw.toLowerCase().startsWith('converter:')) {
-      const url = raw.slice(10).trim();
-      const plat = detectMarketplaceFromUrl(url);
-      const aff = buildAffiliateLink(url, plat, integrations);
-      setCmdOutput(`🔗 Link convertido (${plat}): ${aff}`);
-      return;
-    }
-    if (raw.toLowerCase().startsWith('envio:')) {
-      const msg = raw.slice(6).trim();
-      const activeTargets = dispatchGroups.filter((g) => g.activeForOffers);
-      if (activeTargets.length === 0) {
-        setCmdOutput('⚠️ Nenhum grupo de envio ativo. Ative um grupo real em Grupos de Envio.');
+  const selectedGroup = selectableWaGroups.find(
+    (g) => g.id === monitoringRules.automationGroupId || g.remoteJid === monitoringRules.automationGroupId
+  );
+  const hasConnectedWa = accounts.some((a) => a.channel === 'WhatsApp' && a.connected);
+
+  const handleCreateAutomationGroup = async () => {
+    if (creatingGroup) return;
+    setCreatingGroup(true);
+    try {
+      const res = await createAutomationGroupApi({ segment: activeSegment });
+      if (!res.ok || !res.group) {
+        notify(
+          'Não foi possível criar o grupo',
+          res.error || 'Verifique se o WhatsApp está conectado.',
+          'error'
+        );
         return;
       }
-      dispatchCustomMessage({
-        title: 'Comando Remoto',
-        message: msg,
-        groupsNames: activeTargets.map((g) => g.name),
-        groupIds: activeTargets.map((g) => g.id),
-      });
-      setCmdOutput(
-        `📨 Comunicado enviado para ${activeTargets.map((g) => g.name).join(', ')}: "${msg}"`
+      const created = res.group;
+      setMonitoringGroups((prev) => [
+        ...prev.filter((m) => m.id !== created.id && m.remoteJid !== created.remoteJid),
+        {
+          id: created.id,
+          name: created.name,
+          channel: 'WhatsApp',
+          accountId: created.accountId,
+          accountName: created.accountName,
+          remoteJid: created.remoteJid,
+          monitored: false,
+          monitoredSegments: [],
+          useGroupImage: false,
+          capturedToday: 0,
+        },
+      ]);
+      const dispId = `grp-wa-${created.remoteJid.replace(/[^a-zA-Z0-9]/g, '')}`;
+      setDispatchGroups((prev) => [
+        ...prev.filter((d) => d.id !== dispId && d.remoteJid !== created.remoteJid),
+        {
+          id: dispId,
+          name: created.name,
+          channel: 'WhatsApp',
+          accountId: created.accountId,
+          accountName: created.accountName,
+          remoteJid: created.remoteJid,
+          activeForOffers: false,
+          activeSegments: [],
+          isPriorityCapture: false,
+          isChannel: false,
+          membersCount: 1,
+          maxCapacity: 1024,
+          inviteUrl: 'https://chat.whatsapp.com/',
+          segment: activeSegment,
+          isOwner: true,
+          isAdmin: true,
+          isOwnerOrAdmin: true,
+        },
+      ]);
+      setMonitoringRules((prev) => ({
+        ...prev,
+        automationGroupId: created.id,
+      }));
+      notify(
+        'Grupo de automação criado!',
+        created.welcomeSent === false
+          ? `"${created.name}" foi criado e vinculado ao segmento ${activeSegment}, mas o WhatsApp atrasou a entrega das boas-vindas. Clique em "Enviar boas-vindas" para reenviar.`
+          : `"${created.name}" foi criado no WhatsApp com descrição e boas-vindas, e já está vinculado ao segmento ${activeSegment}.`
       );
-      return;
+    } catch (err: any) {
+      notify(
+        'Erro ao criar grupo',
+        err?.message || 'Falha de comunicação com o servidor.',
+        'error'
+      );
+    } finally {
+      setCreatingGroup(false);
     }
-    setCmdOutput(`✅ Comando "${raw}" processado pelo Controle Remoto!`);
+  };
+
+  const handleSendWelcome = async () => {
+    if (!selectedGroup || sendingWelcome) return;
+    setSendingWelcome(true);
+    try {
+      const res = await sendAutomationGroupWelcomeApi({
+        segment: activeSegment,
+        groupJid: selectedGroup.remoteJid,
+        updateDescription: false,
+      });
+      if (res.ok) {
+        notify(
+          'Boas-vindas enviadas!',
+          `A mensagem com o guia de comandos foi enviada em "${selectedGroup.name}".`
+        );
+      } else {
+        notify(
+          'Não foi possível enviar boas-vindas',
+          res.error || 'Tente novamente em alguns segundos.',
+          'error'
+        );
+      }
+    } catch (err: any) {
+      notify(
+        'Erro ao enviar boas-vindas',
+        err?.message || 'Falha de comunicação com o servidor.',
+        'error'
+      );
+    } finally {
+      setSendingWelcome(false);
+    }
+  };
+
+  const runRealCommand = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const raw = testCmd.trim();
+    if (!raw || runningCmd) return;
+
+    setRunningCmd(true);
+    setCmdResult(null);
+    try {
+      const res = await executeAutomationCommandApi({
+        command: raw,
+        segment: activeSegment,
+        sendToGroup: sendTestReplyToWa && Boolean(selectedGroup),
+      });
+      setCmdResult({
+        ok: Boolean(res.ok),
+        replyText: res.replyText || res.error || 'Comando processado.',
+        previewText: res.previewText,
+        previewImageUrl: res.previewImageUrl,
+      });
+      if (res.ok) {
+        notify('Comando executado no servidor!', res.replyText.split('\n')[0]);
+      } else {
+        notify('Atenção no comando', res.replyText || res.error || 'Verifique a sintaxe.', 'error');
+      }
+    } catch (err: any) {
+      setCmdResult({
+        ok: false,
+        replyText: `❌ Falha ao comunicar com o servidor: ${err?.message || 'erro de rede'}`,
+      });
+    } finally {
+      setRunningCmd(false);
+    }
   };
 
   return (
@@ -669,20 +912,42 @@ export const AutomationGroupConfigView: React.FC = () => {
         >
           <ArrowLeft className="w-5 h-5" />
         </button>
-        <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
-          Grupo de Automação
-        </h1>
+        <div className="flex items-center gap-2.5 flex-wrap">
+          <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
+            Grupo de Automação
+          </h1>
+          <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200/70 dark:border-emerald-800/60 px-2.5 py-0.5 rounded-lg">
+            {activeSegment}
+          </span>
+        </div>
       </div>
 
       {/* Definir Grupo Controle Remoto */}
       <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 space-y-4">
-        <div className="flex items-center gap-2 font-bold text-base text-slate-900 dark:text-white">
-          <Users className="w-5 h-5 text-[#15803D] dark:text-emerald-400" />
-          <span>Definir Grupo de Automação</span>
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-2 font-bold text-base text-slate-900 dark:text-white">
+            <Users className="w-5 h-5 text-[#15803D] dark:text-emerald-400" />
+            <span>Definir Grupo de Automação</span>
+          </div>
+          {selectedGroup ? (
+            <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700 dark:text-emerald-400">
+              <CheckCircle2 className="w-4 h-4" />
+              <span>
+                {hasConnectedWa
+                  ? 'Escutando comandos no WhatsApp em tempo real'
+                  : 'Salvo (conecte o WhatsApp para escutar)'}
+              </span>
+            </span>
+          ) : (
+            <span className="text-xs text-slate-400">Desativado neste segmento</span>
+          )}
         </div>
+
         <p className="text-xs sm:text-sm text-slate-500">
-          Qual grupo será o seu &ldquo;Controle Remoto&rdquo;? Este grupo privado receberá os
-          comandos rápidos que você enviar pelo WhatsApp.
+          Escolha o grupo privado do WhatsApp que funcionará como seu &ldquo;Controle Remoto&rdquo;.
+          Qualquer comando ou link enviado por você nesse grupo será executado automaticamente pelo
+          servidor e respondido lá mesmo — mesmo que o grupo não esteja marcado em Grupos de
+          Monitoramento.
         </p>
 
         <select
@@ -696,49 +961,154 @@ export const AutomationGroupConfigView: React.FC = () => {
           className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3.5 py-2.5 text-sm"
         >
           <option value="">Não utilizar grupo de automação</option>
-          {monitoringGroups.map((g) => (
+          {selectableWaGroups.map((g) => (
             <option key={g.id} value={g.id}>
               {g.name} ({g.accountName})
             </option>
           ))}
         </select>
 
-        <button
-          type="button"
-          onClick={() => notify('Grupo de automação salvo!')}
-          className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-[#15803D] hover:bg-emerald-800 text-white text-sm font-semibold flex items-center justify-center gap-2"
-        >
-          <Save className="w-4 h-4" />
-          <span>Salvar grupo de automação</span>
-        </button>
+        {selectedGroup && (
+          <div className="rounded-xl bg-emerald-50/70 dark:bg-emerald-950/30 border border-emerald-200/70 dark:border-emerald-800/50 px-3.5 py-2.5 text-xs text-emerald-900 dark:text-emerald-200 flex items-center justify-between gap-2 flex-wrap">
+            <span>
+              <strong>Ativo:</strong> {selectedGroup.name} ({selectedGroup.accountName})
+            </span>
+            <span className="font-mono text-[11px] opacity-80">{selectedGroup.remoteJid}</span>
+          </div>
+        )}
+
+        <div className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2.5">
+          <button
+            type="button"
+            disabled={creatingGroup || !hasConnectedWa}
+            onClick={() => void handleCreateAutomationGroup()}
+            title={
+              hasConnectedWa
+                ? `Cria no WhatsApp o grupo "${activeSegment} - GRUPO DE AUTOMAÇÃO" com descrição e vincula automaticamente`
+                : 'Conecte o WhatsApp primeiro para criar o grupo automaticamente'
+            }
+            className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-[#15803D] hover:bg-emerald-800 disabled:opacity-50 text-white text-sm font-semibold flex items-center justify-center gap-2 transition-colors"
+          >
+            {creatingGroup ? (
+              <RefreshCw className="w-4 h-4 animate-spin" />
+            ) : (
+              <Plus className="w-4 h-4" />
+            )}
+            <span>
+              {creatingGroup
+                ? 'Criando grupo no WhatsApp...'
+                : `Criar "${activeSegment} - GRUPO DE AUTOMAÇÃO"`}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() =>
+              notify(
+                selectedGroup ? 'Grupo de automação ativo!' : 'Grupo de automação desativado',
+                selectedGroup
+                  ? `Envie "ajuda" ou "status" em "${selectedGroup.name}" no WhatsApp para testar.`
+                  : 'Nenhum grupo de automação selecionado neste segmento.'
+              )
+            }
+            className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 text-sm font-semibold flex items-center justify-center gap-2 transition-colors"
+          >
+            <Save className="w-4 h-4" />
+            <span>Salvar seleção</span>
+          </button>
+
+          {selectedGroup && (
+            <button
+              type="button"
+              disabled={sendingWelcome || !hasConnectedWa}
+              onClick={() => void handleSendWelcome()}
+              title="Envia a mensagem de boas-vindas com o guia de comandos no grupo selecionado"
+              className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-50 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 text-sm font-semibold flex items-center justify-center gap-2 transition-colors"
+            >
+              {sendingWelcome ? (
+                <RefreshCw className="w-4 h-4 animate-spin" />
+              ) : (
+                <Send className="w-4 h-4" />
+              )}
+              <span>{sendingWelcome ? 'Enviando...' : 'Enviar boas-vindas'}</span>
+            </button>
+          )}
+        </div>
       </div>
 
-      {/* Testador Interativo de Comandos */}
+      {/* Executor Real de Comandos */}
       <form
-        onSubmit={runSimulatedCommand}
+        onSubmit={runRealCommand}
         className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 space-y-3"
       >
-        <div className="flex items-center gap-2 font-bold text-base">
-          <Terminal className="w-5 h-5 text-[#15803D] dark:text-emerald-400" />
-          <span>Testar Comando Rápido Agora</span>
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div className="flex items-center gap-2 font-bold text-base text-slate-900 dark:text-white">
+            <Terminal className="w-5 h-5 text-[#15803D] dark:text-emerald-400" />
+            <span>Executar Comando Rápido Agora</span>
+          </div>
+          {selectedGroup && (
+            <label className="inline-flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={sendTestReplyToWa}
+                onChange={(e) => setSendTestReplyToWa(e.target.checked)}
+                className="rounded border-slate-300 text-[#15803D] focus:ring-[#15803D]"
+              />
+              <span>Enviar resposta também no grupo do WhatsApp</span>
+            </label>
+          )}
         </div>
         <div className="flex flex-col sm:flex-row gap-2">
           <input
             type="text"
             value={testCmd}
             onChange={(e) => setTestCmd(e.target.value)}
+            placeholder="Ex: status, preview: https://..., converter: https://..., agendar: https://... 19:00"
             className="flex-1 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3.5 py-2 text-xs sm:text-sm font-mono"
           />
           <button
             type="submit"
-            className="px-4 py-2 rounded-xl bg-[#15803D] text-white text-xs sm:text-sm font-semibold shrink-0"
+            disabled={runningCmd || !testCmd.trim()}
+            className="px-4 py-2 rounded-xl bg-[#15803D] hover:bg-emerald-800 disabled:opacity-50 text-white text-xs sm:text-sm font-semibold shrink-0 flex items-center justify-center gap-1.5"
           >
-            Executar Comando
+            <RefreshCw className={`w-3.5 h-3.5 ${runningCmd ? 'animate-spin' : ''}`} />
+            <span>{runningCmd ? 'Executando...' : 'Executar Comando'}</span>
           </button>
         </div>
-        {cmdOutput && (
-          <div className="rounded-xl bg-slate-900 text-emerald-300 font-mono text-xs p-3">
-            {cmdOutput}
+        {cmdResult && (
+          <div className="space-y-2.5">
+            <div
+              className={`rounded-xl font-mono text-xs p-3.5 whitespace-pre-wrap break-words ${
+                cmdResult.ok
+                  ? 'bg-slate-900 text-emerald-300'
+                  : 'bg-rose-950/90 text-rose-200 border border-rose-800/60'
+              }`}
+            >
+              {cmdResult.replyText}
+            </div>
+            {cmdResult.previewText && (
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/60 p-3.5 space-y-2">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                  Prévia Gerada do Template
+                </div>
+                <div className="flex flex-col sm:flex-row gap-3 items-start">
+                  {cmdResult.previewImageUrl && (
+                    <img
+                      src={
+                        cmdResult.previewImageUrl.startsWith('http')
+                          ? `/api/media/proxy?url=${encodeURIComponent(cmdResult.previewImageUrl)}`
+                          : cmdResult.previewImageUrl
+                      }
+                      alt="Prévia do produto"
+                      className="w-24 h-24 rounded-xl object-contain bg-white border border-slate-200 shrink-0"
+                    />
+                  )}
+                  <pre className="text-xs text-slate-700 dark:text-slate-200 whitespace-pre-wrap font-sans flex-1">
+                    {cmdResult.previewText}
+                  </pre>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </form>
@@ -1852,6 +2222,97 @@ export const MonitoringAutoConfigView: React.FC = () => {
           <span className="text-sm font-medium">
             Habilitar captura automática de produtos
           </span>
+        </div>
+      </div>
+
+      <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 space-y-4">
+        <div className="flex items-start justify-between gap-4">
+          <div className="space-y-1">
+            <h2 className="font-bold text-base text-slate-900 dark:text-white">
+              Comparador Automático de Menor Preço
+            </h2>
+            <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400">
+              Ao capturar uma oferta de um grupo monitorado, busca automaticamente o mesmo produto
+              na Shopee e no Mercado Livre e substitui pelo anúncio mais barato com seu link de
+              afiliado (filtrando acessórios e divergências de modelo/capacidade).
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={Boolean(monitoringRules.compareLowerPrice)}
+            aria-label="Habilitar comparador automático de menor preço"
+            onClick={() =>
+              setMonitoringRules((prev) => ({
+                ...prev,
+                compareLowerPrice: !prev.compareLowerPrice,
+              }))
+            }
+            className="inline-flex items-center gap-2 min-h-[40px] px-1 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#15803D] shrink-0"
+          >
+            <span
+              className={`text-xs font-semibold whitespace-nowrap ${
+                monitoringRules.compareLowerPrice
+                  ? 'text-[#15803D] dark:text-emerald-400'
+                  : 'text-slate-500 dark:text-slate-400'
+              }`}
+            >
+              {monitoringRules.compareLowerPrice ? 'Ativado' : 'Desativado'}
+            </span>
+            <span
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                monitoringRules.compareLowerPrice
+                  ? 'bg-[#15803D] dark:bg-emerald-600'
+                  : 'bg-slate-300 dark:bg-slate-700'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-xs transition-transform ${
+                  monitoringRules.compareLowerPrice ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </span>
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-slate-100 dark:border-slate-800">
+          <div>
+            <label
+              htmlFor="compare-min-savings-input"
+              className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1.5"
+            >
+              Economia mínima para substituir (%)
+            </label>
+            <input
+              id="compare-min-savings-input"
+              type="number"
+              min={1}
+              max={60}
+              disabled={!monitoringRules.compareLowerPrice}
+              value={monitoringRules.compareMinSavingsPercent ?? 5}
+              onChange={(e) => {
+                const val = Math.max(1, Math.min(60, Number(e.target.value) || 5));
+                setMonitoringRules((prev) => ({
+                  ...prev,
+                  compareMinSavingsPercent: val,
+                }));
+              }}
+              className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 disabled:opacity-50 px-3.5 py-2.5 text-sm tabular-nums"
+            />
+            <p className="text-xs text-slate-400 mt-1.5">
+              A troca só acontece se a oferta encontrada for pelo menos esta porcentagem mais barata
+              que o preço capturado.
+            </p>
+          </div>
+          <div className="rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/70 dark:border-slate-700/60 p-3.5 text-xs text-slate-600 dark:text-slate-300 space-y-1.5">
+            <div className="font-semibold text-slate-800 dark:text-slate-100">
+              Proteção contra falsos positivos
+            </div>
+            <p>
+              Compara título, código de modelo, armazenamento e voltagem, respeita os marketplaces
+              permitidos no grupo e ignora acessórios (capas, películas, cabos ou peças).
+            </p>
+          </div>
         </div>
       </div>
 

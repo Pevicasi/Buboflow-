@@ -18,7 +18,7 @@ import QRCode from 'qrcode';
 import pino from 'pino';
 import { buildMercadoLivreExtensionZip } from './mlExtensionBuilder.ts';
 import {
-  buildWhatsAppLinkPreviewMeta,
+  buildBaileysLinkPreviewPayload,
   cleanMarketplaceProductUrl,
   cleanOfferTitle,
   extractCouponFromMessageText,
@@ -30,6 +30,7 @@ import {
   needsAffiliateReconversion,
   sanitizeShopeeOriginUrl,
   sanitizeShopeeSubIds,
+  shieldWhatsAppCurrencyNumbers,
 } from './src/utils/affiliateUrlRules.ts';
 import {
   FALLBACK_PLATFORM_CATEGORIES,
@@ -57,6 +58,39 @@ import {
 } from './src/utils/autoDispatchEngine.ts';
 import { renderProductMessage } from './src/utils/templateEngine.ts';
 import {
+  extractTextAndUrlsFromWaMessage,
+  filterOfferCandidateUrls,
+  getBrazilDateKey,
+  getCanonicalCapturedTodayForGroup,
+  unwrapWaMessageRecursive,
+} from './src/utils/monitoringCapture.ts';
+import {
+  groupWhatsAppTargetsByActiveAccount,
+  resolveActiveWhatsAppAccounts,
+} from './src/utils/whatsappAccountDispatch.ts';
+import {
+  buildProductSearchQuery,
+  selectBestCheaperOffer,
+} from './src/utils/priceComparator.ts';
+import {
+  computeQueueNextRunIso,
+  isDispatchQueueDue,
+  resolveNextQueueProduct,
+} from './src/utils/dispatchQueueEngine.ts';
+import {
+  assertSafePublicVideoUrl,
+  fetchPublicVideoWithSafeRedirects,
+  sanitizeDownloadFilename,
+} from './src/utils/videoUrlSafety.ts';
+import {
+  buildAutomationGroupDescription,
+  buildAutomationGroupName,
+  isBotAutomationReplyText,
+  parseAutomationCommand,
+  resolveAutomationGroupJidFromId,
+  resolveAutomationSegmentsForGroupJid,
+} from './src/utils/automationCommands.ts';
+import {
   INITIAL_AUTO_DISPATCH,
   INITIAL_INTEGRATIONS,
   INITIAL_MONITORING_RULES,
@@ -75,6 +109,18 @@ import {
   normalizeSegmentName,
   resolveSegmentConfig,
 } from './src/utils/segmentScoping.ts';
+import {
+  evaluateTelegramBotPermission,
+  extractChatsFromTelegramUpdates,
+  normalizeTelegramChatIdentifier,
+  type ResolvedTelegramChat,
+  type TelegramTargetFailure,
+} from './src/utils/telegramSync.ts';
+import {
+  DEFAULT_ML_COUPON_MAX_AGE_HOURS,
+  isPartnerExclusiveCouponCode,
+  resolveEffectiveMlCoupon,
+} from './src/utils/mercadoLivreCoupons.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -703,7 +749,6 @@ function getFallbackCachedGroupsForAccount(accountId: string): {
   }[];
 } | null {
   const safeId = sanitizeAccountId(accountId);
-  const today = new Date().toISOString().slice(0, 10);
   const byJid = new Map<
     string,
     {
@@ -735,12 +780,11 @@ function getFallbackCachedGroupsForAccount(accountId: string): {
     for (const g of cacheData.groups) {
       const jid = normalizeServerGroupJid(g.remoteJid);
       if (!jid.endsWith('@g.us')) continue;
-      const cap = liveWaStats.capturedByGroupJid[jid];
       byJid.set(jid, {
         remoteJid: jid,
         name: g.name || jid,
         membersCount: Math.max(0, Number(g.membersCount) || 0),
-        capturedToday: cap && cap.date === today ? cap.count : 0,
+        capturedToday: getCanonicalCapturedTodayForGroup(jid, liveWaStats.capturedByGroupJid),
         isOwner: g.isOwner,
         isAdmin: g.isAdmin,
         isOwnerOrAdmin: g.isOwnerOrAdmin,
@@ -768,12 +812,11 @@ function getFallbackCachedGroupsForAccount(accountId: string): {
       if (g?.channel !== 'WhatsApp') continue;
       const jid = normalizeServerGroupJid(String(g.remoteJid || ''));
       if (!jid.endsWith('@g.us')) continue;
-      const cap = liveWaStats.capturedByGroupJid[jid];
       byJid.set(jid, {
         remoteJid: jid,
         name: String(g.name || jid),
         membersCount: Math.max(0, Number(g.membersCount) || 0),
-        capturedToday: cap && cap.date === today ? cap.count : 0,
+        capturedToday: getCanonicalCapturedTodayForGroup(jid, liveWaStats.capturedByGroupJid),
         isOwner: g.isOwner,
         isAdmin: g.isAdmin,
         isOwnerOrAdmin: g.isOwnerOrAdmin,
@@ -835,17 +878,42 @@ function recordBaileysMemberDelta(
   saveLiveWaStats();
 }
 
-function recordBaileysCapturedLink(groupJid: string): void {
-  if (!groupJid) return;
-  const today = new Date().toISOString().slice(0, 10);
-  const prev = liveWaStats.capturedByGroupJid[groupJid];
+function recordBaileysCapturedLink(groupJid: string): number {
+  const normJid = normalizeServerGroupJid(groupJid);
+  if (!normJid) return 0;
+  const today = getBrazilDateKey();
+  const prev = liveWaStats.capturedByGroupJid[normJid];
   const nextCount = prev && prev.date === today ? prev.count + 1 : 1;
-  liveWaStats.capturedByGroupJid[groupJid] = {
+  liveWaStats.capturedByGroupJid[normJid] = {
     date: today,
     count: nextCount,
     lastAt: new Date().toISOString(),
   };
   saveLiveWaStats();
+  return nextCount;
+}
+
+function syncMonitoringGroupCountsFromLiveStats(
+  state: Record<string, any> | null
+): Record<string, any> | null {
+  if (!state || !Array.isArray(state.monitoringGroups)) return state;
+  const now = new Date();
+  let changed = false;
+  const nextMonitoring = state.monitoringGroups.map((m: any) => {
+    if (!m || m.channel !== 'WhatsApp' || !m.remoteJid) return m;
+    const norm = normalizeServerGroupJid(m.remoteJid);
+    const canonicalCount = getCanonicalCapturedTodayForGroup(
+      norm,
+      liveWaStats.capturedByGroupJid,
+      now
+    );
+    if ((Number(m.capturedToday) || 0) !== canonicalCount) {
+      changed = true;
+      return { ...m, capturedToday: canonicalCount };
+    }
+    return m;
+  });
+  return changed ? { ...state, monitoringGroups: nextMonitoring } : state;
 }
 
 /* ============================================================================
@@ -1006,6 +1074,17 @@ function mergeNonEmptyCreds(serverInt: any, incomingInt: any): any {
 }
 
 const recentSentWaMsgIds = new Map<string, number>();
+const processedAutomationWaMsgIds = new Map<string, number>();
+let handleIncomingAutomationGroupMessage:
+  | ((params: {
+      groupJid: string;
+      accountId: string;
+      text: string;
+      extractedUrls: string[];
+      groupImageUrl: string | null;
+    }) => Promise<void>)
+  | null = null;
+
 function markRecentOutgoingWaMsgId(msgId?: string | null): void {
   if (!msgId) return;
   const now = Date.now();
@@ -1018,21 +1097,7 @@ function markRecentOutgoingWaMsgId(msgId?: string | null): void {
 }
 
 function extractTextFromWaMessage(msg: any): string {
-  const m =
-    msg?.message?.ephemeralMessage?.message ||
-    msg?.message?.viewOnceMessage?.message ||
-    msg?.message?.viewOnceMessageV2?.message ||
-    msg?.message;
-  if (!m) return '';
-  return String(
-    m.conversation ||
-      m.extendedTextMessage?.text ||
-      m.imageMessage?.caption ||
-      m.videoMessage?.caption ||
-      m.documentMessage?.caption ||
-      m.buttonsResponseMessage?.selectedDisplayText ||
-      ''
-  );
+  return extractTextAndUrlsFromWaMessage(msg).text;
 }
 
 interface MonitoredGroupServerConfig {
@@ -1095,13 +1160,7 @@ function isGroupMonitoredOnServer(groupJid: string): boolean {
 }
 
 function unwrapWaMessageContent(msg: any): any {
-  return (
-    msg?.message?.ephemeralMessage?.message ||
-    msg?.message?.viewOnceMessage?.message ||
-    msg?.message?.viewOnceMessageV2?.message ||
-    msg?.message ||
-    null
-  );
+  return unwrapWaMessageRecursive(msg?.message);
 }
 
 async function saveWaMessageImageToDisk(msg: any, sock: WASocket): Promise<string | null> {
@@ -1162,20 +1221,19 @@ const recentCapturedUrls = new Map<string, number>();
 async function processMonitoredGroupMessage(params: {
   groupJid: string;
   text: string;
+  extractedUrls?: string[];
   groupImageUrl?: string | null;
 }): Promise<void> {
-  const { groupJid, text, groupImageUrl = null } = params;
+  const { groupJid, text, extractedUrls, groupImageUrl = null } = params;
   const normJid = normalizeServerGroupJid(groupJid);
   const groupCfg = getMonitoredGroupConfigOnServer(normJid);
   if (!groupCfg.monitored) return;
 
-  const rawMatches = text.match(/https?:\/\/[^\s<>"')\]}]+/gi) || [];
-  const candidateUrls = rawMatches
-    .map((u) => u.replace(/[.,;!?]+$/, ''))
-    .filter(
-      (u) =>
-        !/chat\.whatsapp\.com|wa\.me\/|whatsapp\.com\/channel|t\.me\/\+/i.test(u)
-    );
+  const rawMatches =
+    Array.isArray(extractedUrls) && extractedUrls.length > 0
+      ? extractedUrls
+      : text.match(/https?:\/\/[^\s<>"')\]}]+/gi) || [];
+  const candidateUrls = filterOfferCandidateUrls(rawMatches, 3);
 
   if (candidateUrls.length === 0) return;
 
@@ -1204,15 +1262,25 @@ async function processMonitoredGroupMessage(params: {
         }
       }
       const avoidHours = Math.max(0, Number(rules.avoidDuplicateHours) || 0);
-      return { segment: seg, avoidMs: avoidHours * 3600_000 };
+      return {
+        segment: seg,
+        avoidMs: avoidHours * 3600_000,
+        compareLowerPrice: Boolean(rules.compareLowerPrice),
+        compareMinSavingsPercent: Math.max(1, Number(rules.compareMinSavingsPercent ?? 5) || 5),
+      };
     })
-    .filter(Boolean) as { segment: string; avoidMs: number }[];
+    .filter(Boolean) as {
+    segment: string;
+    avoidMs: number;
+    compareLowerPrice: boolean;
+    compareMinSavingsPercent: number;
+  }[];
 
   if (segmentPlans.length === 0) return;
 
   const existingProducts: any[] = Array.isArray(st.products) ? st.products : [];
 
-  for (const targetUrl of candidateUrls.slice(0, 2)) {
+  for (const targetUrl of candidateUrls) {
     const cleanBaseUrl = targetUrl.split('?')[0].toLowerCase();
 
     const eligiblePlans = segmentPlans.filter(({ segment, avoidMs }) => {
@@ -1275,35 +1343,154 @@ async function processMonitoredGroupMessage(params: {
           ? groupImageUrl
           : extracted.imageUrl || undefined;
 
+      // Optional automatic lower-price comparator across Shopee + Mercado Livre
+      const needsPriceCompare =
+        disc > 0 && eligiblePlans.some((p) => p.compareLowerPrice);
+      let comparedCandidates: DiscoveredOffer[] = [];
+      if (needsPriceCompare) {
+        const searchQuery = buildProductSearchQuery(extracted.title);
+        if (searchQuery.length >= 4) {
+          try {
+            const [shopeeSettled, mlSettled] = await Promise.allSettled([
+              fetchShopeeOfficialOffers(searchQuery, credentials, 1, 12, undefined, { sortType: 2 }),
+              searchMercadoLivre(searchQuery, credentials, 1, 12),
+            ]);
+            if (shopeeSettled.status === 'fulfilled' && Array.isArray(shopeeSettled.value?.offers)) {
+              comparedCandidates.push(...shopeeSettled.value.offers);
+            }
+            if (mlSettled.status === 'fulfilled' && Array.isArray(mlSettled.value)) {
+              comparedCandidates.push(...mlSettled.value);
+            }
+            // Enforce per-group marketplace filter on comparator candidates too
+            if (groupCfg.allowedMarketplaces && groupCfg.allowedMarketplaces.length > 0) {
+              comparedCandidates = comparedCandidates.filter((c) =>
+                groupCfg.allowedMarketplaces!.includes(c.platform as any)
+              );
+            }
+          } catch (cmpErr: any) {
+            console.warn('[Comparador de Preço] Erro ao buscar alternativas:', cmpErr?.message || cmpErr);
+          }
+        }
+      }
+
       const createdAtIso = new Date().toISOString();
-      const newCapturedProducts = eligiblePlans.map((plan, idx) => ({
-        id: `prod-mon-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
-        title: extracted.title,
-        platform: extracted.platform,
-        category: 'Capturado no Monitoramento',
-        originalPrice: orig,
-        discountPrice: disc,
-        discountPercent: pct,
-        commissionPercent: commPct,
-        commissionValue: commVal,
-        affiliateUrl: extracted.affiliateUrl,
-        originalUrl: extracted.originalUrl || targetUrl,
-        couponCode: extracted.couponCode || undefined,
-        artworkKey: guessArtworkKeyFromTitle(extracted.title),
-        customImageUrl: chosenImageUrl,
-        isFavorite: false,
-        isPrioritized: false,
-        salesRank: 1,
-        segment: plan.segment,
-        createdAt: createdAtIso,
-      }));
+      const newCapturedProducts: any[] = [];
+      for (let idx = 0; idx < eligiblePlans.length; idx += 1) {
+        const plan = eligiblePlans[idx];
+        let finalTitle = extracted.title;
+        let finalPlatform = extracted.platform;
+        let finalOrig = orig;
+        let finalDisc = disc;
+        let finalPct = pct;
+        let finalCommPct = commPct;
+        let finalCommVal = commVal;
+        let finalAffUrl = extracted.affiliateUrl;
+        let finalOrigUrl = extracted.originalUrl || targetUrl;
+        let finalCoupon = extracted.couponCode || undefined;
+        let finalImage = chosenImageUrl;
+        let finalExtraInfo: string | undefined;
+
+        if (plan.compareLowerPrice && comparedCandidates.length > 0) {
+          const picked = selectBestCheaperOffer(
+            {
+              title: extracted.title,
+              platform: extracted.platform,
+              discountPrice: disc,
+              originalPrice: orig,
+              originalUrl: extracted.originalUrl || targetUrl,
+            },
+            comparedCandidates,
+            { minSavingsPercent: plan.compareMinSavingsPercent }
+          );
+          if (picked?.winner) {
+            const w = picked.winner;
+            let convertedWinnerUrl = w.affiliateUrl || w.originalUrl || '';
+            try {
+              if (
+                w.originalUrl &&
+                needsAffiliateReconversion(
+                  {
+                    platform: w.platform,
+                    affiliateUrl: convertedWinnerUrl,
+                    originalUrl: w.originalUrl,
+                  },
+                  credentials?.mercadoLivre?.etiqueta
+                )
+              ) {
+                const conv = await extractOfferFromUrl(w.originalUrl, credentials, '');
+                if (conv?.affiliateUrl) {
+                  convertedWinnerUrl = conv.affiliateUrl;
+                }
+              }
+            } catch {
+              // Keep winner's formatted affiliate URL
+            }
+            if (convertedWinnerUrl) {
+              finalTitle = w.title || finalTitle;
+              finalPlatform = (w.platform as any) || finalPlatform;
+              finalDisc = Number(w.discountPrice) || finalDisc;
+              finalOrig = Math.max(finalDisc, Number(w.originalPrice) || orig);
+              finalPct =
+                finalOrig > finalDisc
+                  ? Math.round(((finalOrig - finalDisc) / finalOrig) * 100)
+                  : Number(w.discountPercent) || 0;
+              finalCommPct =
+                Number(w.commissionPercent) ||
+                DEFAULT_COMMISSION_BY_PLATFORM[finalPlatform] ||
+                commPct;
+              finalCommVal = Number(((finalDisc * finalCommPct) / 100).toFixed(2));
+              finalAffUrl = convertedWinnerUrl;
+              finalOrigUrl = w.originalUrl || convertedWinnerUrl;
+              finalCoupon = undefined;
+              finalImage = w.imageUrl || chosenImageUrl;
+              finalExtraInfo = `Menor preço encontrado (-${picked.savingsPercent}% · economia de R$ ${picked.savingsAmount
+                .toFixed(2)
+                .replace('.', ',')})`;
+              console.log(
+                `[Comparador de Preço][${plan.segment}] Substituído R$ ${disc.toFixed(
+                  2
+                )} (${extracted.platform}) -> R$ ${finalDisc.toFixed(2)} (${finalPlatform}) [-${
+                  picked.savingsPercent
+                }%]: ${finalTitle.slice(0, 60)}`
+              );
+            }
+          }
+        }
+
+        newCapturedProducts.push({
+          id: `prod-mon-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+          title: finalTitle,
+          platform: finalPlatform,
+          category: 'Capturado no Monitoramento',
+          originalPrice: finalOrig,
+          discountPrice: finalDisc,
+          discountPercent: finalPct,
+          commissionPercent: finalCommPct,
+          commissionValue: finalCommVal,
+          affiliateUrl: finalAffUrl,
+          originalUrl: finalOrigUrl,
+          couponCode: finalCoupon,
+          extraInfo: finalExtraInfo,
+          artworkKey: guessArtworkKeyFromTitle(finalTitle),
+          customImageUrl: finalImage,
+          isFavorite: false,
+          isPrioritized: false,
+          salesRank: 1,
+          segment: plan.segment,
+          sourceGroupJid: normJid,
+          createdAt: createdAtIso,
+        });
+      }
+
+      // Record capture count ONLY after a real offer is actually captured & saved for this monitored group
+      const todayCount = recordBaileysCapturedLink(normJid);
 
       const curState = panelStore.state || {};
       const curList = Array.isArray(curState.products) ? curState.products : [];
       const updatedMonitoring = Array.isArray(curState.monitoringGroups)
         ? curState.monitoringGroups.map((m: any) =>
             normalizeServerGroupJid(m?.remoteJid) === normJid
-              ? { ...m, capturedToday: (Number(m.capturedToday) || 0) + 1 }
+              ? { ...m, capturedToday: todayCount }
               : m
           )
         : curState.monitoringGroups;
@@ -1617,34 +1804,66 @@ async function startBaileysSocket(
         const jid = String(msg?.key?.remoteJid || '');
         if (!jid.endsWith('@g.us')) continue;
 
-        const text = extractTextFromWaMessage(msg);
-        if (!text || !/https?:\/\//i.test(text)) continue;
+        const extractedMsg = extractTextAndUrlsFromWaMessage(msg);
 
-        // Avoid re-capturing messages formatted by our own templates
-        if (msg?.key?.fromMe && /Compre aqui:|Promoção sujeita a alteração/i.test(text)) {
-          continue;
-        }
-
-        if (!msg?.key?.fromMe) {
-          recordBaileysCapturedLink(jid);
-        }
-
-        const monCfg = getMonitoredGroupConfigOnServer(jid);
-        if (monCfg.monitored) {
-          if (msg?.key?.fromMe) {
-            recordBaileysCapturedLink(jid);
+        // 1. Check if this group is configured as an Automation Group (Controle Remoto)
+        const autoSegments = resolveAutomationSegmentsForGroupJid(
+          jid,
+          panelStore.state,
+          INITIAL_MONITORING_RULES
+        );
+        if (autoSegments.length > 0 && handleIncomingAutomationGroupMessage) {
+          if (!extractedMsg.text || isBotAutomationReplyText(extractedMsg.text)) {
+            continue;
+          }
+          if (msgId) {
+            if (processedAutomationWaMsgIds.has(msgId)) continue;
+            const nowTs = Date.now();
+            processedAutomationWaMsgIds.set(msgId, nowTs);
+            if (processedAutomationWaMsgIds.size > 300) {
+              for (const [k, ts] of processedAutomationWaMsgIds.entries()) {
+                if (nowTs - ts > 10 * 60_000) processedAutomationWaMsgIds.delete(k);
+              }
+            }
           }
           void (async () => {
-            const groupImageUrl = monCfg.useGroupImage
-              ? await saveWaMessageImageToDisk(msg, sock)
-              : null;
-            await processMonitoredGroupMessage({
+            const groupImageUrl = await saveWaMessageImageToDisk(msg, sock);
+            await handleIncomingAutomationGroupMessage?.({
               groupJid: jid,
-              text,
+              accountId: safeId,
+              text: extractedMsg.text,
+              extractedUrls: extractedMsg.urls,
               groupImageUrl,
             });
           })();
+          continue;
         }
+
+        // 2. Otherwise handle normal passive Monitoring Group capture
+        const monCfg = getMonitoredGroupConfigOnServer(jid);
+        if (!monCfg.monitored) continue;
+
+        if (!extractedMsg.text || extractedMsg.urls.length === 0) continue;
+
+        // Avoid re-capturing messages formatted by our own templates
+        if (
+          msg?.key?.fromMe &&
+          /Compre aqui:|Promoção sujeita a alteração/i.test(extractedMsg.text)
+        ) {
+          continue;
+        }
+
+        void (async () => {
+          const groupImageUrl = monCfg.useGroupImage
+            ? await saveWaMessageImageToDisk(msg, sock)
+            : null;
+          await processMonitoredGroupMessage({
+            groupJid: jid,
+            text: extractedMsg.text,
+            extractedUrls: extractedMsg.urls,
+            groupImageUrl,
+          });
+        })();
       }
     } catch {
       // Ignore message parse error
@@ -4211,7 +4430,8 @@ async function startServer() {
       });
     }
 
-    const reconciled = reconcilePanelWithActiveMlExtension(panelStore.state);
+    const reconciledMl = reconcilePanelWithActiveMlExtension(panelStore.state);
+    const reconciled = syncMonitoringGroupCountsFromLiveStats(reconciledMl);
     if (reconciled && reconciled !== panelStore.state) {
       panelStore.state = reconciled;
       panelStore.version += 1;
@@ -4327,6 +4547,18 @@ async function startServer() {
           ...cur,
           products: mergedProducts,
           savedGroupPrefs: mergedPrefs,
+          excludedDispatchGroupKeys: Array.from(
+            new Set([
+              ...(cur.excludedDispatchGroupKeys || []),
+              ...(incoming.excludedDispatchGroupKeys || []),
+            ])
+          ),
+          excludedMonitoringGroupKeys: Array.from(
+            new Set([
+              ...(cur.excludedMonitoringGroupKeys || []),
+              ...(incoming.excludedMonitoringGroupKeys || []),
+            ])
+          ),
           monitoringGroups: mergedMonitoringGroups,
           integrations: mergedIntegrations,
           autoDispatchBySegment: {
@@ -4406,12 +4638,14 @@ async function startServer() {
         );
       }
 
-      panelStore.state = reconcilePanelWithActiveMlExtension({
-        ...incoming,
-        products: finalProducts,
-        sentLogs: finalSentLogs,
-        totalSentCount: finalTotalSent,
-      });
+      panelStore.state = syncMonitoringGroupCountsFromLiveStats(
+        reconcilePanelWithActiveMlExtension({
+          ...incoming,
+          products: finalProducts,
+          sentLogs: finalSentLogs,
+          totalSentCount: finalTotalSent,
+        })
+      );
       panelStore.hasServerState = true;
       panelStore.version += 1;
       panelStore.updatedAt = new Date().toISOString();
@@ -5172,61 +5406,416 @@ async function startServer() {
   });
 
   // --------------------------------------------------------------------------
-  // 4. TELEGRAM BOT API INTEGRATION (Verify + Discover Chats + Send Photo/Text)
+  // 4. TELEGRAM BOT API INTEGRATION (Safe Shared-Bot Verify + Resolve + Send)
   // --------------------------------------------------------------------------
+  async function inspectAndResolveTelegramBot(params: {
+    botToken: string;
+    knownChatIds?: string[];
+    targetInputs?: string[];
+    includeUpdates?: boolean;
+  }) {
+    const cleanToken = params.botToken.trim();
+    const apiBase = `https://api.telegram.org/bot${cleanToken}`;
+
+    const meRes = await fetch(`${apiBase}/getMe`);
+    const meJson = (await meRes.json()) as any;
+
+    if (!meJson?.ok || !meJson?.result) {
+      return {
+        ok: false as const,
+        status: 400,
+        error: meJson?.description || 'Bot Token inválido no Telegram.',
+      };
+    }
+
+    const bot = {
+      id: Number(meJson.result.id),
+      name: String(meJson.result.first_name || meJson.result.username || 'Bot Telegram'),
+      username: `@${String(meJson.result.username || '')}`,
+    };
+
+    // CRITICAL SAFETY RULE: NEVER call deleteWebhook — this bot may be shared with another automation!
+    let webhookActive = false;
+    let webhookHost: string | undefined;
+    try {
+      const whRes = await fetch(`${apiBase}/getWebhookInfo`);
+      const whJson = (await whRes.json()) as any;
+      const whUrl = String(whJson?.result?.url || '').trim();
+      if (whJson?.ok && whUrl) {
+        webhookActive = true;
+        try {
+          webhookHost = new URL(whUrl).hostname;
+        } catch {
+          webhookHost = 'webhook externo';
+        }
+      }
+    } catch {
+      // Non-fatal; continue safely
+    }
+
+    let updatesConflict = false;
+    const discoveredFromUpdates: { id: string; title?: string; type?: string; username?: string }[] = [];
+
+    if (params.includeUpdates && !webhookActive) {
+      try {
+        const allowed = encodeURIComponent(
+          JSON.stringify([
+            'message',
+            'edited_message',
+            'channel_post',
+            'edited_channel_post',
+            'my_chat_member',
+            'chat_member',
+          ])
+        );
+        const updRes = await fetch(`${apiBase}/getUpdates?limit=100&allowed_updates=${allowed}`);
+        const updJson = (await updRes.json()) as any;
+        if (updRes.status === 409 || (!updJson?.ok && /conflict|webhook|getUpdates/i.test(String(updJson?.description || '')))) {
+          updatesConflict = true;
+        } else if (updJson?.ok && Array.isArray(updJson.result)) {
+          discoveredFromUpdates.push(...extractChatsFromTelegramUpdates(updJson.result));
+        }
+      } catch {
+        // Ignore transient getUpdates error; we still resolve knownChatIds & targetInputs
+      }
+    }
+
+    const failedTargets: TelegramTargetFailure[] = [];
+    const candidateInputs: { target: string; rawInput: string; explicit: boolean }[] = [];
+    const seenCandidates = new Set<string>();
+
+    const enqueueCandidate = (raw: string, explicit: boolean) => {
+      const normalized = normalizeTelegramChatIdentifier(raw);
+      if (!normalized) {
+        if (explicit && raw.trim()) {
+          failedTargets.push({
+            input: raw.trim(),
+            reason:
+              /t\.me\/(\+|joinchat)/i.test(raw)
+                ? 'Links de convite privado (t.me/+...) não são aceitos pela Bot API. Use @usuario do canal ou o ID -100...'
+                : 'Formato inválido. Informe @usuario, https://t.me/usuario ou o ID -100...',
+          });
+        }
+        return;
+      }
+      const key = normalized.toLowerCase();
+      if (!seenCandidates.has(key)) {
+        seenCandidates.add(key);
+        candidateInputs.push({ target: normalized, rawInput: raw.trim(), explicit });
+      }
+    };
+
+    for (const d of discoveredFromUpdates) {
+      enqueueCandidate(d.id, false);
+    }
+    for (const k of params.knownChatIds || []) {
+      if (typeof k === 'string' && k.trim()) {
+        enqueueCandidate(k, false);
+      }
+    }
+    for (const t of params.targetInputs || []) {
+      if (typeof t === 'string' && t.trim()) {
+        enqueueCandidate(t, true);
+      }
+    }
+
+    const resolvedByCanonicalId = new Map<string, ResolvedTelegramChat>();
+
+    for (const cand of candidateInputs) {
+      try {
+        const chatRes = await fetch(
+          `${apiBase}/getChat?chat_id=${encodeURIComponent(cand.target)}`
+        );
+        const chatJson = (await chatRes.json()) as any;
+        if (!chatJson?.ok || !chatJson?.result) {
+          if (cand.explicit) {
+            const desc = String(chatJson?.description || '');
+            let friendlyReason = desc || 'Canal/grupo não encontrado no Telegram.';
+            if (/chat not found/i.test(desc)) {
+              friendlyReason =
+                'Canal não encontrado. Confira a grafia do @usuario e se o canal é público ou se o bot já foi adicionado como admin.';
+            } else if (/forbidden|kicked|not a member/i.test(desc)) {
+              friendlyReason = 'Sem acesso ao canal. Adicione o bot como administrador primeiro.';
+            }
+            failedTargets.push({ input: cand.rawInput, reason: friendlyReason });
+          }
+          continue;
+        }
+
+        const chat = chatJson.result;
+        if (chat.type === 'private') {
+          if (cand.explicit) {
+            failedTargets.push({
+              input: cand.rawInput,
+              reason: 'Este identificador pertence a um chat privado, não a um canal ou grupo.',
+            });
+          }
+          continue;
+        }
+
+        const canonicalId = String(chat.id);
+        if (resolvedByCanonicalId.has(canonicalId)) {
+          continue;
+        }
+
+        // Check real bot permission + real member count safely in parallel
+        const [memberJson, countJson] = await Promise.all([
+          fetch(
+            `${apiBase}/getChatMember?chat_id=${encodeURIComponent(canonicalId)}&user_id=${encodeURIComponent(String(bot.id))}`
+          )
+            .then((r) => r.json() as Promise<any>)
+            .catch(() => null),
+          fetch(`${apiBase}/getChatMemberCount?chat_id=${encodeURIComponent(canonicalId)}`)
+            .then((r) => r.json() as Promise<any>)
+            .catch(() => null),
+        ]);
+
+        const perm = evaluateTelegramBotPermission(
+          String(chat.type || 'channel'),
+          memberJson?.ok ? memberJson.result : null
+        );
+        const membersCount =
+          countJson?.ok && typeof countJson.result === 'number' && countJson.result >= 0
+            ? countJson.result
+            : 0;
+        const username = chat.username ? String(chat.username).replace(/^@/, '') : undefined;
+        const inviteUrl = username
+          ? `https://t.me/${username}`
+          : typeof chat.invite_link === 'string' && chat.invite_link
+          ? chat.invite_link
+          : 'https://t.me/';
+
+        resolvedByCanonicalId.set(canonicalId, {
+          id: canonicalId,
+          title: String(chat.title || (username ? `@${username}` : canonicalId)),
+          type: String(chat.type || 'channel'),
+          username,
+          membersCount,
+          inviteUrl,
+          isChannel: String(chat.type || '').toLowerCase() === 'channel',
+          isOwner: perm.isOwner,
+          isAdmin: perm.isAdmin,
+          isOwnerOrAdmin: perm.isOwnerOrAdmin,
+          canPostMessages: perm.canPostMessages,
+          statusLabel: perm.statusLabel,
+          warningReason: perm.warningReason,
+          sourceInput: cand.explicit ? cand.rawInput : undefined,
+        });
+      } catch (err: any) {
+        if (cand.explicit) {
+          failedTargets.push({
+            input: cand.rawInput,
+            reason: err?.message || 'Erro ao consultar o canal na API do Telegram.',
+          });
+        }
+      }
+    }
+
+    let syncNote: string | undefined;
+    if (webhookActive) {
+      syncNote = `Bot compartilhado detectado: há um webhook ativo em "${webhookHost || 'outra automação'}". Ele foi mantido intacto para não interromper sua outra automação. Use "Importar Canais por @" para adicionar e validar seus canais com segurança.`;
+    } else if (updatesConflict) {
+      syncNote =
+        'Outra automação já está lendo eventos (getUpdates) deste mesmo bot. O sistema manteve a outra automação intacta — use "Importar Canais por @" para adicionar e validar seus canais.';
+    } else if (params.includeUpdates && discoveredFromUpdates.length === 0) {
+      syncNote =
+        'A API do Telegram não possui um endpoint que liste todos os canais do bot automaticamente; ela só retorna canais com eventos recentes. Use "Importar Canais por @" para cadastrar e validar todos os seus canais em segundos.';
+    }
+
+    return {
+      ok: true as const,
+      status: 200,
+      bot,
+      webhookActive,
+      webhookHost,
+      updatesConflict,
+      syncNote,
+      discoveredChats: Array.from(resolvedByCanonicalId.values()),
+      failedTargets,
+    };
+  }
+
   app.post('/api/telegram/verify', async (req, res) => {
     try {
-      const { botToken } = req.body || {};
+      const { botToken, knownChatIds = [], targetInputs = [] } = req.body || {};
       if (!botToken || typeof botToken !== 'string') {
         return res.status(400).json({ ok: false, error: 'Informe o Bot Token do @BotFather.' });
       }
-      const cleanToken = botToken.trim();
-      const meRes = await fetch(`https://api.telegram.org/bot${cleanToken}/getMe`);
-      const meJson = (await meRes.json()) as any;
 
-      if (!meJson.ok) {
-        return res.status(400).json({
-          ok: false,
-          error: meJson.description || 'Bot Token inválido no Telegram.',
-        });
-      }
+      const result = await inspectAndResolveTelegramBot({
+        botToken,
+        knownChatIds: Array.isArray(knownChatIds) ? knownChatIds : [],
+        targetInputs: Array.isArray(targetInputs) ? targetInputs : [],
+        includeUpdates: true,
+      });
 
-      // Also inspect recent updates to auto-discover groups/channels where the bot is present
-      const updRes = await fetch(
-        `https://api.telegram.org/bot${cleanToken}/getUpdates?limit=50`
-      );
-      const updJson = (await updRes.json()) as any;
-      const chatsMap = new Map<
-        string,
-        { id: string; title: string; type: string; username?: string }
-      >();
-
-      if (updJson.ok && Array.isArray(updJson.result)) {
-        for (const u of updJson.result) {
-          const chat =
-            u.message?.chat ||
-            u.channel_post?.chat ||
-            u.my_chat_member?.chat ||
-            u.edited_message?.chat;
-          if (chat && chat.id && chat.type !== 'private') {
-            chatsMap.set(String(chat.id), {
-              id: String(chat.id),
-              title: chat.title || chat.username || String(chat.id),
-              type: chat.type,
-              username: chat.username,
-            });
-          }
-        }
+      if (!result.ok) {
+        return res.status(result.status).json({ ok: false, error: result.error });
       }
 
       res.json({
         ok: true,
-        bot: {
-          id: meJson.result.id,
-          name: meJson.result.first_name,
-          username: `@${meJson.result.username}`,
-        },
-        discoveredChats: Array.from(chatsMap.values()),
+        bot: result.bot,
+        webhookActive: result.webhookActive,
+        webhookHost: result.webhookHost,
+        updatesConflict: result.updatesConflict,
+        syncNote: result.syncNote,
+        discoveredChats: result.discoveredChats,
+        failedTargets: result.failedTargets,
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // 4B. MERCADO LIVRE COUPON CLEANUP ENDPOINT (TTL + Site-Wide Validation)
+  // --------------------------------------------------------------------------
+  app.post('/api/coupons/mercadolivre/cleanup', async (req, res) => {
+    try {
+      const st = panelStore.state || {};
+      const requestedSegment =
+        typeof req.body?.segment === 'string' && req.body.segment.trim()
+          ? normalizeSegmentName(req.body.segment)
+          : undefined;
+      const requestedMaxAge =
+        typeof req.body?.maxAgeHours === 'number' && Number.isFinite(req.body.maxAgeHours)
+          ? Math.max(0, req.body.maxAgeHours)
+          : undefined;
+      const purgePromobitCoupons = req.body?.purgePromobitCoupons === true;
+
+      const allProducts = Array.isArray(st.products) ? st.products : [];
+      const rawCoupons = Array.isArray(st.coupons) ? st.coupons : [];
+
+      let checkedCount = 0;
+      let removedCount = 0;
+      let replacedCount = 0;
+      let keptCount = 0;
+      let mutated = false;
+
+      // Always purge partner-exclusive coupons; optionally purge previously imported Promobit coupons
+      const allCoupons = rawCoupons.filter((c: any) => {
+        if (!c || c.isShowcase) return true;
+        if (
+          c.platform === 'Mercado Livre' &&
+          isPartnerExclusiveCouponCode(c.code, c.description)
+        ) {
+          mutated = true;
+          return false;
+        }
+        if (purgePromobitCoupons && c.platform === 'Mercado Livre' && !c.isSiteWide) {
+          mutated = true;
+          return false;
+        }
+        return true;
+      });
+
+      const nextProducts = allProducts.map((prod: any) => {
+        if (!prod || typeof prod !== 'object') return prod;
+        if (requestedSegment && !matchesSegment(prod.segment, requestedSegment)) {
+          return prod;
+        }
+        const prodSeg = normalizeSegmentName(prod.segment);
+        const segCfg = resolveSegmentConfig(
+          st.autoDispatchBySegment,
+          st.autoDispatch || INITIAL_AUTO_DISPATCH,
+          prodSeg,
+          createDefaultAutoDispatchForSegment
+        );
+        const maxAgeHours =
+          requestedMaxAge !== undefined
+            ? requestedMaxAge
+            : typeof segCfg?.mlCouponMaxAgeHours === 'number'
+            ? segCfg.mlCouponMaxAgeHours
+            : DEFAULT_ML_COUPON_MAX_AGE_HOURS;
+        const segCoupons = allCoupons.filter((c: any) => matchesSegment(c?.segment, prodSeg));
+
+        if (prod.platform === 'Mercado Livre' || prod.couponCode) {
+          checkedCount += 1;
+        }
+        const resolution = resolveEffectiveMlCoupon({
+          product: prod,
+          savedCoupons: segCoupons,
+          maxAgeHours,
+          now: new Date(),
+        });
+
+        if (resolution.changed) {
+          mutated = true;
+          if (!resolution.couponCode) {
+            removedCount += 1;
+          } else {
+            replacedCount += 1;
+          }
+          return {
+            ...prod,
+            couponCode: resolution.couponCode || undefined,
+          };
+        }
+        if (prod.couponCode) {
+          keptCount += 1;
+        }
+        return prod;
+      });
+
+      if (mutated) {
+        panelStore.state = {
+          ...st,
+          coupons: allCoupons,
+          products: nextProducts,
+        };
+        panelStore.version += 1;
+        panelStore.updatedAt = new Date().toISOString();
+        saveStoredPanelState();
+      }
+
+      res.json({
+        ok: true,
+        checkedCount,
+        removedCount,
+        replacedCount,
+        keptCount,
+        version: panelStore.version,
+        products: nextProducts,
+        coupons: allCoupons,
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.post('/api/telegram/resolve-chats', async (req, res) => {
+    try {
+      const { botToken, targets = [] } = req.body || {};
+      if (!botToken || typeof botToken !== 'string') {
+        return res.status(400).json({ ok: false, error: 'Informe o Bot Token do @BotFather.' });
+      }
+      if (!Array.isArray(targets) || targets.length === 0) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Informe pelo menos um @canal, link t.me/canal ou Chat ID -100...',
+        });
+      }
+
+      const result = await inspectAndResolveTelegramBot({
+        botToken,
+        targetInputs: targets,
+        includeUpdates: false,
+      });
+
+      if (!result.ok) {
+        return res.status(result.status).json({ ok: false, error: result.error });
+      }
+
+      res.json({
+        ok: true,
+        bot: result.bot,
+        webhookActive: result.webhookActive,
+        webhookHost: result.webhookHost,
+        updatesConflict: result.updatesConflict,
+        syncNote: result.syncNote,
+        discoveredChats: result.discoveredChats,
+        failedTargets: result.failedTargets,
       });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err.message });
@@ -5358,7 +5947,7 @@ async function startServer() {
   });
 
   app.get('/api/whatsapp/baileys/live-stats', (_req, res) => {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = getBrazilDateKey();
     const todayCaptures: Record<string, number> = {};
     for (const [jid, info] of Object.entries(liveWaStats.capturedByGroupJid)) {
       todayCaptures[jid] = info.date === today ? info.count : 0;
@@ -5643,7 +6232,6 @@ async function startServer() {
         try {
           const participating = await session.sock.groupFetchAllParticipating();
           const selfIds = getBaileysSelfIdentifiers(session.accountId, session.sock);
-          const today = new Date().toISOString().slice(0, 10);
           const uniqueByJid = new Map<
             string,
             {
@@ -5660,7 +6248,6 @@ async function startServer() {
             const rawJid = String(g?.id || '').trim();
             if (!rawJid.endsWith('@g.us')) continue;
             const jid = normalizeServerGroupJid(rawJid);
-            const cap = liveWaStats.capturedByGroupJid[jid] || liveWaStats.capturedByGroupJid[rawJid];
             const membersCount = Number(g.participants?.length || g.size || 0);
             const role = detectGroupAdminRole(g, selfIds);
             const existing = uniqueByJid.get(jid);
@@ -5669,7 +6256,10 @@ async function startServer() {
                 remoteJid: jid,
                 name: String(g.subject || jid),
                 membersCount,
-                capturedToday: cap && cap.date === today ? cap.count : 0,
+                capturedToday: getCanonicalCapturedTodayForGroup(
+                  jid,
+                  liveWaStats.capturedByGroupJid
+                ),
                 isOwner: role.isOwner,
                 isAdmin: role.isAdmin,
                 isOwnerOrAdmin: role.isOwnerOrAdmin,
@@ -5765,13 +6355,17 @@ async function startServer() {
     }
   });
 
+  let waRotationCursor = 0;
+
   async function sendBaileysOfferToJids(params: {
     accountId?: string;
     remoteJids: string[];
     message: string;
     imageUrl?: string;
     enableLinkPreview?: boolean;
+    includeLinkPreviewDetails?: boolean;
     mentionAll?: boolean;
+    allowInactiveAccount?: boolean;
   }): Promise<{
     ok: boolean;
     sentCount: number;
@@ -5784,15 +6378,57 @@ async function startServer() {
       message,
       imageUrl = '',
       enableLinkPreview = true,
+      includeLinkPreviewDetails = false,
       mentionAll = false,
+      allowInactiveAccount = false,
     } = params;
 
     const safeId = sanitizeAccountId(String(accountId));
-    const exact = baileysSessions.get(safeId);
-    const session =
-      exact && exact.status === 'open' && exact.sock
-        ? exact
-        : Array.from(baileysSessions.values()).find((s) => s.status === 'open' && s.sock);
+    const openSessions = Array.from(baileysSessions.values()).filter(
+      (s) => s.status === 'open' && s.sock
+    );
+    let session: BaileysSessionEntry | undefined;
+
+    if (allowInactiveAccount) {
+      const exact = baileysSessions.get(safeId);
+      session = exact && exact.status === 'open' && exact.sock ? exact : openSessions[0];
+    } else {
+      const panelAccounts: any[] = Array.isArray(panelStore.state?.accounts)
+        ? panelStore.state.accounts
+        : [];
+      const { activeAccounts, hasAnyConnectedOrOpen } = resolveActiveWhatsAppAccounts(
+        panelAccounts,
+        openSessions.map((s) => s.accountId)
+      );
+      if (!hasAnyConnectedOrOpen) {
+        return {
+          ok: false,
+          sentCount: 0,
+          results: [],
+          error:
+            'Sessão Baileys desconectada. Escaneie o QR Code ou conecte com número de telefone em Contas WhatsApp.',
+        };
+      }
+      if (activeAccounts.length === 0) {
+        return {
+          ok: false,
+          sentCount: 0,
+          results: [],
+          error:
+            'Nenhum número de WhatsApp está ativo para envio de ofertas. Ative ao menos um número em Canais → WhatsApp.',
+        };
+      }
+      const activeSafeIds = new Set(activeAccounts.map((a) => sanitizeAccountId(String(a.id))));
+      const exact = baileysSessions.get(safeId);
+      if (exact && exact.status === 'open' && exact.sock && activeSafeIds.has(exact.accountId)) {
+        session = exact;
+      } else {
+        const preferredActiveSafeId = sanitizeAccountId(String(activeAccounts[0].id));
+        session =
+          baileysSessions.get(preferredActiveSafeId) ||
+          openSessions.find((s) => activeSafeIds.has(s.accountId));
+      }
+    }
 
     if (!session || session.status !== 'open' || !session.sock) {
       return {
@@ -5817,18 +6453,13 @@ async function startServer() {
       }
     }
 
-    const previewMeta = enableLinkPreview
-      ? buildWhatsAppLinkPreviewMeta(String(message))
+    const baseLinkPreview = enableLinkPreview
+      ? buildBaileysLinkPreviewPayload(String(message), Boolean(includeLinkPreviewDetails))
       : null;
     let richLinkPreview: any = null;
 
-    if (enableLinkPreview && previewMeta) {
-      richLinkPreview = {
-        'canonical-url': previewMeta.matchedUrl,
-        'matched-text': previewMeta.matchedUrl,
-        title: previewMeta.title,
-        description: previewMeta.description,
-      };
+    if (enableLinkPreview && baseLinkPreview) {
+      richLinkPreview = { ...baseLinkPreview };
 
       if (mediaBuf) {
         try {
@@ -5888,9 +6519,11 @@ async function startServer() {
           }
         }
 
+        const waMessageText = shieldWhatsAppCurrencyNumbers(String(message));
+
         if (enableLinkPreview && richLinkPreview) {
           const sent = await session.sock.sendMessage(jid, {
-            text: String(message),
+            text: waMessageText,
             linkPreview: richLinkPreview,
             ...(mentions ? { mentions } : {}),
           });
@@ -5899,7 +6532,7 @@ async function startServer() {
           const imagePayload: any = {
             image: mediaBuf,
             mimetype: 'image/jpeg',
-            caption: String(message),
+            caption: waMessageText,
             ...(standardizedImg
               ? {
                   width: standardizedImg.width,
@@ -5912,7 +6545,7 @@ async function startServer() {
           markRecentOutgoingWaMsgId(sent?.key?.id);
         } else {
           const sent = await session.sock.sendMessage(jid, {
-            text: String(message),
+            text: waMessageText,
             linkPreview: null,
             ...(mentions ? { mentions } : {}),
           });
@@ -6042,10 +6675,17 @@ async function startServer() {
     });
 
     const accounts: any[] = Array.isArray(st.accounts) ? st.accounts : [];
-    const hasOpenBaileys = Array.from(baileysSessions.values()).some(
-      (s) => s.status === 'open' && s.sock
+    const openBaileysIds = Array.from(baileysSessions.values())
+      .filter((s) => s.status === 'open' && s.sock)
+      .map((s) => s.accountId);
+    const rotateAccounts = Boolean(st.whatsappRotationEnabled);
+    const waDispatchPlan = groupWhatsAppTargetsByActiveAccount(
+      targets.waGroups,
+      accounts,
+      openBaileysIds,
+      { rotateAccounts, rotationCursor: waRotationCursor }
     );
-    const usableWaGroups = hasOpenBaileys ? targets.waGroups : [];
+    const waBatches = waDispatchPlan.batches;
     const usableTgTargets = targets.tgGroups
       .map((tg) => {
         const acc = accounts.find(
@@ -6067,16 +6707,17 @@ async function startServer() {
       };
     }
 
-    if (usableWaGroups.length === 0 && usableTgTargets.length === 0) {
+    if (waBatches.length === 0 && usableTgTargets.length === 0) {
       return {
         ok: false,
         skipped: !options.manual,
-        reason: 'whatsapp_disconnected',
+        reason: waDispatchPlan.allDisabled ? 'whatsapp_all_disabled' : 'whatsapp_disconnected',
         sentProductsCount: 0,
         sentGroupsCount: 0,
         titles: [],
-        error:
-          'WhatsApp desconectado. Conecte sua conta em Canais → WhatsApp para iniciar os disparos.',
+        error: waDispatchPlan.allDisabled
+          ? 'Todos os números de WhatsApp conectados estão desativados para envio de ofertas. Ative ao menos um número em Canais → WhatsApp.'
+          : 'WhatsApp desconectado. Conecte sua conta em Canais → WhatsApp para iniciar os disparos.',
       };
     }
 
@@ -6156,6 +6797,33 @@ async function startServer() {
           }
         }
 
+        // Validate & clean expired/invalid Mercado Livre coupons right before rendering
+        if (prod.platform === 'Mercado Livre' || prod.couponCode) {
+          try {
+            const maxAgeHours =
+              typeof effectiveCfg?.mlCouponMaxAgeHours === 'number'
+                ? effectiveCfg.mlCouponMaxAgeHours
+                : DEFAULT_ML_COUPON_MAX_AGE_HOURS;
+            const segCoupons = (Array.isArray(st.coupons) ? st.coupons : []).filter((c: any) =>
+              matchesSegment(c?.segment, targetSegment)
+            );
+            const couponRes = resolveEffectiveMlCoupon({
+              product: prod,
+              savedCoupons: segCoupons,
+              maxAgeHours,
+              now: new Date(),
+            });
+            if (couponRes.changed) {
+              prod = {
+                ...prod,
+                couponCode: couponRes.couponCode || undefined,
+              };
+            }
+          } catch {
+            // Non-fatal; proceed with offer
+          }
+        }
+
         const tpl =
           templates.find((t: any) => t.platform === prod.platform) ||
           templates[0] ||
@@ -6166,19 +6834,31 @@ async function startServer() {
         let deliveredForProduct = 0;
         const deliveredGroupNames: string[] = [];
 
-        if (usableWaGroups.length > 0) {
+        // Re-evaluate batch per product so automatic rotation alternates on every single offer
+        const productWaPlan = rotateAccounts
+          ? groupWhatsAppTargetsByActiveAccount(targets.waGroups, accounts, openBaileysIds, {
+              rotateAccounts: true,
+              rotationCursor: waRotationCursor,
+            })
+          : waDispatchPlan;
+
+        for (const batch of productWaPlan.batches) {
           const waRes = await sendBaileysOfferToJids({
-            accountId: usableWaGroups[0].accountId || 'acc-wa-1',
-            remoteJids: usableWaGroups.map((g) => g.remoteJid),
+            accountId: batch.accountId,
+            remoteJids: batch.remoteJids,
             message,
             imageUrl,
             enableLinkPreview: tpl.enableLinkPreview,
+            includeLinkPreviewDetails: Boolean(tpl.includeLinkPreviewDetails),
           });
           if (waRes.ok && waRes.sentCount > 0) {
             deliveredForProduct += waRes.sentCount;
+            if (rotateAccounts && productWaPlan.rotatedAccountId) {
+              waRotationCursor = productWaPlan.nextRotationCursor;
+            }
             for (const r of waRes.results) {
               if (r.ok) {
-                const match = usableWaGroups.find(
+                const match = batch.targets.find(
                   (g) => normalizeServerGroupJid(g.remoteJid) === normalizeServerGroupJid(r.jid)
                 );
                 deliveredGroupNames.push(match?.name || r.jid);
@@ -6343,6 +7023,1748 @@ async function startServer() {
     }
   });
 
+  // --------------------------------------------------------------------------
+  // 5B. AUTOMATION GROUP (CONTROLE REMOTO WHATSAPP) + 24/7 SCHEDULE RUNNER
+  // --------------------------------------------------------------------------
+  async function dispatchMessageToSegmentActiveGroups(params: {
+    segment: string;
+    title: string;
+    message: string;
+    imageUrl?: string;
+    enableLinkPreview?: boolean;
+    includeLinkPreviewDetails?: boolean;
+    platform?: string;
+    affiliateUrl?: string;
+    targetGroupIds?: string[];
+    logPrefix?: string;
+  }): Promise<{
+    ok: boolean;
+    sentCount: number;
+    deliveredGroupNames: string[];
+    error?: string;
+  }> {
+    const st = panelStore.state || {};
+    const targetSegment = normalizeSegmentName(params.segment);
+    const accounts: any[] = Array.isArray(st.accounts) ? st.accounts : [];
+    const openBaileysIds = Array.from(baileysSessions.values())
+      .filter((s) => s.status === 'open' && s.sock)
+      .map((s) => s.accountId);
+
+    let waGroups: { remoteJid: string; name: string; accountId?: string }[] = [];
+    let tgGroups: { remoteJid: string; name: string; accountId?: string }[] = [];
+
+    if (Array.isArray(params.targetGroupIds) && params.targetGroupIds.length > 0) {
+      const idSet = new Set(params.targetGroupIds);
+      const allDispatch: any[] = Array.isArray(st.dispatchGroups) ? st.dispatchGroups : [];
+      for (const g of allDispatch) {
+        if (!g || !idSet.has(g.id) || !g.remoteJid) continue;
+        if (g.channel === 'WhatsApp') {
+          waGroups.push({
+            remoteJid: String(g.remoteJid),
+            name: String(g.name || g.remoteJid),
+            accountId: g.accountId,
+          });
+        } else if (g.channel === 'Telegram') {
+          tgGroups.push({
+            remoteJid: String(g.remoteJid),
+            name: String(g.name || g.remoteJid),
+            accountId: g.accountId,
+          });
+        }
+      }
+    } else {
+      const targets = resolveActiveDispatchTargets({
+        dispatchGroups: st.dispatchGroups,
+        savedGroupPrefs: st.savedGroupPrefs,
+        targetSegment,
+      });
+      waGroups = targets.waGroups;
+      tgGroups = targets.tgGroups;
+    }
+
+    const rotateAccounts = Boolean(st.whatsappRotationEnabled);
+    const waDispatchPlan = groupWhatsAppTargetsByActiveAccount(
+      waGroups,
+      accounts,
+      openBaileysIds,
+      { rotateAccounts, rotationCursor: waRotationCursor }
+    );
+    const waBatches = waDispatchPlan.batches;
+    const usableTgTargets = tgGroups
+      .map((tg) => {
+        const acc = accounts.find(
+          (a) => a.channel === 'Telegram' && (a.id === tg.accountId || a.apiToken)
+        );
+        return acc?.apiToken ? { ...tg, botToken: String(acc.apiToken) } : null;
+      })
+      .filter(Boolean) as { remoteJid: string; name: string; botToken: string }[];
+
+    if (waGroups.length === 0 && tgGroups.length === 0) {
+      return {
+        ok: false,
+        sentCount: 0,
+        deliveredGroupNames: [],
+        error: `Nenhum grupo de envio ativo no segmento "${targetSegment}". Ative ao menos um grupo em Grupos de Envio.`,
+      };
+    }
+
+    if (waBatches.length === 0 && usableTgTargets.length === 0) {
+      return {
+        ok: false,
+        sentCount: 0,
+        deliveredGroupNames: [],
+        error: waDispatchPlan.allDisabled
+          ? 'Todos os números de WhatsApp conectados estão desativados para envio de ofertas. Ative ao menos um número em Canais → WhatsApp.'
+          : 'WhatsApp e Telegram desconectados ou sem token configurado.',
+      };
+    }
+
+    let sentCount = 0;
+    const deliveredGroupNames: string[] = [];
+    let lastError: string | undefined;
+
+    for (const batch of waBatches) {
+      const waRes = await sendBaileysOfferToJids({
+        accountId: batch.accountId,
+        remoteJids: batch.remoteJids,
+        message: params.message,
+        imageUrl: params.imageUrl,
+        enableLinkPreview: params.enableLinkPreview !== false,
+        includeLinkPreviewDetails: Boolean(params.includeLinkPreviewDetails),
+      });
+      if (waRes.ok && waRes.sentCount > 0) {
+        sentCount += waRes.sentCount;
+        if (rotateAccounts && waDispatchPlan.rotatedAccountId) {
+          waRotationCursor = waDispatchPlan.nextRotationCursor;
+        }
+        for (const r of waRes.results) {
+          if (r.ok) {
+            const match = batch.targets.find(
+              (g) => normalizeServerGroupJid(g.remoteJid) === normalizeServerGroupJid(r.jid)
+            );
+            deliveredGroupNames.push(match?.name || r.jid);
+          }
+        }
+      } else if (waRes.error) {
+        lastError = waRes.error;
+      }
+    }
+
+    const standardizedTgImg =
+      usableTgTargets.length > 0 && params.imageUrl
+        ? await loadStandardizedProductImage(String(params.imageUrl))
+        : null;
+    const tgHtml =
+      usableTgTargets.length > 0 ? whatsappToTelegramHtml(String(params.message)) : '';
+
+    for (const tg of usableTgTargets) {
+      try {
+        let tgRes: Response;
+        if (standardizedTgImg) {
+          const form = new FormData();
+          form.append('chat_id', String(tg.remoteJid));
+          form.append('caption', tgHtml.slice(0, 1024));
+          form.append('parse_mode', 'HTML');
+          form.append(
+            'photo',
+            new Blob([new Uint8Array(standardizedTgImg.buffer)], { type: 'image/jpeg' }),
+            'oferta.jpg'
+          );
+          tgRes = await fetch(`https://api.telegram.org/bot${tg.botToken}/sendPhoto`, {
+            method: 'POST',
+            body: form,
+          });
+        } else if (params.imageUrl) {
+          tgRes = await fetch(`https://api.telegram.org/bot${tg.botToken}/sendPhoto`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: tg.remoteJid,
+              photo: params.imageUrl,
+              caption: tgHtml.slice(0, 1024),
+              parse_mode: 'HTML',
+            }),
+          });
+        } else {
+          tgRes = await fetch(`https://api.telegram.org/bot${tg.botToken}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: tg.remoteJid,
+              text: tgHtml,
+              parse_mode: 'HTML',
+              disable_web_page_preview: params.enableLinkPreview === false,
+            }),
+          });
+        }
+        if (tgRes.ok) {
+          sentCount += 1;
+          deliveredGroupNames.push(tg.name);
+        } else {
+          const errBody = await tgRes.text().catch(() => '');
+          lastError = errBody || `Erro Telegram HTTP ${tgRes.status}`;
+        }
+      } catch (err: any) {
+        lastError = err?.message || 'Erro ao enviar via Telegram';
+      }
+    }
+
+    if (sentCount > 0) {
+      const now = new Date();
+      const nowFormatted = now.toLocaleString('pt-BR', {
+        timeZone: 'America/Sao_Paulo',
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+      const newLog = {
+        id: `${params.logPrefix || 'sent-auto'}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        title: params.title,
+        message: params.message,
+        platform: params.platform,
+        groupsNames: deliveredGroupNames,
+        sentAt: nowFormatted,
+        sentAtIso: now.toISOString(),
+        customImageUrl: params.imageUrl,
+        affiliateUrl: params.affiliateUrl,
+        segment: targetSegment,
+      };
+      const curState = panelStore.state || {};
+      const prevLogs = Array.isArray(curState.sentLogs) ? curState.sentLogs : [];
+      panelStore.state = {
+        ...curState,
+        sentLogs: [newLog, ...prevLogs],
+        totalSentCount: (Number(curState.totalSentCount) || 0) + sentCount,
+      };
+      panelStore.hasServerState = true;
+      panelStore.version += 1;
+      panelStore.updatedAt = now.toISOString();
+      saveStoredPanelState();
+    }
+
+    return {
+      ok: sentCount > 0,
+      sentCount,
+      deliveredGroupNames,
+      error: sentCount === 0 ? lastError || 'Não foi possível entregar a mensagem.' : undefined,
+    };
+  }
+
+  async function sendAutomationGroupReply(params: {
+    accountId?: string;
+    groupJid: string;
+    text: string;
+    imageUrl?: string;
+    enableLinkPreview?: boolean;
+    includeLinkPreviewDetails?: boolean;
+    videoBuffer?: Buffer | null;
+  }): Promise<boolean> {
+    const safeId = sanitizeAccountId(String(params.accountId || 'acc-wa-1'));
+    const exact = baileysSessions.get(safeId);
+    const session =
+      exact && exact.status === 'open' && exact.sock
+        ? exact
+        : Array.from(baileysSessions.values()).find((s) => s.status === 'open' && s.sock);
+    if (!session || !session.sock || !params.groupJid) return false;
+
+    try {
+      if (params.videoBuffer && params.videoBuffer.length > 500) {
+        const sent = await session.sock.sendMessage(params.groupJid, {
+          video: params.videoBuffer,
+          mimetype: 'video/mp4',
+          caption: params.text,
+        });
+        markRecentOutgoingWaMsgId(sent?.key?.id);
+        return true;
+      }
+      if (params.imageUrl) {
+        const res = await sendBaileysOfferToJids({
+          accountId: session.accountId,
+          remoteJids: [params.groupJid],
+          message: params.text,
+          imageUrl: params.imageUrl,
+          enableLinkPreview: params.enableLinkPreview !== false,
+          includeLinkPreviewDetails: Boolean(params.includeLinkPreviewDetails),
+          allowInactiveAccount: true,
+        });
+        return res.ok;
+      }
+      const sent = await session.sock.sendMessage(params.groupJid, {
+        text: params.text,
+        linkPreview: null,
+      });
+      markRecentOutgoingWaMsgId(sent?.key?.id);
+      return true;
+    } catch (err: any) {
+      console.warn('[Grupo de Automação] Erro ao responder no grupo:', err?.message || err);
+      return false;
+    }
+  }
+
+  async function extractDirectVideoInfo(
+    rawUrl: string,
+    options?: { downloadBuffer?: boolean }
+  ): Promise<{
+    platformLabel: string;
+    title: string;
+    thumbnailUrl: string | null;
+    cleanUrl: string;
+    directMp4Url: string | null;
+    fileSizeBytes: number | null;
+    videoBuffer: Buffer | null;
+    error?: string;
+  }> {
+    const shouldDownloadBuffer = options?.downloadBuffer !== false;
+    const lower = rawUrl.toLowerCase();
+    const platformLabel =
+      lower.includes('shopee') || lower.includes('sv.shopee') || lower.includes('shp.ee')
+        ? 'Shopee Video'
+        : lower.includes('instagram')
+        ? 'Instagram Reels'
+        : lower.includes('tiktok')
+        ? 'TikTok'
+        : lower.includes('facebook') || lower.includes('fb.watch')
+        ? 'Facebook Video'
+        : lower.includes('pinterest') || lower.includes('pin.it')
+        ? 'Pinterest Video'
+        : 'Vídeo';
+
+    let finalUrl = rawUrl.trim();
+    let directMp4Url: string | null = /\.(mp4|webm|mov)(\?|$)/i.test(finalUrl) ? finalUrl : null;
+    let videoBuffer: Buffer | null = null;
+    let fileSizeBytes: number | null = null;
+    let title = '';
+    let thumbnailUrl: string | null = null;
+
+    const decodeEscapedUrl = (u: string): string =>
+      u
+        .replace(/\\u002F/gi, '/')
+        .replace(/\\u0026/gi, '&')
+        .replace(/\\\//g, '/')
+        .replace(/&amp;/g, '&')
+        .trim();
+
+    try {
+      await assertSafePublicVideoUrl(finalUrl);
+      const { response: res, finalUrl: resolvedUrl } = await fetchPublicVideoWithSafeRedirects(
+        finalUrl,
+        {
+          timeoutMs: 12_000,
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+            Accept: 'text/html,application/xhtml+xml,video/mp4,*/*;q=0.8',
+            'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+          },
+        }
+      );
+      finalUrl = resolvedUrl;
+      const contentType = String(res.headers.get('content-type') || '').toLowerCase();
+      const hdrLen = Number(res.headers.get('content-length') || 0);
+      if (hdrLen > 0) fileSizeBytes = hdrLen;
+
+      if (contentType.includes('video/')) {
+        directMp4Url = finalUrl;
+        if (shouldDownloadBuffer && (!hdrLen || hdrLen <= 16 * 1024 * 1024)) {
+          const arr = Buffer.from(await res.arrayBuffer());
+          fileSizeBytes = arr.length;
+          if (arr.length > 500 && arr.length <= 16 * 1024 * 1024) {
+            videoBuffer = arr;
+          }
+        }
+      } else {
+        const html = (await res.text()).slice(0, 450_000);
+        const ogTitle =
+          html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)?.[1] ||
+          html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i)?.[1] ||
+          html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1];
+        if (ogTitle) {
+          title = ogTitle.replace(/\s+/g, ' ').trim().slice(0, 140);
+        }
+
+        const ogImage =
+          html.match(/<meta[^>]+property=["']og:image(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i)?.[1] ||
+          html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image(?::secure_url)?["']/i)?.[1];
+        if (ogImage && /^https?:\/\//i.test(ogImage)) {
+          thumbnailUrl = decodeEscapedUrl(ogImage);
+        }
+
+        const mp4Patterns: RegExp[] = [
+          /<meta[^>]+property=["']og:video(?::secure_url)?["'][^>]+content=["'](https?:[^"']+)["']/i,
+          /<meta[^>]+content=["'](https?:[^"']+)["'][^>]+property=["']og:video(?::secure_url)?["']/i,
+          /"(?:watermark_free_url|no_watermark_url|playable_url_quality_hd|browser_native_hd_url|browser_native_sd_url|playable_url|downloadAddr|playAddr|video_url|play_url|mp4Url|contentUrl)"\s*:\s*"(https?:[^"\\]+(?:\.mp4|video)[^"]*)"/i,
+          /"V_720P"\s*:\s*\{[^}]*"url"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"/i,
+          /(https?:\/\/[^"'\\\s<>]+\.mp4(?:\?[^"'\\\s<>]*)?)/i,
+        ];
+
+        for (const rx of mp4Patterns) {
+          const m = html.match(rx)?.[1];
+          if (m) {
+            const candidate = decodeEscapedUrl(m);
+            if (/^https?:\/\//i.test(candidate)) {
+              directMp4Url = candidate;
+              break;
+            }
+          }
+        }
+      }
+    } catch (err: any) {
+      return {
+        platformLabel,
+        title,
+        thumbnailUrl,
+        cleanUrl: finalUrl.split('?')[0] || rawUrl.trim().split('?')[0],
+        directMp4Url: null,
+        fileSizeBytes: null,
+        videoBuffer: null,
+        error: err?.message || 'Não foi possível acessar o link do vídeo.',
+      };
+    }
+
+    if (directMp4Url && shouldDownloadBuffer && !videoBuffer) {
+      try {
+        const { response: vr } = await fetchPublicVideoWithSafeRedirects(directMp4Url, {
+          timeoutMs: 12_000,
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+          },
+        });
+        if (vr.ok) {
+          const contentLen = Number(vr.headers.get('content-length') || 0);
+          if (contentLen > 0) fileSizeBytes = contentLen;
+          if (!contentLen || contentLen <= 16 * 1024 * 1024) {
+            const buf = Buffer.from(await vr.arrayBuffer());
+            fileSizeBytes = buf.length;
+            if (buf.length > 1000 && buf.length <= 16 * 1024 * 1024) {
+              videoBuffer = buf;
+            }
+          }
+        }
+      } catch {
+        // Non-fatal
+      }
+    } else if (directMp4Url && !shouldDownloadBuffer && !fileSizeBytes) {
+      try {
+        const safeUrl = await assertSafePublicVideoUrl(directMp4Url);
+        const headRes = await fetch(safeUrl.toString(), {
+          method: 'HEAD',
+          redirect: 'manual',
+          signal: AbortSignal.timeout(5000),
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+          },
+        });
+        const len = Number(headRes.headers.get('content-length') || 0);
+        if (len > 0) fileSizeBytes = len;
+      } catch {
+        // Best-effort size check
+      }
+    }
+
+    return {
+      platformLabel,
+      title,
+      thumbnailUrl,
+      cleanUrl: finalUrl.split('?')[0] || rawUrl.trim().split('?')[0],
+      directMp4Url,
+      fileSizeBytes,
+      videoBuffer,
+    };
+  }
+
+  async function buildOfferPayloadFromUrl(params: {
+    url: string;
+    sourceText: string;
+    segment: string;
+    fallbackGroupImageUrl?: string | null;
+  }): Promise<{
+    ok: boolean;
+    product?: any;
+    renderedMessage?: string;
+    enableLinkPreview?: boolean;
+    includeLinkPreviewDetails?: boolean;
+    error?: string;
+  }> {
+    const st = panelStore.state || {};
+    const targetSegment = normalizeSegmentName(params.segment);
+    const integrations = st.integrations || INITIAL_INTEGRATIONS;
+    const extracted = await extractOfferFromUrl(params.url, integrations, params.sourceText);
+    if (!extracted?.title || !extracted?.affiliateUrl) {
+      return {
+        ok: false,
+        error: 'Não foi possível extrair os dados deste link. Verifique se é um link válido de produto.',
+      };
+    }
+
+    const disc = Number(extracted.discountPrice) || 0;
+    const orig = Number(extracted.originalPrice) || disc;
+    const pct = Number(extracted.discountPercent) || 0;
+    const commPct = DEFAULT_COMMISSION_BY_PLATFORM[extracted.platform] || 10;
+    const commVal = Number(((disc * commPct) / 100).toFixed(2));
+    const createdAtIso = new Date().toISOString();
+
+    let product: any = {
+      id: `prod-auto-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      title: extracted.title,
+      platform: extracted.platform,
+      category: 'Grupo de Automação',
+      originalPrice: orig,
+      discountPrice: disc,
+      discountPercent: pct,
+      commissionPercent: commPct,
+      commissionValue: commVal,
+      affiliateUrl: extracted.affiliateUrl,
+      originalUrl: extracted.originalUrl || params.url,
+      couponCode: extracted.couponCode || undefined,
+      artworkKey: guessArtworkKeyFromTitle(extracted.title),
+      customImageUrl: extracted.imageUrl || params.fallbackGroupImageUrl || undefined,
+      isFavorite: false,
+      isPrioritized: false,
+      salesRank: 1,
+      segment: targetSegment,
+      createdAt: createdAtIso,
+    };
+
+    // Apply ML coupon protection rules (4h TTL + explicit site-wide user coupons)
+    if (product.platform === 'Mercado Livre' || product.couponCode) {
+      try {
+        const segAutoCfg = resolveSegmentConfig(
+          st.autoDispatchBySegment,
+          st.autoDispatch || INITIAL_AUTO_DISPATCH,
+          targetSegment,
+          createDefaultAutoDispatchForSegment
+        );
+        const maxAgeHours =
+          typeof segAutoCfg?.mlCouponMaxAgeHours === 'number'
+            ? segAutoCfg.mlCouponMaxAgeHours
+            : DEFAULT_ML_COUPON_MAX_AGE_HOURS;
+        const segCoupons = (Array.isArray(st.coupons) ? st.coupons : []).filter((c: any) =>
+          matchesSegment(c?.segment, targetSegment)
+        );
+        const couponRes = resolveEffectiveMlCoupon({
+          product,
+          savedCoupons: segCoupons,
+          maxAgeHours,
+          now: new Date(),
+        });
+        if (couponRes.changed) {
+          product = { ...product, couponCode: couponRes.couponCode || undefined };
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    const segmentTemplates = resolveSegmentConfig(
+      st.templatesBySegment,
+      st.templates || INITIAL_TEMPLATES,
+      targetSegment,
+      createDefaultTemplatesForSegment
+    );
+    const templates =
+      Array.isArray(segmentTemplates) && segmentTemplates.length > 0
+        ? segmentTemplates
+        : INITIAL_TEMPLATES;
+    const tpl =
+      templates.find((t: any) => t.platform === product.platform) ||
+      templates[0] ||
+      INITIAL_TEMPLATES[0];
+
+    const renderedMessage = renderProductMessage(product, tpl, integrations);
+    return {
+      ok: true,
+      product,
+      renderedMessage,
+      enableLinkPreview: tpl.enableLinkPreview,
+      includeLinkPreviewDetails: Boolean(tpl.includeLinkPreviewDetails),
+    };
+  }
+
+  async function executeAutomationGroupCommand(params: {
+    rawText: string;
+    extractedUrls?: string[];
+    segment?: string;
+    replyGroupJid?: string;
+    replyAccountId?: string;
+    sendReplyToGroup?: boolean;
+    groupImageUrl?: string | null;
+  }): Promise<{
+    ok: boolean;
+    commandType: string;
+    replyText: string;
+    previewText?: string;
+    previewImageUrl?: string;
+  }> {
+    const targetSegment = normalizeSegmentName(params.segment);
+    const parsed = parseAutomationCommand(params.rawText, params.extractedUrls, new Date());
+
+    if (parsed.type === 'ignore') {
+      return { ok: true, commandType: 'ignore', replyText: '' };
+    }
+
+    const reply = async (
+      text: string,
+      opts?: {
+        imageUrl?: string;
+        enableLinkPreview?: boolean;
+        includeLinkPreviewDetails?: boolean;
+        videoBuffer?: Buffer | null;
+      }
+    ) => {
+      if (params.sendReplyToGroup && params.replyGroupJid) {
+        await sendAutomationGroupReply({
+          accountId: params.replyAccountId,
+          groupJid: params.replyGroupJid,
+          text,
+          imageUrl: opts?.imageUrl,
+          enableLinkPreview: opts?.enableLinkPreview,
+          includeLinkPreviewDetails: opts?.includeLinkPreviewDetails,
+          videoBuffer: opts?.videoBuffer,
+        });
+      }
+    };
+
+    if (parsed.type === 'invalid') {
+      const msg = `⚠️ ${parsed.error}`;
+      await reply(msg);
+      return { ok: false, commandType: 'invalid', replyText: msg };
+    }
+
+    const st = panelStore.state || {};
+
+    // 1. envio_automatico_on / envio_automatico_off
+    if (parsed.type === 'auto_dispatch_on' || parsed.type === 'auto_dispatch_off') {
+      const enabled = parsed.type === 'auto_dispatch_on';
+      const curCfg = resolveSegmentConfig(
+        st.autoDispatchBySegment,
+        st.autoDispatch || INITIAL_AUTO_DISPATCH,
+        targetSegment,
+        createDefaultAutoDispatchForSegment
+      );
+      const nextCfg = { ...curCfg, enabled };
+      const nextBySeg = {
+        ...(st.autoDispatchBySegment || {}),
+        [targetSegment]: nextCfg,
+      };
+      panelStore.state = {
+        ...st,
+        ...(matchesSegment(targetSegment, DEFAULT_SEGMENT) ? { autoDispatch: nextCfg } : {}),
+        autoDispatchBySegment: nextBySeg,
+      };
+      panelStore.hasServerState = true;
+      panelStore.version += 1;
+      panelStore.updatedAt = new Date().toISOString();
+      saveStoredPanelState();
+
+      if (enabled) {
+        const rt = getAutoDispatchSegmentRuntime(targetSegment);
+        rt.nextRunAt = Math.min(rt.nextRunAt, Date.now() + 15_000);
+      }
+
+      const msg = enabled
+        ? `✅ Envio automático ATIVADO no segmento "${targetSegment}"!`
+        : `⏸️ Envio automático PAUSADO no segmento "${targetSegment}".`;
+      await reply(msg);
+      return { ok: true, commandType: parsed.type, replyText: msg };
+    }
+
+    // 2. status
+    if (parsed.type === 'status') {
+      const curCfg = resolveSegmentConfig(
+        st.autoDispatchBySegment,
+        st.autoDispatch || INITIAL_AUTO_DISPATCH,
+        targetSegment,
+        createDefaultAutoDispatchForSegment
+      );
+      const targets = resolveActiveDispatchTargets({
+        dispatchGroups: st.dispatchGroups,
+        savedGroupPrefs: st.savedGroupPrefs,
+        targetSegment,
+      });
+      const prodsCount = (Array.isArray(st.products) ? st.products : []).filter((p: any) =>
+        matchesSegment(p?.segment, targetSegment)
+      ).length;
+      const pendingSched = (Array.isArray(st.schedules) ? st.schedules : []).filter(
+        (s: any) => s?.status === 'Pendente' && matchesSegment(s?.segment, targetSegment)
+      ).length;
+      const activeTotal = targets.waGroups.length + targets.tgGroups.length;
+      const msg = [
+        `📊 Status do Controle Remoto (${targetSegment}):`,
+        `• Envio automático: ${curCfg.enabled ? 'ATIVO ✅' : 'PAUSADO ⏸️'}`,
+        `• Grupos de envio ativos: ${activeTotal} (${targets.waGroups.length} WA / ${targets.tgGroups.length} TG)`,
+        `• Produtos na fila: ${prodsCount}`,
+        `• Agendamentos pendentes: ${pendingSched}`,
+      ].join('\n');
+      await reply(msg);
+      return { ok: true, commandType: 'status', replyText: msg };
+    }
+
+    // 3. help
+    if (parsed.type === 'help') {
+      const msg = [
+        '🤖 Comandos do Grupo de Automação:',
+        '• Cole um link direto → dispara a oferta para os grupos ativos',
+        '• preview: <link> → gera prévia com foto só aqui no grupo',
+        '• converter: <link> → devolve seu link de afiliado',
+        '• video: <link> → extrai/limpa vídeo de oferta',
+        '• salvar_prioridade: <link> → salva no topo da fila',
+        '• agendar: <link ou texto> HH:MM → agenda disparo (Horário de Brasília)',
+        '• envio: <mensagem> → envia comunicado para todos os grupos ativos',
+        '• envio_automatico_on / envio_automatico_off → liga ou pausa disparo automático',
+        '• status → resumo da fila e grupos ativos',
+      ].join('\n');
+      await reply(msg);
+      return { ok: true, commandType: 'help', replyText: msg };
+    }
+
+    // 4. converter: <url>
+    if (parsed.type === 'convert') {
+      try {
+        const integrations = st.integrations || INITIAL_INTEGRATIONS;
+        const extracted = await extractOfferFromUrl(parsed.url, integrations, parsed.sourceText);
+        if (!extracted?.affiliateUrl) {
+          const errMsg = '❌ Não foi possível converter este link. Verifique suas integrações.';
+          await reply(errMsg);
+          return { ok: false, commandType: 'convert', replyText: errMsg };
+        }
+        const now = new Date();
+        const convertedEntry = {
+          id: `conv-auto-${Date.now()}`,
+          originalUrl: extracted.originalUrl || parsed.url,
+          affiliateUrl: extracted.affiliateUrl,
+          platform: extracted.platform,
+          convertedAt: now.toLocaleString('pt-BR', {
+            timeZone: 'America/Sao_Paulo',
+            day: '2-digit',
+            month: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+          }),
+          segment: targetSegment,
+        };
+        const curState = panelStore.state || {};
+        const prevConv = Array.isArray(curState.convertedLinks) ? curState.convertedLinks : [];
+        panelStore.state = {
+          ...curState,
+          convertedLinks: [convertedEntry, ...prevConv].slice(0, 200),
+        };
+        panelStore.hasServerState = true;
+        panelStore.version += 1;
+        panelStore.updatedAt = now.toISOString();
+        saveStoredPanelState();
+
+        const msg = `🔗 Link convertido (${extracted.platform}):\n${extracted.affiliateUrl}`;
+        await reply(msg);
+        return { ok: true, commandType: 'convert', replyText: msg };
+      } catch (err: any) {
+        const errMsg = `❌ Erro ao converter link: ${err?.message || 'falha inesperada'}`;
+        await reply(errMsg);
+        return { ok: false, commandType: 'convert', replyText: errMsg };
+      }
+    }
+
+    // 5. preview: <url>
+    if (parsed.type === 'preview') {
+      const built = await buildOfferPayloadFromUrl({
+        url: parsed.url,
+        sourceText: parsed.sourceText,
+        segment: targetSegment,
+        fallbackGroupImageUrl: params.groupImageUrl,
+      });
+      if (!built.ok || !built.renderedMessage || !built.product) {
+        const errMsg = `❌ ${built.error || 'Falha ao gerar prévia da oferta.'}`;
+        await reply(errMsg);
+        return { ok: false, commandType: 'preview', replyText: errMsg };
+      }
+      await reply(built.renderedMessage, {
+        imageUrl: built.product.customImageUrl,
+        enableLinkPreview: built.enableLinkPreview,
+        includeLinkPreviewDetails: built.includeLinkPreviewDetails,
+      });
+      return {
+        ok: true,
+        commandType: 'preview',
+        replyText: `✅ Prévia gerada (${built.product.platform}): ${built.product.title}`,
+        previewText: built.renderedMessage,
+        previewImageUrl: built.product.customImageUrl,
+      };
+    }
+
+    // 6. video: <url>
+    if (parsed.type === 'video') {
+      const info = await extractDirectVideoInfo(parsed.url);
+      if (info.videoBuffer) {
+        const caption = `🎬 Vídeo processado (${info.platformLabel}) sem rastreadores.\n🔗 ${info.cleanUrl}`;
+        await reply(caption, { videoBuffer: info.videoBuffer });
+        return {
+          ok: true,
+          commandType: 'video',
+          replyText: `🎬 Vídeo extraído (${info.platformLabel}) e pronto (${Math.round(
+            info.videoBuffer.length / 1024
+          )} KB): ${info.cleanUrl}`,
+        };
+      }
+      const msg = `🎬 Vídeo (${info.platformLabel}) limpo sem rastreadores:\n${info.directMp4Url || info.cleanUrl}`;
+      await reply(msg);
+      return { ok: true, commandType: 'video', replyText: msg };
+    }
+
+    // 7. envio: <mensagem>
+    if (parsed.type === 'broadcast') {
+      const res = await dispatchMessageToSegmentActiveGroups({
+        segment: targetSegment,
+        title: 'Comunicado — Controle Remoto',
+        message: parsed.message,
+        imageUrl: params.groupImageUrl || undefined,
+        enableLinkPreview: true,
+        logPrefix: 'sent-remote',
+      });
+      const msg = res.ok
+        ? `📨 Comunicado enviado para ${res.sentCount} grupo(s): ${res.deliveredGroupNames.join(', ')}`
+        : `❌ ${res.error || 'Falha ao enviar comunicado.'}`;
+      await reply(msg);
+      return { ok: res.ok, commandType: 'broadcast', replyText: msg };
+    }
+
+    // 8. salvar_prioridade: <url>
+    if (parsed.type === 'save_priority') {
+      const built = await buildOfferPayloadFromUrl({
+        url: parsed.url,
+        sourceText: parsed.sourceText,
+        segment: targetSegment,
+        fallbackGroupImageUrl: params.groupImageUrl,
+      });
+      if (!built.ok || !built.product) {
+        const errMsg = `❌ ${built.error || 'Falha ao salvar produto prioritário.'}`;
+        await reply(errMsg);
+        return { ok: false, commandType: 'save_priority', replyText: errMsg };
+      }
+      const priorityProd = {
+        ...built.product,
+        isPrioritized: true,
+        category: 'Prioridade (Automação)',
+      };
+      const curState = panelStore.state || {};
+      const curProducts = Array.isArray(curState.products) ? curState.products : [];
+      panelStore.state = {
+        ...curState,
+        products: [priorityProd, ...curProducts],
+      };
+      panelStore.hasServerState = true;
+      panelStore.version += 1;
+      panelStore.updatedAt = new Date().toISOString();
+      saveStoredPanelState();
+
+      const priceStr =
+        priorityProd.discountPrice > 0
+          ? `R$ ${Number(priorityProd.discountPrice).toFixed(2).replace('.', ',')}`
+          : 'preço a conferir';
+      const msg = `⭐ Produto salvo com PRIORIDADE no topo da fila (${targetSegment})!\n📦 ${priorityProd.title}\n💰 ${priceStr}`;
+      await reply(msg);
+      return { ok: true, commandType: 'save_priority', replyText: msg };
+    }
+
+    // 9. agendar: <link ou texto> <HH:MM>
+    if (parsed.type === 'schedule') {
+      let schedTitle = 'Agendamento Remoto';
+      let schedMessage = parsed.messageText;
+      let schedPlatform: string | undefined;
+      let schedImageUrl: string | undefined = params.groupImageUrl || undefined;
+
+      if (parsed.url) {
+        const built = await buildOfferPayloadFromUrl({
+          url: parsed.url,
+          sourceText: parsed.sourceText,
+          segment: targetSegment,
+          fallbackGroupImageUrl: params.groupImageUrl,
+        });
+        if (!built.ok || !built.product || !built.renderedMessage) {
+          const errMsg = `❌ ${built.error || 'Não foi possível preparar a oferta para agendamento.'}`;
+          await reply(errMsg);
+          return { ok: false, commandType: 'schedule', replyText: errMsg };
+        }
+        schedTitle = built.product.title;
+        schedMessage = built.renderedMessage;
+        schedPlatform = built.product.platform;
+        schedImageUrl = built.product.customImageUrl || schedImageUrl;
+      }
+
+      const targets = resolveActiveDispatchTargets({
+        dispatchGroups: st.dispatchGroups,
+        savedGroupPrefs: st.savedGroupPrefs,
+        targetSegment,
+      });
+      const allDispatch: any[] = Array.isArray(st.dispatchGroups) ? st.dispatchGroups : [];
+      const activeIds = allDispatch
+        .filter((g) => {
+          const norm = normalizeServerGroupJid(g?.remoteJid);
+          return (
+            targets.waGroups.some((w) => normalizeServerGroupJid(w.remoteJid) === norm) ||
+            targets.tgGroups.some((t) => normalizeServerGroupJid(t.remoteJid) === norm)
+          );
+        })
+        .map((g) => String(g.id));
+
+      const newSchedule = {
+        id: `sch-auto-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        title: schedTitle,
+        message: schedMessage,
+        groupIds: activeIds,
+        scheduledAt: parsed.scheduledAtIso,
+        recurrence: 'Único' as const,
+        status: 'Pendente' as const,
+        ...(schedPlatform ? { platform: schedPlatform } : {}),
+        ...(schedImageUrl ? { imageUrl: schedImageUrl } : {}),
+        segment: targetSegment,
+      };
+
+      const curState = panelStore.state || {};
+      const curSchedules = Array.isArray(curState.schedules) ? curState.schedules : [];
+      panelStore.state = {
+        ...curState,
+        schedules: [newSchedule, ...curSchedules],
+      };
+      panelStore.hasServerState = true;
+      panelStore.version += 1;
+      panelStore.updatedAt = new Date().toISOString();
+      saveStoredPanelState();
+
+      const msg = `📅 Agendado para ${parsed.formattedBr} (Horário de Brasília) no segmento "${targetSegment}"!\n📌 ${schedTitle}`;
+      await reply(msg);
+      return {
+        ok: true,
+        commandType: 'schedule',
+        replyText: msg,
+        previewText: schedMessage,
+        previewImageUrl: schedImageUrl,
+      };
+    }
+
+    // 10. Direct product link / promo post -> extract + dispatch immediately
+    if (parsed.type === 'dispatch_product') {
+      const built = await buildOfferPayloadFromUrl({
+        url: parsed.url,
+        sourceText: parsed.sourceText,
+        segment: targetSegment,
+        fallbackGroupImageUrl: params.groupImageUrl,
+      });
+      if (!built.ok || !built.product || !built.renderedMessage) {
+        const errMsg = `❌ ${built.error || 'Link não reconhecido como produto válido.'}`;
+        await reply(errMsg);
+        return { ok: false, commandType: 'dispatch_product', replyText: errMsg };
+      }
+
+      const res = await dispatchMessageToSegmentActiveGroups({
+        segment: targetSegment,
+        title: built.product.title,
+        message: built.renderedMessage,
+        imageUrl: built.product.customImageUrl,
+        enableLinkPreview: built.enableLinkPreview,
+        includeLinkPreviewDetails: built.includeLinkPreviewDetails,
+        platform: built.product.platform,
+        affiliateUrl: built.product.affiliateUrl,
+        logPrefix: 'sent-remote',
+      });
+
+      const priceStr =
+        built.product.discountPrice > 0
+          ? `R$ ${Number(built.product.discountPrice).toFixed(2).replace('.', ',')}`
+          : '';
+      const msg = res.ok
+        ? `✅ Oferta disparada para ${res.sentCount} grupo(s) ativo(s)!\n📦 ${built.product.title}${
+            priceStr ? `\n💰 ${priceStr}` : ''
+          }`
+        : `❌ ${res.error || 'Falha ao disparar a oferta.'}`;
+      await reply(msg);
+      return {
+        ok: res.ok,
+        commandType: 'dispatch_product',
+        replyText: msg,
+        previewText: built.renderedMessage,
+        previewImageUrl: built.product.customImageUrl,
+      };
+    }
+
+    return { ok: false, commandType: 'unknown', replyText: '❌ Comando não reconhecido.' };
+  }
+
+  handleIncomingAutomationGroupMessage = async ({
+    groupJid,
+    accountId,
+    text,
+    extractedUrls,
+    groupImageUrl,
+  }) => {
+    const segments = resolveAutomationSegmentsForGroupJid(
+      groupJid,
+      panelStore.state,
+      INITIAL_MONITORING_RULES
+    );
+    if (segments.length === 0) return;
+
+    for (const seg of segments) {
+      try {
+        console.log(
+          `[Grupo de Automação][${seg}] Executando comando recebido de ${groupJid}: "${text.slice(0, 80)}"`
+        );
+        await executeAutomationGroupCommand({
+          rawText: text,
+          extractedUrls,
+          segment: seg,
+          replyGroupJid: groupJid,
+          replyAccountId: accountId,
+          sendReplyToGroup: true,
+          groupImageUrl,
+        });
+      } catch (err: any) {
+        console.warn(`[Grupo de Automação][${seg}] Erro ao executar comando:`, err?.message || err);
+      }
+    }
+  };
+
+  const sendAutomationGroupWelcome = async (
+    session: BaileysSessionEntry,
+    groupJid: string,
+    targetSegment: string,
+    options?: {
+      groupDescription?: string;
+      initialDelayMs?: number;
+      updateDescription?: boolean;
+    }
+  ): Promise<{ welcomeSent: boolean; descriptionApplied: boolean; error?: string }> => {
+    const sock = session.sock;
+    if (!sock) {
+      return { welcomeSent: false, descriptionApplied: false, error: 'Sessão WhatsApp sem socket ativo.' };
+    }
+    const groupDescription =
+      options?.groupDescription || buildAutomationGroupDescription(targetSegment);
+    let descriptionApplied = false;
+
+    if (options?.updateDescription) {
+      const descDelays = [options.initialDelayMs ?? 800, 1500];
+      for (let i = 0; i < descDelays.length; i += 1) {
+        try {
+          if (descDelays[i] > 0) {
+            await new Promise((resolve) => setTimeout(resolve, descDelays[i]));
+          }
+          await sock.groupUpdateDescription(groupJid, groupDescription);
+          descriptionApplied = true;
+          break;
+        } catch (descErr: any) {
+          console.warn(
+            `[Grupo de Automação][${targetSegment}] Tentativa ${i + 1} de aplicar descrição falhou:`,
+            descErr?.message || descErr
+          );
+        }
+      }
+    }
+
+    const welcome = [
+      `🤖 Grupo de Automação do segmento "${targetSegment}" criado e ativado!`,
+      '',
+      groupDescription,
+    ].join('\n');
+
+    // Warm up Baileys group metadata & SenderKey propagation before sending to a brand-new group
+    const retryDelays = options?.updateDescription ? [1200, 2200, 3500] : [250, 1500, 2500];
+    let lastError = '';
+    for (let attempt = 0; attempt < retryDelays.length; attempt += 1) {
+      try {
+        if (retryDelays[attempt] > 0) {
+          await new Promise((resolve) => setTimeout(resolve, retryDelays[attempt]));
+        }
+        try {
+          await sock.groupMetadata(groupJid);
+        } catch {
+          // Best-effort metadata warm-up
+        }
+        const sent = await sock.sendMessage(groupJid, {
+          text: welcome,
+          linkPreview: null,
+        });
+        markRecentOutgoingWaMsgId(sent?.key?.id);
+        console.log(
+          `[Grupo de Automação][${targetSegment}] Mensagem de boas-vindas enviada para ${groupJid} (tentativa ${attempt + 1})`
+        );
+        return { welcomeSent: true, descriptionApplied };
+      } catch (sendErr: any) {
+        lastError = sendErr?.message || String(sendErr || 'erro desconhecido');
+        console.warn(
+          `[Grupo de Automação][${targetSegment}] Tentativa ${attempt + 1}/${retryDelays.length} de enviar boas-vindas falhou:`,
+          lastError
+        );
+      }
+    }
+
+    return { welcomeSent: false, descriptionApplied, error: lastError };
+  };
+
+  app.post('/api/automation-group/create', async (req, res) => {
+    try {
+      const targetSegment = normalizeSegmentName(req.body?.segment);
+      const requestedAccId =
+        typeof req.body?.accountId === 'string' && req.body.accountId.trim()
+          ? sanitizeAccountId(req.body.accountId.trim())
+          : '';
+
+      const exact = requestedAccId ? baileysSessions.get(requestedAccId) : undefined;
+      const session =
+        exact && exact.status === 'open' && exact.sock
+          ? exact
+          : Array.from(baileysSessions.values()).find((s) => s.status === 'open' && s.sock);
+
+      if (!session || session.status !== 'open' || !session.sock) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            'WhatsApp desconectado. Conecte sua conta em Canais → WhatsApp antes de criar o grupo.',
+        });
+      }
+
+      const groupName = buildAutomationGroupName(targetSegment);
+      const groupDescription = buildAutomationGroupDescription(targetSegment);
+
+      const created = await session.sock.groupCreate(groupName, []);
+      const rawCreatedJid = String(created?.id || '').trim();
+      const createdJid = normalizeServerGroupJid(rawCreatedJid);
+      if (!createdJid || !createdJid.endsWith('@g.us')) {
+        return res.status(500).json({
+          ok: false,
+          error: 'O WhatsApp não retornou o ID do grupo criado. Tente novamente.',
+        });
+      }
+
+      const { welcomeSent, descriptionApplied } = await sendAutomationGroupWelcome(
+        session,
+        createdJid,
+        targetSegment,
+        {
+          groupDescription,
+          initialDelayMs: 800,
+          updateDescription: true,
+        }
+      );
+
+      const st = panelStore.state || {};
+      const accounts: any[] = Array.isArray(st.accounts) ? st.accounts : [];
+      const matchedAcc = accounts.find(
+        (a) =>
+          a?.channel === 'WhatsApp' &&
+          sanitizeAccountId(String(a.id || '')) === session.accountId
+      );
+      const accountId = String(matchedAcc?.id || session.accountId);
+      const accountName = String(
+        matchedAcc?.name || session.connectedName || 'WhatsApp'
+      );
+
+      // Update live group cache immediately
+      const existingCache = liveWaStats.cachedGroupsByAccount[session.accountId]?.groups || [];
+      const nextCachedGroups = [
+        ...existingCache.filter((g) => normalizeServerGroupJid(g.remoteJid) !== createdJid),
+        {
+          remoteJid: createdJid,
+          name: groupName,
+          membersCount: Math.max(1, Number(created?.participants?.length || 1)),
+          isOwner: true,
+          isAdmin: true,
+          isOwnerOrAdmin: true,
+        },
+      ].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+      cacheBaileysGroupsForAccount(
+        session.accountId,
+        session.connectedPhone,
+        accountName,
+        nextCachedGroups
+      );
+
+      const cleanIdSuffix = createdJid.replace(/[^a-zA-Z0-9]/g, '');
+      const monGroupId = `mon-wa-${cleanIdSuffix}`;
+      const dispGroupId = `grp-wa-${cleanIdSuffix}`;
+
+      const prevMonitoring: any[] = Array.isArray(st.monitoringGroups) ? st.monitoringGroups : [];
+      const nextMonitoring = [
+        ...prevMonitoring.filter(
+          (m) => normalizeServerGroupJid(m?.remoteJid) !== createdJid && m?.id !== monGroupId
+        ),
+        {
+          id: monGroupId,
+          name: groupName,
+          channel: 'WhatsApp',
+          accountId,
+          accountName,
+          remoteJid: createdJid,
+          monitored: false,
+          monitoredSegments: [],
+          useGroupImage: false,
+          capturedToday: 0,
+        },
+      ];
+
+      const prevDispatch: any[] = Array.isArray(st.dispatchGroups) ? st.dispatchGroups : [];
+      const nextDispatch = [
+        ...prevDispatch.filter(
+          (g) => normalizeServerGroupJid(g?.remoteJid) !== createdJid && g?.id !== dispGroupId
+        ),
+        {
+          id: dispGroupId,
+          name: groupName,
+          channel: 'WhatsApp',
+          accountId,
+          accountName,
+          remoteJid: createdJid,
+          activeForOffers: false,
+          activeSegments: [],
+          isPriorityCapture: false,
+          isChannel: false,
+          membersCount: Math.max(1, Number(created?.participants?.length || 1)),
+          maxCapacity: 1024,
+          inviteUrl: 'https://chat.whatsapp.com/',
+          segment: targetSegment,
+          isOwner: true,
+          isAdmin: true,
+          isOwnerOrAdmin: true,
+        },
+      ];
+
+      const curSegRules = resolveSegmentConfig(
+        st.monitoringRulesBySegment,
+        st.monitoringRules || INITIAL_MONITORING_RULES,
+        targetSegment,
+        createDefaultMonitoringRulesForSegment
+      );
+      const nextSegRules = {
+        ...curSegRules,
+        automationGroupId: monGroupId,
+      };
+      const nextRulesBySeg = {
+        ...(st.monitoringRulesBySegment || {}),
+        [targetSegment]: nextSegRules,
+      };
+
+      const nextSavedPrefs = {
+        ...(st.savedGroupPrefs || {}),
+        [`wa:${createdJid}`]: {
+          ...(st.savedGroupPrefs?.[`wa:${createdJid}`] || {}),
+          activeForOffers: false,
+          activeSegments: [],
+          monitored: false,
+          monitoredSegments: [],
+          segment: targetSegment,
+          isOwner: true,
+          isAdmin: true,
+          isOwnerOrAdmin: true,
+        },
+      };
+
+      panelStore.state = {
+        ...st,
+        monitoringGroups: nextMonitoring,
+        dispatchGroups: nextDispatch,
+        savedGroupPrefs: nextSavedPrefs,
+        ...(matchesSegment(targetSegment, DEFAULT_SEGMENT)
+          ? { monitoringRules: nextSegRules }
+          : {}),
+        monitoringRulesBySegment: nextRulesBySeg,
+      };
+      panelStore.hasServerState = true;
+      panelStore.version += 1;
+      panelStore.updatedAt = new Date().toISOString();
+      saveStoredPanelState();
+
+      console.log(
+        `[Grupo de Automação][${targetSegment}] Grupo criado no WhatsApp: "${groupName}" (${createdJid}) | welcomeSent=${welcomeSent}`
+      );
+
+      res.json({
+        ok: true,
+        group: {
+          id: monGroupId,
+          name: groupName,
+          remoteJid: createdJid,
+          accountId,
+          accountName,
+          description: groupDescription,
+          descriptionApplied,
+          welcomeSent,
+        },
+        version: panelStore.version,
+        state: panelStore.state,
+      });
+    } catch (err: any) {
+      console.warn('[Grupo de Automação] Erro ao criar grupo no WhatsApp:', err?.message || err);
+      res.status(500).json({
+        ok: false,
+        error: err?.message || 'Não foi possível criar o grupo no WhatsApp.',
+      });
+    }
+  });
+
+  app.post('/api/automation-group/welcome', async (req, res) => {
+    try {
+      const targetSegment = normalizeSegmentName(req.body?.segment);
+      const explicitJid = normalizeServerGroupJid(String(req.body?.groupJid || ''));
+      const updateDescription = Boolean(req.body?.updateDescription);
+
+      const st = panelStore.state || {};
+      const segRules = resolveSegmentConfig(
+        st.monitoringRulesBySegment,
+        st.monitoringRules || INITIAL_MONITORING_RULES,
+        targetSegment,
+        createDefaultMonitoringRulesForSegment
+      );
+      const linkedId = String(segRules?.automationGroupId || '').trim();
+      const allWaGroups = [
+        ...(Array.isArray(st.monitoringGroups) ? st.monitoringGroups : []),
+        ...(Array.isArray(st.dispatchGroups) ? st.dispatchGroups : []),
+      ];
+      const matchedGroup = explicitJid
+        ? allWaGroups.find((g) => normalizeServerGroupJid(g?.remoteJid) === explicitJid)
+        : allWaGroups.find(
+            (g) =>
+              g?.channel === 'WhatsApp' &&
+              (g.id === linkedId || normalizeServerGroupJid(g?.remoteJid) === normalizeServerGroupJid(linkedId))
+          );
+
+      const targetJid = explicitJid || normalizeServerGroupJid(matchedGroup?.remoteJid || linkedId);
+      if (!targetJid || !targetJid.endsWith('@g.us')) {
+        return res.status(400).json({
+          ok: false,
+          error: `Nenhum grupo de automação válido vinculado ao segmento "${targetSegment}".`,
+        });
+      }
+
+      const preferredAccId = matchedGroup?.accountId
+        ? sanitizeAccountId(String(matchedGroup.accountId))
+        : '';
+      const exact = preferredAccId ? baileysSessions.get(preferredAccId) : undefined;
+      const session =
+        exact && exact.status === 'open' && exact.sock
+          ? exact
+          : Array.from(baileysSessions.values()).find((s) => s.status === 'open' && s.sock);
+
+      if (!session || session.status !== 'open' || !session.sock) {
+        return res.status(400).json({
+          ok: false,
+          error: 'WhatsApp desconectado. Conecte sua conta antes de enviar a mensagem.',
+        });
+      }
+
+      const result = await sendAutomationGroupWelcome(session, targetJid, targetSegment, {
+        updateDescription,
+        initialDelayMs: 200,
+      });
+
+      if (!result.welcomeSent) {
+        return res.status(502).json({
+          ok: false,
+          error: result.error || 'O WhatsApp não confirmou o envio da mensagem de boas-vindas.',
+          ...result,
+        });
+      }
+
+      res.json({
+        ok: true,
+        segment: targetSegment,
+        remoteJid: targetJid,
+        ...result,
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        ok: false,
+        error: err?.message || 'Erro ao enviar mensagem de boas-vindas.',
+      });
+    }
+  });
+
+  app.post('/api/automation-group/execute', async (req, res) => {
+    try {
+      const command = String(req.body?.command || '').trim();
+      const segment = normalizeSegmentName(req.body?.segment);
+      const sendToGroup = req.body?.sendToGroup === true;
+
+      if (!command) {
+        return res.status(400).json({ ok: false, error: 'Digite um comando para executar.' });
+      }
+
+      const st = panelStore.state || {};
+      const segRules = resolveSegmentConfig(
+        st.monitoringRulesBySegment,
+        st.monitoringRules || INITIAL_MONITORING_RULES,
+        segment,
+        createDefaultMonitoringRulesForSegment
+      );
+      const configuredJid = resolveAutomationGroupJidFromId(segRules?.automationGroupId, st);
+
+      const result = await executeAutomationGroupCommand({
+        rawText: command,
+        segment,
+        replyGroupJid: configuredJid || undefined,
+        sendReplyToGroup: Boolean(sendToGroup && configuredJid),
+      });
+
+      res.json({
+        ...result,
+        version: panelStore.version,
+        state: panelStore.state,
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        ok: false,
+        commandType: 'error',
+        replyText: `❌ Erro ao executar comando: ${err?.message || 'falha interna'}`,
+      });
+    }
+  });
+
+  // 24/7 Server-side Due Scheduled Items Runner (fires even when browser tab is closed)
+  const runningScheduleIds = new Set<string>();
+  async function runDueScheduledItemsOnServer(): Promise<void> {
+    const st = panelStore.state;
+    if (!st || !Array.isArray(st.schedules) || st.schedules.length === 0) return;
+    const now = Date.now();
+    const dueItems = st.schedules.filter((item: any) => {
+      if (!item || item.status !== 'Pendente' || runningScheduleIds.has(item.id)) return false;
+      const ts = Date.parse(String(item.scheduledAt || ''));
+      return Number.isFinite(ts) && ts <= now;
+    });
+    if (dueItems.length === 0) return;
+
+    for (const item of dueItems) {
+      runningScheduleIds.add(item.id);
+      try {
+        // Mark as sent/advanced BEFORE network dispatch so no duplicate tick or browser tab double-sends
+        const curState = panelStore.state || {};
+        const curSchedules: any[] = Array.isArray(curState.schedules) ? curState.schedules : [];
+        const updatedSchedules = curSchedules.map((s: any) => {
+          if (s?.id !== item.id) return s;
+          if (s.recurrence === 'Recorrente') {
+            const nextDue = new Date(Date.parse(String(s.scheduledAt)) + 86_400_000);
+            return { ...s, scheduledAt: nextDue.toISOString() };
+          }
+          return { ...s, status: 'Enviado' };
+        });
+        panelStore.state = { ...curState, schedules: updatedSchedules };
+        panelStore.version += 1;
+        panelStore.updatedAt = new Date().toISOString();
+        saveStoredPanelState();
+
+        const schedSegment = normalizeSegmentName(item.segment);
+        const schedSegmentTemplates = resolveSegmentConfig(
+          curState?.templatesBySegment,
+          curState?.templates || INITIAL_TEMPLATES,
+          schedSegment,
+          createDefaultTemplatesForSegment
+        );
+        const schedTpl = item.platform
+          ? (Array.isArray(schedSegmentTemplates) ? schedSegmentTemplates : INITIAL_TEMPLATES).find(
+              (t: any) => t.platform === item.platform
+            )
+          : undefined;
+        const res = await dispatchMessageToSegmentActiveGroups({
+          segment: schedSegment,
+          title: String(item.title || 'Agendamento'),
+          message: String(item.message || ''),
+          imageUrl: item.imageUrl || undefined,
+          enableLinkPreview: schedTpl ? schedTpl.enableLinkPreview : true,
+          includeLinkPreviewDetails: Boolean(schedTpl?.includeLinkPreviewDetails),
+          platform: item.platform,
+          targetGroupIds: Array.isArray(item.groupIds) ? item.groupIds : undefined,
+          logPrefix: 'sent-sched',
+        });
+        console.log(
+          `[Agendamento][${normalizeSegmentName(item.segment)}] "${String(
+            item.title || ''
+          ).slice(0, 45)}" -> ${res.ok ? `enviado para ${res.sentCount} grupo(s)` : res.error}`
+        );
+      } catch (err: any) {
+        console.warn('[Agendamento] Erro ao disparar item agendado:', err?.message || err);
+      } finally {
+        runningScheduleIds.delete(item.id);
+      }
+    }
+  }
+
+  const runningQueueIds = new Set<string>();
+  async function runSingleDispatchQueueStep(queueId: string): Promise<{
+    ok: boolean;
+    sentCount: number;
+    productTitle?: string;
+    completed?: boolean;
+    nextRunAt?: string;
+    error?: string;
+  }> {
+    if (runningQueueIds.has(queueId)) {
+      return { ok: false, sentCount: 0, error: 'Esta fila já está disparando um item agora.' };
+    }
+    const st = panelStore.state;
+    const allQueues: any[] = Array.isArray(st?.queues) ? st.queues : [];
+    const queue = allQueues.find((q) => q?.id === queueId);
+    if (!queue) {
+      return { ok: false, sentCount: 0, error: 'Fila de disparo não encontrada.' };
+    }
+
+    const allProducts: any[] = Array.isArray(st?.products) ? st.products : [];
+    const resolved = resolveNextQueueProduct(queue, allProducts);
+    if (!resolved) {
+      // Queue finished (all items sent or products deleted) -> pause cleanly
+      const updatedQueues = allQueues.map((q) =>
+        q?.id === queueId
+          ? {
+              ...q,
+              active: false,
+              sentCount: Array.isArray(q.productIds) ? q.productIds.length : q.sentCount,
+              totalCount: Array.isArray(q.productIds) ? q.productIds.length : q.totalCount,
+              nextRunAt: undefined,
+            }
+          : q
+      );
+      panelStore.state = { ...st, queues: updatedQueues };
+      panelStore.version += 1;
+      panelStore.updatedAt = new Date().toISOString();
+      saveStoredPanelState();
+      return {
+        ok: false,
+        sentCount: 0,
+        completed: true,
+        error: 'Todos os produtos desta fila já foram enviados.',
+      };
+    }
+
+    runningQueueIds.add(queueId);
+    try {
+      const targetSegment = normalizeSegmentName(queue.segment || resolved.product.segment);
+      const integrations = st?.integrations || INITIAL_INTEGRATIONS;
+      const segmentTemplates = resolveSegmentConfig(
+        st?.templatesBySegment,
+        st?.templates || INITIAL_TEMPLATES,
+        targetSegment,
+        createDefaultTemplatesForSegment
+      );
+      const templates: any[] =
+        Array.isArray(segmentTemplates) && segmentTemplates.length > 0
+          ? segmentTemplates
+          : INITIAL_TEMPLATES;
+      const prod = resolved.product;
+      const tpl =
+        templates.find((t: any) => t.platform === prod.platform) ||
+        templates[0] ||
+        INITIAL_TEMPLATES[0];
+
+      const message = renderProductMessage(prod, tpl, integrations);
+      const res = await dispatchMessageToSegmentActiveGroups({
+        segment: targetSegment,
+        title: String(prod.title || queue.name),
+        message,
+        imageUrl: prod.customImageUrl?.trim() || undefined,
+        platform: prod.platform,
+        affiliateUrl: prod.affiliateUrl,
+        enableLinkPreview: tpl.enableLinkPreview,
+        includeLinkPreviewDetails: Boolean(tpl.includeLinkPreviewDetails),
+        logPrefix: 'sent-queue',
+      });
+
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+      const totalIds = Array.isArray(queue.productIds) ? queue.productIds.length : 0;
+
+      if (!res.ok) {
+        // Back off next attempt by 2 minutes so server doesn't hammer while disconnected/paused
+        const retryIso = new Date(nowMs + 120_000).toISOString();
+        const curState = panelStore.state || {};
+        const curQueues: any[] = Array.isArray(curState.queues) ? curState.queues : [];
+        panelStore.state = {
+          ...curState,
+          queues: curQueues.map((q) => (q?.id === queueId ? { ...q, nextRunAt: retryIso } : q)),
+        };
+        panelStore.version += 1;
+        panelStore.updatedAt = nowIso;
+        saveStoredPanelState();
+        return { ok: false, sentCount: 0, error: res.error || 'Falha ao enviar item da fila.' };
+      }
+
+      const completed = resolved.nextIndex >= totalIds;
+      const nextRunAt = completed
+        ? undefined
+        : computeQueueNextRunIso(queue.intervalMinutes, nowMs);
+
+      const curState = panelStore.state || {};
+      const curQueues: any[] = Array.isArray(curState.queues) ? curState.queues : [];
+      panelStore.state = {
+        ...curState,
+        queues: curQueues.map((q) =>
+          q?.id === queueId
+            ? {
+                ...q,
+                sentCount: resolved.nextIndex,
+                totalCount: totalIds,
+                active: completed ? false : q.active,
+                lastRunAt: nowIso,
+                nextRunAt,
+              }
+            : q
+        ),
+      };
+      panelStore.version += 1;
+      panelStore.updatedAt = nowIso;
+      saveStoredPanelState();
+
+      console.log(
+        `[Fila de Disparo][${targetSegment}] "${queue.name}" enviou (${resolved.nextIndex}/${totalIds}): "${String(
+          prod.title || ''
+        ).slice(0, 50)}" para ${res.sentCount} grupo(s).`
+      );
+
+      return {
+        ok: true,
+        sentCount: res.sentCount,
+        productTitle: prod.title,
+        completed,
+        nextRunAt,
+      };
+    } finally {
+      runningQueueIds.delete(queueId);
+    }
+  }
+
+  async function runDueDispatchQueuesOnServer(): Promise<void> {
+    const st = panelStore.state;
+    if (!st || !Array.isArray(st.queues) || st.queues.length === 0) return;
+    const nowMs = Date.now();
+    const dueQueues = st.queues.filter(
+      (q: any) => q && !runningQueueIds.has(q.id) && isDispatchQueueDue(q, nowMs)
+    );
+    for (const q of dueQueues) {
+      await runSingleDispatchQueueStep(q.id).catch((err: any) => {
+        console.warn(`[Fila de Disparo] Erro na fila "${q?.name}":`, err?.message || err);
+      });
+    }
+  }
+
+  app.post('/api/queues/run-next', async (req, res) => {
+    try {
+      const queueId = String(req.body?.queueId || '').trim();
+      if (!queueId) {
+        return res.status(400).json({ ok: false, error: 'Informe o ID da fila.' });
+      }
+      const result = await runSingleDispatchQueueStep(queueId);
+      res.status(result.ok ? 200 : 400).json({
+        ...result,
+        version: panelStore.version,
+        state: panelStore.state,
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Erro ao executar fila.' });
+    }
+  });
+
+  app.post('/api/videos/extract', async (req, res) => {
+    try {
+      const rawUrl = String(req.body?.url || '').trim();
+      if (!rawUrl) {
+        return res.status(400).json({ ok: false, error: 'Cole o link do vídeo para analisar.' });
+      }
+      try {
+        await assertSafePublicVideoUrl(rawUrl);
+      } catch (safeErr: any) {
+        return res.status(400).json({ ok: false, error: safeErr?.message || 'URL não permitida.' });
+      }
+
+      const info = await extractDirectVideoInfo(rawUrl, { downloadBuffer: false });
+      if (info.error && !info.directMp4Url) {
+        return res.status(422).json({
+          ok: false,
+          platformLabel: info.platformLabel,
+          cleanUrl: info.cleanUrl,
+          error: info.error,
+        });
+      }
+
+      res.json({
+        ok: true,
+        platformLabel: info.platformLabel,
+        title: info.title || `${info.platformLabel} · Vídeo`,
+        thumbnailUrl: info.thumbnailUrl,
+        cleanUrl: info.cleanUrl,
+        directMp4Url: info.directMp4Url,
+        canDirectDownload: Boolean(info.directMp4Url),
+        fileSizeBytes: info.fileSizeBytes,
+        note: info.directMp4Url
+          ? 'Arquivo de vídeo localizado e pronto para baixar em MP4.'
+          : `${info.platformLabel} exige login no app ou bloqueia extração direta sem sessão. Use o link limpo abaixo para abrir o vídeo original.`,
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Erro ao analisar vídeo.' });
+    }
+  });
+
+  app.get('/api/videos/download', async (req, res) => {
+    try {
+      const rawUrl = String(req.query?.url || '').trim();
+      const inline = req.query?.inline === '1';
+      const filename = sanitizeDownloadFilename(
+        typeof req.query?.filename === 'string' ? req.query.filename : undefined
+      );
+      if (!rawUrl) {
+        return res.status(400).json({ ok: false, error: 'Parâmetro url ausente.' });
+      }
+
+      try {
+        await assertSafePublicVideoUrl(rawUrl);
+      } catch (safeErr: any) {
+        return res.status(400).json({ ok: false, error: safeErr?.message || 'URL bloqueada.' });
+      }
+
+      const { response: upstream } = await fetchPublicVideoWithSafeRedirects(rawUrl, {
+        timeoutMs: 20_000,
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+          Accept: 'video/mp4,video/*,*/*;q=0.8',
+        },
+      });
+
+      if (!upstream.ok) {
+        return res.status(502).json({
+          ok: false,
+          error: `A origem recusou o download do vídeo (HTTP ${upstream.status}).`,
+        });
+      }
+
+      const maxBytes = 35 * 1024 * 1024;
+      const contentLength = Number(upstream.headers.get('content-length') || 0);
+      if (contentLength > maxBytes) {
+        return res.status(413).json({
+          ok: false,
+          error: 'Vídeo acima do limite de 35 MB suportado para download direto.',
+        });
+      }
+
+      const contentType = String(upstream.headers.get('content-type') || 'video/mp4');
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      if (buf.length === 0 || buf.length > maxBytes) {
+        return res.status(413).json({
+          ok: false,
+          error: 'Arquivo de vídeo vazio ou acima do limite de 35 MB.',
+        });
+      }
+
+      res.setHeader('Content-Type', contentType.includes('video/') ? contentType : 'video/mp4');
+      res.setHeader('Content-Length', String(buf.length));
+      res.setHeader(
+        'Content-Disposition',
+        `${inline ? 'inline' : 'attachment'}; filename="${filename}"`
+      );
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.send(buf);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Falha ao baixar vídeo.' });
+    }
+  });
+
   app.post('/api/whatsapp/send', async (req, res) => {
     try {
       const {
@@ -6356,7 +8778,9 @@ async function startServer() {
         message = '',
         imageUrl = '',
         enableLinkPreview = true,
+        includeLinkPreviewDetails = false,
         mentionAll = false,
+        allowInactiveAccount = false,
       } = req.body || {};
 
       if (!Array.isArray(remoteJids) || remoteJids.length === 0) {
@@ -6373,7 +8797,9 @@ async function startServer() {
           message: String(message),
           imageUrl: imageUrl ? String(imageUrl) : '',
           enableLinkPreview: Boolean(enableLinkPreview),
+          includeLinkPreviewDetails: Boolean(includeLinkPreviewDetails),
           mentionAll: Boolean(mentionAll),
+          allowInactiveAccount: Boolean(allowInactiveAccount),
         });
         if (!result.ok && result.results.length === 0) {
           return res.status(400).json({ ok: false, error: result.error });
@@ -6419,6 +8845,8 @@ async function startServer() {
             continue;
           }
 
+          const shieldedWaMessage = shieldWhatsAppCurrencyNumbers(String(message));
+
           if (provider === 'zapi') {
             const endpoint = imageUrl ? 'send-image' : 'send-text';
             const zUrl = `https://api.z-api.io/instances/${encodeURIComponent(
@@ -6431,9 +8859,9 @@ async function startServer() {
                     image: standardizedBase64
                       ? `data:image/jpeg;base64,${standardizedBase64}`
                       : imageUrl,
-                    caption: message,
+                    caption: shieldedWaMessage,
                   }
-                : { phone: jid, message };
+                : { phone: jid, message: shieldedWaMessage };
             const r = await fetch(zUrl, {
               method: 'POST',
               headers: {
@@ -6465,7 +8893,7 @@ async function startServer() {
                   number: jid,
                   mediatype: 'image',
                   mimetype: 'image/jpeg',
-                  caption: message,
+                  caption: shieldedWaMessage,
                   media: mediaValue,
                   mentionsEveryOne: mentionAll,
                 }),
@@ -6484,7 +8912,7 @@ async function startServer() {
                 },
                 body: JSON.stringify({
                   number: jid,
-                  text: message,
+                  text: shieldedWaMessage,
                   linkPreview: enableLinkPreview,
                   mentionsEveryOne: mentionAll,
                 }),
@@ -6533,10 +8961,12 @@ async function startServer() {
     void reconvertStaleProductAffiliatesInStore().catch(() => {});
   }, 1500);
 
-  // 24/7 Server-Side Auto-Dispatch Scheduler per Segment (runs even when no browser tab is open)
+  // 24/7 Server-Side Auto-Dispatch, Dispatch Queues & Scheduled Messages Runner (runs even when no browser tab is open)
   setInterval(() => {
     const st = panelStore.state;
     if (!st) return;
+    void runDueScheduledItemsOnServer().catch(() => {});
+    void runDueDispatchQueuesOnServer().catch(() => {});
     const allSegments = dedupeSegmentNames([
       DEFAULT_SEGMENT,
       ...(Array.isArray(st.segments) ? st.segments : []),

@@ -2,6 +2,10 @@ import React from 'react';
 import { Users, Video, Phone, Plus, Paperclip, Camera, Mic, CheckCheck } from 'lucide-react';
 import { ProductArtworkKey } from '../types';
 import { ProductArtwork } from './ProductArtwork';
+import {
+  buildWhatsAppLinkPreviewMeta,
+  getLinkPreviewStoreTitle,
+} from '../utils/affiliateUrlRules';
 
 interface WhatsAppMockupProps {
   groupName?: string;
@@ -11,6 +15,7 @@ interface WhatsAppMockupProps {
   customImageUrl?: string;
   showMedia?: boolean;
   enableLinkPreview?: boolean;
+  includeLinkPreviewDetails?: boolean;
   previewDomain?: string;
   time?: string;
 }
@@ -90,11 +95,16 @@ export const WhatsAppMockup: React.FC<WhatsAppMockupProps> = ({
   customImageUrl,
   showMedia = false,
   enableLinkPreview = false,
+  includeLinkPreviewDetails = false,
   previewDomain = 's.shopee.com.br',
   time = '22:53',
 }) => {
   const displayText = message.trim() || 'Sua mensagem aparecerá aqui...';
   const lines = displayText.split('\n');
+  const previewMeta =
+    enableLinkPreview && includeLinkPreviewDetails
+      ? buildWhatsAppLinkPreviewMeta(displayText)
+      : null;
 
   return (
     <div className="mx-auto w-full max-w-[330px] rounded-[36px] bg-[#18222D] p-3 shadow-md select-none">
@@ -137,8 +147,24 @@ export const WhatsAppMockup: React.FC<WhatsAppMockupProps> = ({
                   className="w-full h-48 p-1.5"
                 />
                 {enableLinkPreview && (
-                  <div className="bg-[#CFE9C8] px-2.5 py-1.5 text-[11px] text-slate-600 font-mono truncate">
-                    {previewDomain}
+                  <div className="bg-[#CFE9C8] px-2.5 py-1.5 space-y-0.5">
+                    {previewMeta ? (
+                      <>
+                        <div className="text-[11.5px] font-semibold text-slate-900 line-clamp-2 leading-tight">
+                          {previewMeta.title}
+                        </div>
+                        <div className="text-[10.5px] text-slate-600 truncate">
+                          {previewMeta.description}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="text-[11.5px] font-semibold text-slate-900 truncate leading-tight">
+                        {getLinkPreviewStoreTitle(previewDomain)}
+                      </div>
+                    )}
+                    <div className="text-[11px] text-slate-600 font-mono truncate">
+                      {previewDomain}
+                    </div>
                   </div>
                 )}
               </div>

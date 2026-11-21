@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildBaileysLinkPreviewPayload,
   buildWhatsAppLinkPreviewMeta,
   cleanMarketplaceProductUrl,
   cleanOfferTitle,
@@ -13,6 +14,7 @@ import {
   needsAffiliateReconversion,
   sanitizeShopeeOriginUrl,
   sanitizeShopeeSubIds,
+  shieldWhatsAppCurrencyNumbers,
 } from './affiliateUrlRules';
 import {
   computeMemberMonitorSummary,
@@ -331,6 +333,30 @@ test('buildWhatsAppLinkPreviewMeta extracts matchedUrl, domain, title, and price
   assert.equal(meta.title, 'Camiseta Nike Sportswear');
   assert.match(meta.description, /R\$ 129,99/);
   assert.match(meta.description, /R\$ 85,49/);
+});
+
+test('buildBaileysLinkPreviewPayload uses clean store title by default so WhatsApp keeps the photo without duplicating product info', () => {
+  const mlMsg =
+    '💥 O Boticário Quasar Blue 100ml\n\nDe: ~R$ 189,90~ ❌\n*💸 Por: R$ 67,41 🔥*\n\n🔗 Compre aqui: https://meli.la/1gBUE2N';
+  const cleanMlPayload = buildBaileysLinkPreviewPayload(mlMsg, false);
+  assert.ok(cleanMlPayload);
+  assert.equal(cleanMlPayload['canonical-url'], 'https://meli.la/1gBUE2N');
+  assert.equal(cleanMlPayload['matched-text'], 'https://meli.la/1gBUE2N');
+  assert.equal(cleanMlPayload.title, 'Mercado Livre');
+  assert.equal('description' in cleanMlPayload, false);
+
+  const shopeeMsg =
+    '💥 Tablet S12Max 11.6"\n\n*💸 Por: R$ 1.159,00 🔥*\n\n🔗 Compre aqui: https://s.shopee.com.br/8KrG57drWQ';
+  const cleanShopeePayload = buildBaileysLinkPreviewPayload(shopeeMsg);
+  assert.ok(cleanShopeePayload);
+  assert.equal(cleanShopeePayload.title, 'Shopee');
+  assert.equal('description' in cleanShopeePayload, false);
+
+  const detailedPayload = buildBaileysLinkPreviewPayload(mlMsg, true);
+  assert.ok(detailedPayload);
+  assert.equal(detailedPayload.title, 'O Boticário Quasar Blue 100ml');
+  assert.match(String(detailedPayload.description), /R\$ 189,90/);
+  assert.match(String(detailedPayload.description), /R\$ 67,41/);
 });
 
 test('interleaveOffersByPlatform mixes marketplaces evenly instead of grouping one platform first', () => {
@@ -1296,6 +1322,28 @@ test('resolveActiveDispatchTargets filters dispatch groups strictly by targetSeg
   });
   assert.equal(emptySegTargets.waGroups.length, 0);
 });
+
+test('shieldWhatsAppCurrencyNumbers shields BRL prices with Word Joiners without altering URLs or formatting', () => {
+  const sample =
+    '💥 Relógio Tommy Hilfiger 1791819\n\nDe: ~R$ 2.099,00~ ❌\n*💸 Por: R$ 495,00 🔥*\n61% OFF\n\n🔗 Compre aqui: https://meli.la/1QCQtDT\n\n🎟️ Use o cupom: *MODA1911*';
+  const shielded = shieldWhatsAppCurrencyNumbers(sample);
+
+  // Visible text is 100% identical once invisible Word Joiners are stripped
+  assert.equal(shielded.replace(/\u2060/g, ''), sample);
+
+  // No 2+ consecutive digits remain inside the R$ prices
+  assert.ok(shielded.includes('~R$ 2\u2060.\u20600\u20609\u20609\u2060,\u20600\u20600~'));
+  assert.ok(shielded.includes('*💸 Por: R$ 4\u20609\u20605\u2060,\u20600\u20600 🔥*'));
+
+  // URLs, coupons, and product codes outside R$ are untouched
+  assert.ok(shielded.includes('https://meli.la/1QCQtDT'));
+  assert.ok(shielded.includes('*MODA1911*'));
+  assert.ok(shielded.includes('1791819'));
+
+  // Idempotent when called multiple times
+  assert.equal(shieldWhatsAppCurrencyNumbers(shielded), shielded);
+});
+
 
 
 

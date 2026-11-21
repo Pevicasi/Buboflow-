@@ -33,6 +33,11 @@ import {
   LogOut,
   MoreVertical,
   Check,
+  AlertTriangle,
+  RotateCcw,
+  AtSign,
+  Repeat,
+  Clock,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import {
@@ -49,6 +54,8 @@ import {
   getBaileysStatusApi,
   getWhatsAppQrApi,
   logoutBaileysApi,
+  resolveTelegramChatsApi,
+  runDispatchQueueNextApi,
   sendTelegramApi,
   sendWhatsAppApi,
   verifyTelegramBotApi,
@@ -62,6 +69,13 @@ import {
   normalizeSegmentName,
   toggleGroupSegmentMembership,
 } from '../utils/segmentScoping';
+import {
+  getGroupAllMatchKeys,
+  mergeTelegramResolvedChats,
+  parseTelegramTargetList,
+  type ResolvedTelegramChat,
+  type TelegramTargetFailure,
+} from '../utils/telegramSync';
 
 /* ============================================================================
  * 1. WHATSAPP & TELEGRAM ACCOUNTS VIEW (Telas 6–7 + Conexão Real QR/Bot API)
@@ -72,9 +86,13 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
   const {
     accounts,
     setAccounts,
+    whatsappRotationEnabled,
+    setWhatsappRotationEnabled,
     dispatchGroups,
     setDispatchGroups,
     setMonitoringGroups,
+    excludedDispatchGroupKeys,
+    unexcludeDispatchGroupKeys,
     syncWhatsAppGroupsFromAccount,
     activeSegment,
     notify,
@@ -82,6 +100,10 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
   const [search, setSearch] = useState('');
   const [modalOpen, setModalOpen] = useState(false);
   const [editingAcc, setEditingAcc] = useState<ChannelAccount | null>(null);
+  const [pendingDeleteAcc, setPendingDeleteAcc] = useState<ChannelAccount | null>(null);
+  const [deletingAccBusy, setDeletingAccBusy] = useState(false);
+  const [pendingDisconnectAcc, setPendingDisconnectAcc] = useState<ChannelAccount | null>(null);
+  const [disconnectingAccBusy, setDisconnectingAccBusy] = useState(false);
 
   // Account Form Fields
   const [accName, setAccName] = useState('');
@@ -97,6 +119,25 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
 
   // Async Connection, QR Code & Pairing Code States
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [tgSyncDiagByAcc, setTgSyncDiagByAcc] = useState<
+    Record<
+      string,
+      {
+        webhookActive?: boolean;
+        webhookHost?: string;
+        updatesConflict?: boolean;
+        syncNote?: string;
+        validatedCount?: number;
+      }
+    >
+  >({});
+  const [tgImportAcc, setTgImportAcc] = useState<ChannelAccount | null>(null);
+  const [tgImportInput, setTgImportInput] = useState('');
+  const [tgImportResult, setTgImportResult] = useState<{
+    resolved: ResolvedTelegramChat[];
+    failed: TelegramTargetFailure[];
+    syncNote?: string;
+  } | null>(null);
   const [connectTab, setConnectTab] = useState<'qr' | 'pairing'>('qr');
   const [pairingPhoneInput, setPairingPhoneInput] = useState('');
   const [qrModalData, setQrModalData] = useState<{
@@ -233,60 +274,65 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
     setModalOpen(true);
   };
 
-  const importDiscoveredTelegramChats = (
+  const getKnownTelegramChatIds = (accId?: string): string[] => {
+    const ids: string[] = [];
+    for (const g of dispatchGroups) {
+      if (g.channel !== 'Telegram') continue;
+      if (accId && g.accountId !== accId) continue;
+      if (g.remoteJid?.trim()) ids.push(g.remoteJid.trim());
+      if (g.username?.trim()) ids.push(`@${g.username.trim().replace(/^@/, '')}`);
+    }
+    return Array.from(new Set(ids));
+  };
+
+  const applyResolvedTelegramChats = (
     accId: string,
     accLabel: string,
-    chats: { id: string; title: string; type: string; username?: string }[],
-    manualChatId?: string
+    chats: ResolvedTelegramChat[],
+    options?: { forceInclude?: boolean }
   ) => {
-    const itemsToMerge = [...chats];
-    if (manualChatId?.trim() && !itemsToMerge.some((c) => c.id === manualChatId.trim())) {
-      itemsToMerge.push({
-        id: manualChatId.trim(),
-        title: manualChatId.trim().startsWith('@')
-          ? `Canal ${manualChatId.trim()}`
-          : `Grupo Telegram (${manualChatId.trim()})`,
-        type: 'channel',
-      });
+    if (chats.length === 0) {
+      return { addedCount: 0, updatedCount: 0, mergedDuplicatesCount: 0 };
     }
 
-    if (itemsToMerge.length === 0) return 0;
-
-    let added = 0;
-    setDispatchGroups((prev) => {
-      const next = [...prev];
-      for (const ch of itemsToMerge) {
-        const existsIdx = next.findIndex(
-          (g) => g.remoteJid === ch.id || (g.channel === 'Telegram' && g.name === ch.title)
-        );
-        if (existsIdx >= 0) {
-          next[existsIdx] = {
-            ...next[existsIdx],
-            remoteJid: ch.id,
-            accountId: accId,
-            accountName: accLabel,
-          };
-        } else {
-          added++;
-          next.push({
-            id: `grp-tg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-            name: ch.title,
-            channel: 'Telegram',
-            accountId: accId,
-            accountName: accLabel,
-            remoteJid: ch.id,
-            isChannel: ch.type === 'channel',
-            activeForOffers: next.filter((g) => g.activeForOffers).length < 5,
-            membersCount: 1,
-            maxCapacity: 200000,
-            inviteUrl: ch.username ? `https://t.me/${ch.username}` : 'https://t.me/',
-            segment: activeSegment,
-          });
+    const forceKeys = new Set<string>();
+    if (options?.forceInclude) {
+      for (const ch of chats) {
+        for (const k of getGroupAllMatchKeys({
+          channel: 'Telegram',
+          remoteJid: ch.id,
+          username: ch.username,
+          inviteUrl: ch.inviteUrl,
+        })) {
+          forceKeys.add(k);
         }
       }
-      return next;
+      if (forceKeys.size > 0) {
+        unexcludeDispatchGroupKeys(Array.from(forceKeys));
+      }
+    }
+
+    const excludedSet = new Set(excludedDispatchGroupKeys || []);
+    let summary = { addedCount: 0, updatedCount: 0, mergedDuplicatesCount: 0 };
+    setDispatchGroups((prev) => {
+      const merged = mergeTelegramResolvedChats({
+        existing: prev,
+        resolvedChats: chats,
+        accountId: accId,
+        accountName: accLabel,
+        defaultSegment: activeSegment,
+        excludedKeys: options?.forceInclude ? undefined : excludedSet,
+        forceIncludeKeys: forceKeys.size > 0 ? forceKeys : undefined,
+        autoActivateIfUnderLimit: 5,
+      });
+      summary = {
+        addedCount: merged.addedCount,
+        updatedCount: merged.updatedCount,
+        mergedDuplicatesCount: merged.mergedDuplicatesCount,
+      };
+      return merged.groups;
     });
-    return added;
+    return summary;
   };
 
   const handleVerifyTelegramInModal = async () => {
@@ -296,7 +342,12 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
     }
     setBusyAction('verify-tg');
     try {
-      const res = await verifyTelegramBotApi(accToken.trim());
+      const parsedTargets = parseTelegramTargetList(defaultTargetId);
+      const knownIds = editingAcc ? getKnownTelegramChatIds(editingAcc.id) : [];
+      const res = await verifyTelegramBotApi(accToken.trim(), {
+        knownChatIds: knownIds,
+        targetInputs: parsedTargets.valid,
+      });
       if (!res.ok || !res.bot) {
         notify('Falha ao conectar Bot', res.error || 'Token inválido.', 'error');
         return;
@@ -307,20 +358,35 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
       }
 
       const targetAccId = editingAcc?.id || `acc-tg-${Date.now()}`;
-      const added = importDiscoveredTelegramChats(
+      const chats = res.discoveredChats || [];
+      const merged = applyResolvedTelegramChats(
         targetAccId,
-        res.bot.name || accName,
-        res.discoveredChats || [],
-        defaultTargetId
+        res.bot.name || accName || res.bot.username,
+        chats,
+        { forceInclude: parsedTargets.valid.length > 0 }
       );
 
+      setTgSyncDiagByAcc((prev) => ({
+        ...prev,
+        [targetAccId]: {
+          webhookActive: res.webhookActive,
+          webhookHost: res.webhookHost,
+          updatesConflict: res.updatesConflict,
+          syncNote: res.syncNote,
+          validatedCount: chats.length,
+        },
+      }));
+
+      const failCount = (res.failedTargets?.length || 0) + parsedTargets.invalid.length;
       notify(
         `Bot ${res.bot.username} autenticado!`,
-        added > 0
-          ? `${added} grupo(s)/canal(is) do Telegram importados automaticamente!`
-          : (res.discoveredChats?.length || 0) > 0
-          ? `${res.discoveredChats!.length} canal/grupo sincronizado.`
-          : 'Adicione o bot como administrador no seu grupo/canal ou preencha o @canal abaixo.'
+        merged.addedCount > 0
+          ? `${merged.addedCount} canal(is)/grupo(s) importado(s) e validado(s) pela API oficial.${failCount > 0 ? ` ${failCount} não encontrado(s).` : ''}`
+          : chats.length > 0
+          ? `${chats.length} canal(is)/grupo(s) validado(s) com dados reais.${merged.mergedDuplicatesCount > 0 ? ` ${merged.mergedDuplicatesCount} duplicado(s) unificado(s).` : ''}`
+          : res.webhookActive
+          ? 'Webhook externo detectado e mantido intacto. Use "Importar Canais por @" para adicionar seus canais.'
+          : 'Nenhum canal novo nos eventos recentes. Informe os @canais no campo abaixo ou use "Importar Canais por @".'
       );
     } catch {
       notify('Erro de rede ao validar Telegram Bot', undefined, 'error');
@@ -339,21 +405,34 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
     // Auto-verify Telegram token if provided
     if (channel === 'Telegram' && accToken.trim()) {
       try {
-        const check = await verifyTelegramBotApi(accToken.trim());
+        const parsedTargets = parseTelegramTargetList(defaultTargetId);
+        const knownIds = editingAcc ? getKnownTelegramChatIds(editingAcc.id) : [];
+        const check = await verifyTelegramBotApi(accToken.trim(), {
+          knownChatIds: knownIds,
+          targetInputs: parsedTargets.valid,
+        });
         if (check.ok && check.bot) {
           resolvedHandle = check.bot.username;
-          importDiscoveredTelegramChats(
+          applyResolvedTelegramChats(
             targetId,
             accName.trim(),
             check.discoveredChats || [],
-            defaultTargetId
+            { forceInclude: parsedTargets.valid.length > 0 }
           );
+          setTgSyncDiagByAcc((prev) => ({
+            ...prev,
+            [targetId]: {
+              webhookActive: check.webhookActive,
+              webhookHost: check.webhookHost,
+              updatesConflict: check.updatesConflict,
+              syncNote: check.syncNote,
+              validatedCount: check.discoveredChats?.length || 0,
+            },
+          }));
         }
       } catch {
         // Save anyway
       }
-    } else if (channel === 'Telegram' && defaultTargetId.trim()) {
-      importDiscoveredTelegramChats(targetId, accName.trim(), [], defaultTargetId);
     }
 
     const isBaileys = channel === 'WhatsApp' && accProvider === 'baileys';
@@ -364,6 +443,7 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
       channel,
       phoneOrHandle: resolvedHandle,
       connected: isBaileys ? Boolean(editingAcc?.connected) : true,
+      activeForDispatch: editingAcc?.activeForDispatch ?? true,
       provider: accProvider,
       baseUrl: accBaseUrl.trim(),
       instanceName: accInstanceName.trim(),
@@ -591,6 +671,95 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
     }
   };
 
+  const handleToggleDispatchActive = (acc: ChannelAccount) => {
+    const nextActive = acc.activeForDispatch === false;
+    setAccounts((prev) =>
+      prev.map((a) => (a.id === acc.id ? { ...a, activeForDispatch: nextActive } : a))
+    );
+    notify(
+      nextActive ? 'WhatsApp ativado para envios' : 'WhatsApp desativado para envios',
+      nextActive
+        ? `"${acc.name}" agora pode enviar ofertas (manuais, automáticas e agendadas).`
+        : `"${acc.name}" permanece conectado, mas não enviará ofertas até ser reativado.`,
+      nextActive ? 'success' : 'info'
+    );
+  };
+
+  const handleBatchImportTelegram = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!tgImportAcc?.apiToken) {
+      notify('Bot sem token', 'Configure o Bot Token do @BotFather primeiro.', 'error');
+      return;
+    }
+    const parsed = parseTelegramTargetList(tgImportInput);
+    if (parsed.valid.length === 0 && parsed.invalid.length === 0) {
+      notify(
+        'Informe ao menos um canal',
+        'Digite um ou mais @canais, links t.me/canal ou IDs -100...',
+        'info'
+      );
+      return;
+    }
+
+    setBusyAction('import-tg-batch');
+    try {
+      const localInvalid: TelegramTargetFailure[] = parsed.invalid.map((raw) => ({
+        input: raw,
+        reason: /t\.me\/(\+|joinchat)/i.test(raw)
+          ? 'Link de convite privado (t.me/+...) não é aceito pela Bot API. Use @usuario ou ID -100...'
+          : 'Formato inválido. Use @usuario, https://t.me/usuario ou -100...',
+      }));
+
+      if (parsed.valid.length === 0) {
+        setTgImportResult({ resolved: [], failed: localInvalid });
+        return;
+      }
+
+      const res = await resolveTelegramChatsApi(tgImportAcc.apiToken, parsed.valid);
+      if (!res.ok) {
+        notify('Erro ao validar canais', res.error || 'Não foi possível consultar a API do Telegram.', 'error');
+        return;
+      }
+
+      const resolved = res.discoveredChats || [];
+      const failed = [...localInvalid, ...(res.failedTargets || [])];
+
+      if (resolved.length > 0) {
+        const summary = applyResolvedTelegramChats(tgImportAcc.id, tgImportAcc.name, resolved, {
+          forceInclude: true,
+        });
+        notify(
+          `${resolved.length} canal(is) validado(s) no Telegram!`,
+          summary.addedCount > 0
+            ? `${summary.addedCount} novo(s) adicionado(s) em Grupos de Envio${summary.mergedDuplicatesCount > 0 ? ` e ${summary.mergedDuplicatesCount} duplicado(s) unificado(s)` : ''}.`
+            : `Dados, permissões e inscritos atualizados em Grupos de Envio.`
+        );
+      } else if (failed.length > 0) {
+        notify(
+          'Nenhum canal válido encontrado',
+          'Verifique os detalhes abaixo para corrigir o @usuario ou as permissões do bot.',
+          'error'
+        );
+      }
+
+      setTgSyncDiagByAcc((prev) => ({
+        ...prev,
+        [tgImportAcc.id]: {
+          webhookActive: res.webhookActive,
+          webhookHost: res.webhookHost,
+          updatesConflict: res.updatesConflict,
+          syncNote: res.syncNote,
+          validatedCount: resolved.length,
+        },
+      }));
+      setTgImportResult({ resolved, failed, syncNote: res.syncNote });
+    } catch {
+      notify('Erro de rede ao consultar Telegram', undefined, 'error');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const handleSyncAccountGroups = async (acc: ChannelAccount) => {
     if (acc.channel === 'Telegram') {
       if (!acc.apiToken) {
@@ -600,16 +769,29 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
       }
       setBusyAction(`sync-${acc.id}`);
       try {
-        const res = await verifyTelegramBotApi(acc.apiToken);
+        const knownIds = getKnownTelegramChatIds(acc.id);
+        const res = await verifyTelegramBotApi(acc.apiToken, { knownChatIds: knownIds });
         if (res.ok && res.bot) {
-          const added = importDiscoveredTelegramChats(
-            acc.id,
-            acc.name,
-            res.discoveredChats || []
-          );
+          const chats = res.discoveredChats || [];
+          const summary = applyResolvedTelegramChats(acc.id, acc.name, chats);
+          setTgSyncDiagByAcc((prev) => ({
+            ...prev,
+            [acc.id]: {
+              webhookActive: res.webhookActive,
+              webhookHost: res.webhookHost,
+              updatesConflict: res.updatesConflict,
+              syncNote: res.syncNote,
+              validatedCount: chats.length,
+            },
+          }));
           notify(
             `Telegram sincronizado (${res.bot.username})`,
-            `${res.discoveredChats?.length || 0} chat(s) detectados (${added} novos adicionados em Grupos de Envio).`
+            chats.length > 0
+              ? `${chats.length} canal(is) validado(s) (${summary.addedCount} novo(s)${summary.mergedDuplicatesCount > 0 ? `, ${summary.mergedDuplicatesCount} duplicado(s) unificado(s)` : ''}).`
+              : res.webhookActive
+              ? 'Webhook externo preservado. Clique em "Importar Canais por @" para adicionar seus canais.'
+              : 'Nenhum canal novo em eventos recentes. Use "Importar Canais por @" para cadastrar e validar seus canais.',
+            chats.length > 0 ? 'success' : 'info'
           );
         } else {
           notify('Erro no Bot Telegram', res.error || 'Token inválido', 'error');
@@ -690,9 +872,15 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
           clientToken: acc.clientToken,
           remoteJids: [linkedGroups[0].remoteJid!],
           message: sampleMsg,
+          allowInactiveAccount: true,
         });
         if (res.ok) {
-          notify('Mensagem enviada no WhatsApp!', `Entregue em ${linkedGroups[0].name}.`);
+          notify(
+            'Mensagem enviada no WhatsApp!',
+            acc.activeForDispatch === false
+              ? `Entregue em ${linkedGroups[0].name}. Obs.: este número está desativado para envio de ofertas.`
+              : `Entregue em ${linkedGroups[0].name}.`
+          );
         } else {
           notify(
             'Erro ao enviar no WhatsApp',
@@ -750,8 +938,10 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
           </span>
         ) : (
           <span>
-            Conecte seu <strong>Bot do Telegram (@BotFather)</strong> para descobrir seus canais/grupos
-            automaticamente e disparar ofertas com foto e formatação HTML direto pela API oficial do Telegram.
+            Conecte seu <strong>Bot do Telegram (@BotFather)</strong> para disparar ofertas com foto e
+            formatação HTML pela API oficial. Como o Telegram não possui um comando que liste todos os
+            canais antigos automaticamente (e protege webhooks de outras automações), use{' '}
+            <strong>Importar Canais por @</strong> para validar e puxar todos os seus canais de uma vez.
           </span>
         )}
       </div>
@@ -777,6 +967,82 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
           <span>Pesquisar</span>
         </button>
       </div>
+
+      {/* WhatsApp Automatic Account Rotation Bar */}
+      {channel === 'WhatsApp' && (() => {
+        const activeConnectedWaCount = accounts.filter(
+          (a) => a.channel === 'WhatsApp' && a.connected && a.activeForDispatch !== false
+        ).length;
+        return (
+          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-start gap-3 min-w-0">
+              <div className="w-10 h-10 rounded-xl bg-emerald-50 dark:bg-emerald-950/60 text-[#15803D] dark:text-emerald-400 flex items-center justify-center shrink-0">
+                <Repeat className="w-5 h-5" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-bold text-sm text-slate-900 dark:text-white">
+                    Rodízio automático entre números
+                  </span>
+                  <span className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                    · {activeConnectedWaCount} número(s) ativo(s) conectado(s)
+                  </span>
+                </div>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  {whatsappRotationEnabled
+                    ? activeConnectedWaCount >= 2
+                      ? 'Alternando automaticamente cada disparo entre os números conectados e ativos para envios.'
+                      : 'Ativado · conecte e mantenha 2 ou mais números ativos para alternar os disparos.'
+                    : 'Quando ativado, alterna cada oferta entre todos os números conectados e liberados para envio (manuais, filas e disparo automático).'}
+                </p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              role="switch"
+              aria-checked={whatsappRotationEnabled}
+              aria-label="Alternar rodízio automático entre números de WhatsApp"
+              onClick={() => {
+                const next = !whatsappRotationEnabled;
+                setWhatsappRotationEnabled(next);
+                notify(
+                  next
+                    ? 'Rodízio automático ativado!'
+                    : 'Rodízio automático desativado',
+                  next
+                    ? 'Os próximos envios alternarão entre todos os números de WhatsApp conectados e ativos.'
+                    : 'Cada grupo voltará a usar preferencialmente seu número vinculado.'
+                );
+              }}
+              className="inline-flex items-center gap-2 min-h-[40px] px-1 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#15803D] shrink-0 self-end sm:self-center"
+            >
+              <span
+                className={`text-xs font-semibold whitespace-nowrap ${
+                  whatsappRotationEnabled
+                    ? 'text-[#15803D] dark:text-emerald-400'
+                    : 'text-slate-500 dark:text-slate-400'
+                }`}
+              >
+                {whatsappRotationEnabled ? 'Ativado' : 'Desativado'}
+              </span>
+              <span
+                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                  whatsappRotationEnabled
+                    ? 'bg-[#15803D] dark:bg-emerald-600'
+                    : 'bg-slate-300 dark:bg-slate-700'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-xs transition-transform ${
+                    whatsappRotationEnabled ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </span>
+            </button>
+          </div>
+        );
+      })()}
 
       {/* Account Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -857,8 +1123,82 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
                       {acc.baseUrl ? `· ${acc.baseUrl}` : ''}
                     </div>
                   )}
+                  {channel === 'Telegram' && (() => {
+                    const diag = tgSyncDiagByAcc[acc.id];
+                    const linkedCount = dispatchGroups.filter(
+                      (g) => g.channel === 'Telegram' && g.accountId === acc.id
+                    ).length;
+                    return (
+                      <div className="mt-2 space-y-1.5">
+                        <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                          {linkedCount} canal(is)/grupo(s) vinculado(s) em Grupos de Envio
+                        </div>
+                        {diag?.syncNote && (
+                          <div className="rounded-xl border border-amber-200/80 dark:border-amber-800/70 bg-amber-50/70 dark:bg-amber-950/30 px-3 py-2 text-xs text-amber-800 dark:text-amber-200 flex items-start gap-2">
+                            <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
+                            <span>{diag.syncNote}</span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
+
+              {channel === 'WhatsApp' && (() => {
+                const isDispatchActive = acc.activeForDispatch !== false;
+                return (
+                  <div className="flex items-center justify-between gap-3 pt-3 border-t border-slate-100 dark:border-slate-800">
+                    <div className="min-w-0">
+                      <div className="text-xs font-semibold text-slate-800 dark:text-slate-100">
+                        Envio de ofertas
+                      </div>
+                      <div
+                        className={`text-xs mt-0.5 ${
+                          isDispatchActive
+                            ? 'text-[#15803D] dark:text-emerald-400'
+                            : 'text-amber-700 dark:text-amber-400'
+                        }`}
+                      >
+                        {isDispatchActive
+                          ? 'Ativo · liberado para enviar ofertas'
+                          : 'Desativado · pausado para envios'}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={isDispatchActive}
+                      aria-label={`Alternar envio de ofertas para ${acc.name}`}
+                      onClick={() => handleToggleDispatchActive(acc)}
+                      className="inline-flex items-center gap-2 min-h-[40px] px-1 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#15803D] shrink-0"
+                    >
+                      <span
+                        className={`text-xs font-semibold whitespace-nowrap ${
+                          isDispatchActive
+                            ? 'text-[#15803D] dark:text-emerald-400'
+                            : 'text-slate-500 dark:text-slate-400'
+                        }`}
+                      >
+                        {isDispatchActive ? 'Ativo' : 'Inativo'}
+                      </span>
+                      <span
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                          isDispatchActive
+                            ? 'bg-[#15803D] dark:bg-emerald-600'
+                            : 'bg-slate-300 dark:bg-slate-700'
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-xs transition-transform ${
+                            isDispatchActive ? 'translate-x-6' : 'translate-x-1'
+                          }`}
+                        />
+                      </span>
+                    </button>
+                  </div>
+                );
+              })()}
 
               <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -891,6 +1231,21 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
                     </>
                   )}
 
+                  {channel === 'Telegram' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTgImportAcc(acc);
+                        setTgImportInput('');
+                        setTgImportResult(null);
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-[#15803D] hover:bg-emerald-800 text-white text-xs font-semibold flex items-center gap-1.5"
+                    >
+                      <AtSign className="w-3.5 h-3.5" />
+                      <span>Importar Canais por @</span>
+                    </button>
+                  )}
+
                   <button
                     type="button"
                     disabled={busyAction === `sync-${acc.id}`}
@@ -921,8 +1276,9 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
                     <button
                       type="button"
                       disabled={busyAction === `logout-${acc.id}`}
-                      onClick={() => void handleLogoutBaileys(acc)}
-                      title="Desconectar sessão Baileys"
+                      onClick={() => setPendingDisconnectAcc(acc)}
+                      aria-label={`Desconectar sessão ${acc.name}`}
+                      title="Desconectar sessão WhatsApp"
                       className="p-2 rounded-lg text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-950/40"
                     >
                       <LogOut className="w-4 h-4" />
@@ -938,20 +1294,8 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
                   </button>
                   <button
                     type="button"
-                    onClick={() => {
-                      void (async () => {
-                        if (channel === 'WhatsApp' && waProvider === 'baileys') {
-                          await logoutBaileysApi(acc.id);
-                        }
-                        setAccounts((prev) => prev.filter((a) => a.id !== acc.id));
-                        setDispatchGroups((prev) => prev.filter((g) => g.accountId !== acc.id));
-                        setMonitoringGroups((prev) => prev.filter((m) => m.accountId !== acc.id));
-                        if (channel === 'WhatsApp') {
-                          void syncWhatsAppGroupsFromAccount(undefined, { silent: true });
-                        }
-                        notify('Conta removida', acc.name, 'info');
-                      })();
-                    }}
+                    onClick={() => setPendingDeleteAcc(acc)}
+                    aria-label={`Remover conta ${acc.name}`}
                     title="Remover conta"
                     className="p-2 rounded-lg text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40"
                   >
@@ -1382,13 +1726,13 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
 
                   <div>
                     <label className="block text-[11px] text-slate-500 mb-1">
-                      Canal ou Chat ID padrão (opcional — ex: @divulgatudo ou -100123456789)
+                      Canais / Chat IDs para validar (opcional — um por linha ou separados por vírgula)
                     </label>
-                    <input
-                      type="text"
+                    <textarea
+                      rows={3}
                       value={defaultTargetId}
                       onChange={(e) => setDefaultTargetId(e.target.value)}
-                      placeholder="Ex: @divulgatudoofertas ou -1001987654321"
+                      placeholder={'@divulgatudoofertas\n@meusegundocanal\n@meuterceirocanal'}
                       className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3 py-2 text-xs font-mono"
                     />
                   </div>
@@ -1404,7 +1748,7 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
                     ) : (
                       <CheckCircle2 className="w-3.5 h-3.5" />
                     )}
-                    <span>Verificar Bot & Descobrir Canais</span>
+                    <span>Verificar Bot & Validar Canais</span>
                   </button>
                 </div>
               )}
@@ -1426,6 +1770,303 @@ export const ChannelAccountsView: React.FC<{ channel: 'WhatsApp' | 'Telegram' }>
               </button>
             </div>
           </form>
+        </div>
+      )}
+
+      {/* Batch Import Telegram Channels by @ Modal */}
+      {tgImportAcc && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs overflow-y-auto"
+          onClick={() => setTgImportAcc(null)}
+        >
+          <form
+            onSubmit={handleBatchImportTelegram}
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-lg rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 shadow-2xl space-y-4 my-auto"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="font-bold text-lg text-slate-900 dark:text-white">
+                  Importar Canais do Telegram por @
+                </h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  Bot <span className="font-mono">{tgImportAcc.phoneOrHandle || tgImportAcc.name}</span> · Validação direta via API oficial (seguro para bots compartilhados com webhook).
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTgImportAcc(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
+                Cole os @canais, links t.me/canal ou IDs -100... (um por linha ou separados por vírgula)
+              </label>
+              <textarea
+                rows={4}
+                value={tgImportInput}
+                onChange={(e) => setTgImportInput(e.target.value)}
+                placeholder={'@divulgatudoofertas\n@achadosofertas\nhttps://t.me/meuterceirocanal'}
+                className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3.5 py-2.5 text-sm font-mono text-slate-900 dark:text-slate-100"
+              />
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1.5">
+                Para cada canal informado, o sistema consulta o título oficial, converte para o ID permanente (<span className="font-mono">-100...</span>), busca o número real de inscritos e verifica se o bot tem permissão para postar.
+              </p>
+            </div>
+
+            {tgImportResult && (
+              <div className="space-y-2.5 max-h-60 overflow-y-auto border-t border-slate-100 dark:border-slate-800 pt-3">
+                {tgImportResult.resolved.length > 0 && (
+                  <div className="space-y-1.5">
+                    <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+                      Validados e importados ({tgImportResult.resolved.length})
+                    </div>
+                    {tgImportResult.resolved.map((ch) => (
+                      <div
+                        key={ch.id}
+                        className="rounded-xl border border-slate-200/80 dark:border-slate-800 px-3 py-2 text-xs flex flex-col gap-0.5"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-semibold text-slate-900 dark:text-white truncate">
+                            {ch.title}
+                          </span>
+                          <span
+                            className={`font-semibold shrink-0 ${
+                              ch.canPostMessages
+                                ? 'text-[#15803D] dark:text-emerald-400'
+                                : 'text-amber-600 dark:text-amber-400'
+                            }`}
+                          >
+                            {ch.statusLabel}
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-x-2 text-[11px] text-slate-500 dark:text-slate-400 font-mono tabular-nums">
+                          {ch.username && <span>@{ch.username}</span>}
+                          <span>·</span>
+                          <span>ID: {ch.id}</span>
+                          <span>·</span>
+                          <span>{ch.membersCount} inscrito(s)</span>
+                        </div>
+                        {ch.warningReason && (
+                          <div className="text-[11px] text-amber-700 dark:text-amber-300 mt-0.5">
+                            {ch.warningReason}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {tgImportResult.failed.length > 0 && (
+                  <div className="space-y-1.5">
+                    <div className="text-xs font-semibold text-rose-700 dark:text-rose-400">
+                      Não encontrados / com erro ({tgImportResult.failed.length})
+                    </div>
+                    {tgImportResult.failed.map((f, idx) => (
+                      <div
+                        key={`${f.input}-${idx}`}
+                        className="rounded-xl border border-rose-200/80 dark:border-rose-900/60 bg-rose-50/50 dark:bg-rose-950/20 px-3 py-2 text-xs"
+                      >
+                        <div className="font-mono font-semibold text-rose-800 dark:text-rose-300">
+                          {f.input}
+                        </div>
+                        <div className="text-[11px] text-rose-700 dark:text-rose-300/90 mt-0.5">
+                          {f.reason}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setTgImportAcc(null)}
+                className="px-4 py-2 rounded-xl text-sm text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                Fechar
+              </button>
+              <button
+                type="submit"
+                disabled={busyAction === 'import-tg-batch'}
+                className="px-4 py-2 rounded-xl bg-[#15803D] hover:bg-emerald-800 text-white text-sm font-semibold flex items-center gap-1.5 disabled:opacity-60"
+              >
+                {busyAction === 'import-tg-batch' ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <CheckCircle2 className="w-4 h-4" />
+                )}
+                <span>Validar e Importar</span>
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Modal: Confirmação de Exclusão de Conta */}
+      {pendingDeleteAcc && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-account-modal-title"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs"
+          onClick={() => {
+            if (!deletingAccBusy) setPendingDeleteAcc(null);
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 shadow-2xl space-y-4"
+          >
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3
+                  id="delete-account-modal-title"
+                  className="font-bold text-base text-slate-900 dark:text-white"
+                >
+                  Excluir conta conectada?
+                </h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
+                  Tem certeza que deseja remover a conta{' '}
+                  <strong className="text-slate-800 dark:text-slate-100">
+                    {pendingDeleteAcc.name}
+                  </strong>{' '}
+                  ({pendingDeleteAcc.channel})? Os grupos e canais vinculados a ela também serão
+                  removidos da lista.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+              <button
+                type="button"
+                disabled={deletingAccBusy}
+                onClick={() => setPendingDeleteAcc(null)}
+                className="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={deletingAccBusy}
+                onClick={() => {
+                  const target = pendingDeleteAcc;
+                  if (!target) return;
+                  setDeletingAccBusy(true);
+                  void (async () => {
+                    try {
+                      const targetWaProvider = target.provider || 'baileys';
+                      if (channel === 'WhatsApp' && targetWaProvider === 'baileys') {
+                        await logoutBaileysApi(target.id);
+                      }
+                      setAccounts((prev) => prev.filter((a) => a.id !== target.id));
+                      setDispatchGroups((prev) => prev.filter((g) => g.accountId !== target.id));
+                      setMonitoringGroups((prev) =>
+                        prev.filter((m) => m.accountId !== target.id)
+                      );
+                      if (channel === 'WhatsApp') {
+                        void syncWhatsAppGroupsFromAccount(undefined, { silent: true });
+                      }
+                      notify('Conta removida', target.name, 'info');
+                    } finally {
+                      setDeletingAccBusy(false);
+                      setPendingDeleteAcc(null);
+                    }
+                  })();
+                }}
+                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-sm font-semibold inline-flex items-center gap-1.5 disabled:opacity-60"
+              >
+                {deletingAccBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>Sim, excluir</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Confirmação de Desconexão de Sessão WhatsApp */}
+      {pendingDisconnectAcc && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="disconnect-account-modal-title"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs"
+          onClick={() => {
+            if (!disconnectingAccBusy) setPendingDisconnectAcc(null);
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 shadow-2xl space-y-4"
+          >
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400 flex items-center justify-center shrink-0">
+                <LogOut className="w-5 h-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3
+                  id="disconnect-account-modal-title"
+                  className="font-bold text-base text-slate-900 dark:text-white"
+                >
+                  Desconectar sessão do WhatsApp?
+                </h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
+                  Tem certeza que deseja desconectar{' '}
+                  <strong className="text-slate-800 dark:text-slate-100">
+                    {pendingDisconnectAcc.name}
+                  </strong>{' '}
+                  ({pendingDisconnectAcc.phoneOrHandle})? Para voltar a usar este número será
+                  necessário ler o QR Code ou parear novamente.
+                </p>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-2 leading-relaxed">
+                  Dica: se quiser apenas pausar os envios sem perder a conexão, desligue o botão{' '}
+                  <strong className="text-slate-700 dark:text-slate-200">Envio de ofertas</strong>{' '}
+                  no card da conta.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+              <button
+                type="button"
+                disabled={disconnectingAccBusy}
+                onClick={() => setPendingDisconnectAcc(null)}
+                className="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={disconnectingAccBusy}
+                onClick={() => {
+                  const target = pendingDisconnectAcc;
+                  if (!target) return;
+                  setDisconnectingAccBusy(true);
+                  void (async () => {
+                    try {
+                      await handleLogoutBaileys(target);
+                    } finally {
+                      setDisconnectingAccBusy(false);
+                      setPendingDisconnectAcc(null);
+                    }
+                  })();
+                }}
+                className="px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold inline-flex items-center gap-1.5 disabled:opacity-60"
+              >
+                {disconnectingAccBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>Sim, desconectar</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -1947,6 +2588,13 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
     setDispatchGroups,
     monitoringGroups,
     setMonitoringGroups,
+    excludedDispatchGroupKeys,
+    excludedMonitoringGroupKeys,
+    removeDispatchGroup,
+    removeMonitoringGroup,
+    restoreExcludedDispatchGroups,
+    restoreExcludedMonitoringGroups,
+    unexcludeDispatchGroupKeys,
     accounts,
     activeSegment,
     syncWhatsAppGroupsFromAccount,
@@ -1966,7 +2614,85 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
   const [newRemoteJid, setNewRemoteJid] = useState('');
   const [newInvite, setNewInvite] = useState('https://chat.whatsapp.com/');
   const [newIsChannel, setNewIsChannel] = useState(false);
+  const [addGroupBusy, setAddGroupBusy] = useState(false);
+  const [addGroupError, setAddGroupError] = useState<string | null>(null);
   const [syncingGroups, setSyncingGroups] = useState(false);
+  const [pendingDeleteGroup, setPendingDeleteGroup] = useState<
+    | { kind: 'envio'; group: DispatchGroup }
+    | { kind: 'monitoramento'; group: MonitoringGroup }
+    | null
+  >(null);
+
+  const renderDeleteGroupConfirmModal = () => {
+    if (!pendingDeleteGroup) return null;
+    const grp = pendingDeleteGroup.group;
+    const isChannelItem =
+      pendingDeleteGroup.kind === 'envio' && Boolean(pendingDeleteGroup.group.isChannel);
+    const kindLabel = isChannelItem ? 'canal' : 'grupo';
+
+    return (
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="delete-group-modal-title"
+        className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs"
+        onClick={() => setPendingDeleteGroup(null)}
+      >
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="w-full max-w-md rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 shadow-2xl space-y-4"
+        >
+          <div className="flex items-start gap-3">
+            <div className="w-10 h-10 rounded-xl bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 flex items-center justify-center shrink-0">
+              <AlertTriangle className="w-5 h-5" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <h3
+                id="delete-group-modal-title"
+                className="font-bold text-base text-slate-900 dark:text-white"
+              >
+                Excluir grupo ou canal?
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
+                Tem certeza que deseja excluir o {kindLabel}{' '}
+                <strong className="text-slate-800 dark:text-slate-100">{grp.name}</strong> (
+                {grp.channel}) da lista de{' '}
+                {pendingDeleteGroup.kind === 'envio' ? 'envio' : 'monitoramento'}?
+              </p>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-2">
+                Ele não voltará automaticamente ao sincronizar. Se precisar dele depois, basta
+                clicar em <strong>Restaurar excluídos</strong>.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+            <button
+              type="button"
+              onClick={() => setPendingDeleteGroup(null)}
+              className="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
+            >
+              Cancelar
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (pendingDeleteGroup.kind === 'envio') {
+                  removeDispatchGroup(pendingDeleteGroup.group);
+                } else {
+                  removeMonitoringGroup(pendingDeleteGroup.group);
+                }
+                setPendingDeleteGroup(null);
+              }}
+              className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-sm font-semibold"
+            >
+              Sim, excluir
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   const MONITORING_MARKETPLACES: Marketplace[] = [
     'Shopee',
@@ -2038,45 +2764,44 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
   const syncAllConnectedChannels = async () => {
     setSyncingGroups(true);
     let totalFound = 0;
+    let tgSharedWebhookDetected = false;
     try {
       const waResult = await syncWhatsAppGroupsFromAccount(undefined, { silent: true });
       if (waResult.ok) {
         totalFound += waResult.count;
       }
 
+      const excludedSet = new Set(excludedDispatchGroupKeys || []);
       for (const acc of accounts) {
         if (!acc.connected) continue;
         if (acc.channel === 'Telegram' && acc.apiToken) {
-          const tgRes = await verifyTelegramBotApi(acc.apiToken);
+          const knownIds = Array.from(
+            new Set(
+              dispatchGroups
+                .filter((g) => g.channel === 'Telegram' && g.accountId === acc.id)
+                .flatMap((g) => [
+                  g.remoteJid?.trim() || '',
+                  g.username?.trim() ? `@${g.username.trim().replace(/^@/, '')}` : '',
+                ])
+                .filter(Boolean)
+            )
+          );
+          const tgRes = await verifyTelegramBotApi(acc.apiToken, { knownChatIds: knownIds });
+          if (tgRes.webhookActive || tgRes.updatesConflict) {
+            tgSharedWebhookDetected = true;
+          }
           if (tgRes.ok && tgRes.discoveredChats?.length) {
             totalFound += tgRes.discoveredChats.length;
-            setDispatchGroups((prev) => {
-              const next = [...prev];
-              for (const ch of tgRes.discoveredChats!) {
-                const idx = next.findIndex(
-                  (g) => g.remoteJid === ch.id || (g.channel === 'Telegram' && g.name === ch.title)
-                );
-                if (idx >= 0) {
-                  next[idx] = { ...next[idx], remoteJid: ch.id, accountId: acc.id, accountName: acc.name };
-                } else {
-                  next.push({
-                    id: `grp-tg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                    name: ch.title,
-                    channel: 'Telegram',
-                    accountId: acc.id,
-                    accountName: acc.name,
-                    remoteJid: ch.id,
-                    isChannel: ch.type === 'channel',
-                    activeForOffers: false,
-                    membersCount: 1,
-                    maxCapacity: 200000,
-                    inviteUrl: ch.username ? `https://t.me/${ch.username}` : 'https://t.me/',
-                    segment: activeSegment,
-                  });
-                }
-              }
-              return next;
-            });
+            setDispatchGroups((prev) =>
+              mergeTelegramResolvedChats({
+                existing: prev,
+                resolvedChats: tgRes.discoveredChats!,
+                accountId: acc.id,
+                accountName: acc.name,
+                defaultSegment: activeSegment,
+                excludedKeys: excludedSet,
+              }).groups
+            );
           }
         }
       }
@@ -2084,12 +2809,16 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
       if (totalFound > 0) {
         notify(
           'Grupos reais sincronizados!',
-          `${totalFound} grupo(s)/canal(is) puxados diretamente da sua conta conectada.`
+          tgSharedWebhookDetected
+            ? `${totalFound} grupo(s)/canal(is) atualizados. Para novos canais do Telegram em bot compartilhado, use "Canais → Telegram → Importar Canais por @".`
+            : `${totalFound} grupo(s)/canal(is) puxados e validados diretamente da sua conta conectada.`
         );
       } else {
         notify(
           'Nenhum grupo encontrado na sessão atual',
-          'Verifique se o seu WhatsApp está conectado em Canais → WhatsApp.',
+          tgSharedWebhookDetected
+            ? 'Bot do Telegram com webhook externo detectado. Vá em Canais → Telegram e clique em "Importar Canais por @".'
+            : 'Verifique se o seu WhatsApp ou Telegram está conectado em Canais.',
           'info'
         );
       }
@@ -2150,38 +2879,125 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
       );
     };
 
-    const handleAddDispatchGroup = (e: React.FormEvent) => {
+    const handleAddDispatchGroup = async (e: React.FormEvent) => {
       e.preventDefault();
-      if (!newName.trim()) return;
+      setAddGroupError(null);
       const matchingAcc =
         accounts.find((a) => a.id === newAccountId) ||
         accounts.find((a) => a.channel === newChannel) ||
         accounts[0] || { id: 'acc-wa-1', name: 'CONTA 01' };
 
-      const activateNow = activeCount < maxLimit;
       const seg = normalizeSegmentName(activeSegment);
-      setDispatchGroups((prev) => [
-        ...prev,
-        {
-          id: `grp-${Date.now()}`,
-          name: newName.trim(),
-          channel: newChannel,
-          accountId: matchingAcc.id,
-          accountName: matchingAcc.name,
-          remoteJid: newRemoteJid.trim() || undefined,
-          isChannel: newIsChannel,
-          activeForOffers: activateNow,
-          activeSegments: activateNow ? [seg] : [],
-          membersCount: 1,
-          maxCapacity: newChannel === 'Telegram' ? 200000 : newIsChannel ? 5000 : 1024,
-          inviteUrl: newInvite.trim(),
-          segment: seg,
-        },
-      ]);
+
+      // When adding a Telegram channel/group with a connected bot token, validate via Bot API first
+      if (newChannel === 'Telegram' && 'apiToken' in matchingAcc && matchingAcc.apiToken?.trim()) {
+        const parsed = parseTelegramTargetList(newRemoteJid);
+        if (parsed.valid.length === 0) {
+          setAddGroupError(
+            'Informe um @canal válido (ex: @divulgatudoofertas), link https://t.me/canal ou Chat ID -100...'
+          );
+          return;
+        }
+        setAddGroupBusy(true);
+        try {
+          const res = await resolveTelegramChatsApi(matchingAcc.apiToken.trim(), parsed.valid);
+          if (!res.ok) {
+            setAddGroupError(res.error || 'Falha ao consultar a API do Telegram.');
+            return;
+          }
+          const resolved = res.discoveredChats || [];
+          if (resolved.length === 0) {
+            setAddGroupError(
+              res.failedTargets?.[0]?.reason ||
+                'Canal não encontrado no Telegram. Confira o @usuario ou adicione o bot como administrador.'
+            );
+            return;
+          }
+
+          const customTitle = newName.trim();
+          const finalChats: ResolvedTelegramChat[] = resolved.map((ch, i) => ({
+            ...ch,
+            title: i === 0 && customTitle ? customTitle : ch.title,
+            inviteUrl:
+              i === 0 && newInvite.trim() && newInvite.trim() !== 'https://chat.whatsapp.com/'
+                ? newInvite.trim()
+                : ch.inviteUrl,
+          }));
+
+          const forceKeys = new Set<string>();
+          for (const ch of finalChats) {
+            for (const k of getGroupAllMatchKeys({
+              channel: 'Telegram',
+              remoteJid: ch.id,
+              username: ch.username,
+              inviteUrl: ch.inviteUrl,
+            })) {
+              forceKeys.add(k);
+            }
+          }
+          if (forceKeys.size > 0) {
+            unexcludeDispatchGroupKeys(Array.from(forceKeys));
+          }
+
+          setDispatchGroups((prev) =>
+            mergeTelegramResolvedChats({
+              existing: prev,
+              resolvedChats: finalChats,
+              accountId: matchingAcc.id,
+              accountName: matchingAcc.name,
+              defaultSegment: seg,
+              forceIncludeKeys: forceKeys,
+              autoActivateIfUnderLimit: maxLimit,
+            }).groups
+          );
+
+          const firstChat = finalChats[0];
+          setNewName('');
+          setNewRemoteJid('');
+          setAddGroupModal(false);
+          notify(
+            firstChat.canPostMessages ? 'Canal Telegram validado e salvo!' : 'Canal salvo com alerta de permissão',
+            firstChat.canPostMessages
+              ? `${firstChat.title} (${firstChat.membersCount} inscritos · ${firstChat.statusLabel})`
+              : `${firstChat.title}: ${firstChat.warningReason || firstChat.statusLabel}`,
+            firstChat.canPostMessages ? 'success' : 'info'
+          );
+          return;
+        } catch {
+          setAddGroupError('Erro de rede ao consultar a API do Telegram.');
+          return;
+        } finally {
+          setAddGroupBusy(false);
+        }
+      }
+
+      if (!newName.trim()) {
+        setAddGroupError('Informe o nome do grupo ou canal.');
+        return;
+      }
+
+      const activateNow = activeCount < maxLimit;
+      const candidateGroup: DispatchGroup = {
+        id: `grp-${Date.now()}`,
+        name: newName.trim(),
+        channel: newChannel,
+        accountId: matchingAcc.id,
+        accountName: matchingAcc.name,
+        remoteJid: newRemoteJid.trim() || undefined,
+        isChannel: newIsChannel,
+        activeForOffers: activateNow,
+        activeSegments: activateNow ? [seg] : [],
+        membersCount: 1,
+        maxCapacity: newChannel === 'Telegram' ? 200000 : newIsChannel ? 5000 : 1024,
+        inviteUrl: newInvite.trim(),
+        segment: seg,
+      };
+      unexcludeDispatchGroupKeys(getGroupAllMatchKeys(candidateGroup));
+      setDispatchGroups((prev) => [...prev, candidateGroup]);
       setNewName('');
       setNewRemoteJid('');
       setAddGroupModal(false);
-      notify('Grupo/Canal adicionado!', newName.trim());
+      notify('Grupo/Canal adicionado!', candidateGroup.name);
     };
 
     return (
@@ -2301,6 +3117,23 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
           </button>
         </div>
 
+        {/* Excluded Groups Restore Bar */}
+        {excludedDispatchGroupKeys.length > 0 && (
+          <div className="rounded-xl bg-slate-50 dark:bg-slate-900/70 border border-slate-200/80 dark:border-slate-800 px-4 py-2.5 flex items-center justify-between gap-3 flex-wrap text-xs">
+            <span className="text-slate-600 dark:text-slate-300">
+              Você possui itens excluídos da lista de envio (não voltarão automaticamente ao sincronizar).
+            </span>
+            <button
+              type="button"
+              onClick={() => void restoreExcludedDispatchGroups()}
+              className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-semibold flex items-center gap-1.5 hover:bg-slate-100 dark:hover:bg-slate-700"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Restaurar excluídos</span>
+            </button>
+          </div>
+        )}
+
         {/* Table */}
         <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 overflow-hidden">
           <div className="overflow-x-auto">
@@ -2311,13 +3144,14 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                   <th className="py-3.5 px-3">App</th>
                   <th className="py-3.5 px-3">Conta</th>
                   <th className="py-3.5 px-3 text-right">Membros</th>
-                  <th className="py-3.5 px-4 text-right">Enviar Ofertas</th>
+                  <th className="py-3.5 px-3 text-right">Enviar Ofertas</th>
+                  <th className="py-3.5 px-4 text-right">Excluir</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-sm">
                 {filtered.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="py-14 px-6 text-center">
+                    <td colSpan={6} className="py-14 px-6 text-center">
                       <Users className="w-10 h-10 text-slate-300 dark:text-slate-600 mx-auto mb-2.5" />
                       <div className="font-bold text-sm text-slate-800 dark:text-slate-100">
                         {dispatchGroups.length === 0
@@ -2365,23 +3199,38 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                     >
                       <td className="py-3.5 px-4 font-medium text-slate-900 dark:text-white">
                         <div>{g.name}</div>
-                        <div className="flex flex-wrap items-center gap-2 mt-0.5">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-0.5 text-[11px]">
                           {g.isChannel && (
-                            <span className="text-xs text-sky-600 dark:text-sky-400 font-medium">
+                            <span className="text-sky-600 dark:text-sky-400 font-medium">
                               Canal
                             </span>
                           )}
+                          {g.username && (
+                            <span className="font-mono text-slate-500 dark:text-slate-400">
+                              @{g.username}
+                            </span>
+                          )}
+                          {g.channel === 'Telegram' && g.canPostMessages === true && (
+                            <span className="text-[#15803D] dark:text-emerald-400 font-medium">
+                              · Admin OK
+                            </span>
+                          )}
+                          {g.channel === 'Telegram' && g.canPostMessages === false && (
+                            <span className="text-amber-600 dark:text-amber-400 font-medium">
+                              · Sem permissão de postar
+                            </span>
+                          )}
                           {otherSegments.length > 0 && (
-                            <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                              Ativo em: {otherSegments.join(', ')}
+                            <span className="text-slate-500 dark:text-slate-400">
+                              · Ativo em: {otherSegments.join(', ')}
                             </span>
                           )}
                           {g.remoteJid ? (
-                            <span className="text-[11px] font-mono text-emerald-700 dark:text-emerald-400">
+                            <span className="font-mono text-emerald-700 dark:text-emerald-400">
                               ID: {g.remoteJid}
                             </span>
                           ) : (
-                            <span className="text-[11px] text-slate-400">
+                            <span className="text-slate-400">
                               Sem JID/Chat ID (sincronize para envio automático)
                             </span>
                           )}
@@ -2400,7 +3249,7 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                       <td className="py-3.5 px-3 text-right tabular-nums text-slate-600 dark:text-slate-300">
                         {g.membersCount}
                       </td>
-                      <td className="py-3.5 px-4 text-right">
+                      <td className="py-3.5 px-3 text-right">
                         <button
                           type="button"
                           role="switch"
@@ -2417,6 +3266,17 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                               activeHere ? 'translate-x-6' : 'translate-x-1'
                             }`}
                           />
+                        </button>
+                      </td>
+                      <td className="py-3.5 px-4 text-right">
+                        <button
+                          type="button"
+                          onClick={() => setPendingDeleteGroup({ kind: 'envio', group: g })}
+                          aria-label={`Excluir ${g.name}`}
+                          title="Excluir grupo/canal da lista de envio"
+                          className="p-2 rounded-lg text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors"
+                        >
+                          <Trash2 className="w-4 h-4" />
                         </button>
                       </td>
                     </tr>
@@ -2497,14 +3357,20 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
 
                 <div>
                   <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
-                    Nome do Grupo ou Canal *
+                    {newChannel === 'Telegram'
+                      ? 'Nome do Grupo ou Canal (opcional — preenchido automaticamente pela API)'
+                      : 'Nome do Grupo ou Canal *'}
                   </label>
                   <input
                     type="text"
-                    required
+                    required={newChannel !== 'Telegram'}
                     value={newName}
                     onChange={(e) => setNewName(e.target.value)}
-                    placeholder="Ex: Meu Grupo de Ofertas"
+                    placeholder={
+                      newChannel === 'Telegram'
+                        ? 'Deixe em branco para puxar o nome oficial do Telegram'
+                        : 'Ex: Meu Grupo de Ofertas'
+                    }
                     className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3.5 py-2 text-sm"
                   />
                 </div>
@@ -2512,21 +3378,31 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                 <div>
                   <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
                     {newChannel === 'Telegram'
-                      ? 'Chat ID ou @username do Canal (para envio via Bot API)'
+                      ? '@username do Canal, link t.me/canal ou Chat ID *'
                       : 'JID do Grupo no WhatsApp (ex: 12036304...@g.us)'}
                   </label>
                   <input
                     type="text"
+                    required={newChannel === 'Telegram'}
                     value={newRemoteJid}
-                    onChange={(e) => setNewRemoteJid(e.target.value)}
+                    onChange={(e) => {
+                      setNewRemoteJid(e.target.value);
+                      if (addGroupError) setAddGroupError(null);
+                    }}
                     placeholder={
                       newChannel === 'Telegram'
-                        ? 'Ex: @divulgatudoofertas ou -1001987654321'
+                        ? 'Ex: @divulgatudoofertas ou https://t.me/meucanal'
                         : 'Ex: 120363192837465@g.us'
                     }
                     className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3.5 py-2 text-xs font-mono"
                   />
                 </div>
+
+                {addGroupError && (
+                  <div className="rounded-xl border border-rose-200 dark:border-rose-900/60 bg-rose-50/70 dark:bg-rose-950/30 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+                    {addGroupError}
+                  </div>
+                )}
 
                 <div>
                   <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
@@ -2553,21 +3429,28 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
               <div className="flex justify-end gap-2">
                 <button
                   type="button"
-                  onClick={() => setAddGroupModal(false)}
-                  className="px-4 py-2 rounded-xl text-sm text-slate-600"
+                  onClick={() => {
+                    setAddGroupError(null);
+                    setAddGroupModal(false);
+                  }}
+                  className="px-4 py-2 rounded-xl text-sm text-slate-600 dark:text-slate-300"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-xl bg-[#15803D] text-white text-sm font-semibold"
+                  disabled={addGroupBusy}
+                  className="px-4 py-2 rounded-xl bg-[#15803D] hover:bg-emerald-800 text-white text-sm font-semibold flex items-center gap-1.5 disabled:opacity-60"
                 >
-                  Salvar Grupo
+                  {addGroupBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  <span>{newChannel === 'Telegram' ? 'Validar e Salvar' : 'Salvar Grupo'}</span>
                 </button>
               </div>
             </form>
           </div>
         )}
+
+        {renderDeleteGroupConfirmModal()}
       </div>
     );
   }
@@ -2594,10 +3477,10 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
 
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2.5">
-          <Users className="w-6 h-6 text-[#15803D] dark:text-emerald-400" />
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
+          <Users className="w-6 h-6 text-[#15803D] dark:text-emerald-400 shrink-0" />
+          <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
             Grupos de Monitoramento
           </h1>
           <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200/70 dark:border-emerald-800/60 px-2.5 py-0.5 rounded-lg">
@@ -2608,7 +3491,7 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
           type="button"
           disabled={syncingGroups}
           onClick={() => void syncAllConnectedChannels()}
-          className="px-3.5 py-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs sm:text-sm font-medium text-slate-700 dark:text-slate-200 flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
+          className="px-3.5 py-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs sm:text-sm font-medium text-slate-700 dark:text-slate-200 flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800 shrink-0"
         >
           <RefreshCw className={`w-4 h-4 ${syncingGroups ? 'animate-spin text-[#15803D]' : ''}`} />
           <span>Sincronizar</span>
@@ -2685,8 +3568,171 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
         />
       </div>
 
+      {excludedMonitoringGroupKeys.length > 0 && (
+        <div className="rounded-xl bg-slate-50 dark:bg-slate-900/70 border border-slate-200/80 dark:border-slate-800 px-4 py-2.5 flex items-center justify-between gap-3 flex-wrap text-xs">
+          <span className="text-slate-600 dark:text-slate-300">
+            Você possui grupo(s) excluído(s) do monitoramento (não voltarão automaticamente ao sincronizar).
+          </span>
+          <button
+            type="button"
+            onClick={() => void restoreExcludedMonitoringGroups()}
+            className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-semibold flex items-center gap-1.5 hover:bg-slate-100 dark:hover:bg-slate-700"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>Restaurar excluídos</span>
+          </button>
+        </div>
+      )}
+
       <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 overflow-hidden">
-        <div className="overflow-x-auto">
+        {/* Mobile card layout so group name, Links Hoje, and Monitorar switch stay visible together */}
+        <div className="md:hidden divide-y divide-slate-100 dark:divide-slate-800">
+          {filteredMon.length === 0 ? (
+            <div className="py-12 px-5 text-center">
+              <Users className="w-10 h-10 text-slate-300 dark:text-slate-600 mx-auto mb-2.5" />
+              <div className="font-bold text-sm text-slate-800 dark:text-slate-100">
+                {monitoringGroups.length === 0
+                  ? 'Nenhum grupo de monitoramento sincronizado'
+                  : 'Nenhum grupo corresponde aos filtros'}
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                {accounts.some((a) => a.connected)
+                  ? 'Clique em "Sincronizar" acima para carregar todos os grupos reais do seu WhatsApp conectado.'
+                  : 'Conecte seu WhatsApp em Canais → WhatsApp para listar seus grupos reais aqui.'}
+              </p>
+            </div>
+          ) : (
+            filteredMon.map((g) => {
+              const monHere = isGroupMonitoredInSegment(g, activeSegment);
+              const otherMonSegs = getGroupMonitoredSegments(g).filter(
+                (s) => !matchesSegment(s, activeSegment)
+              );
+              const activeMarkets =
+                g.allowedMarketplaces && g.allowedMarketplaces.length > 0
+                  ? g.allowedMarketplaces
+                  : MONITORING_MARKETPLACES;
+              const marketSummary =
+                activeMarkets.length === MONITORING_MARKETPLACES.length
+                  ? 'Todos os marketplaces'
+                  : activeMarkets.join(', ');
+              return (
+                <div key={`mob-${g.id}`} className="p-4 space-y-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="font-semibold text-sm text-slate-900 dark:text-white leading-snug break-words">
+                        {g.name}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                        <span className="inline-flex items-center gap-1 font-mono text-slate-600 dark:text-slate-300">
+                          <MessageCircle className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                          {g.accountName}
+                        </span>
+                        <span>• {marketSummary}</span>
+                        {g.useGroupImage && (
+                          <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
+                            • Foto do grupo
+                          </span>
+                        )}
+                        {otherMonSegs.length > 0 && (
+                          <span>• Monitorado em: {otherMonSegs.join(', ')}</span>
+                        )}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={monHere}
+                      aria-label={`Monitorar ${g.name}`}
+                      onClick={() => {
+                        if (!monHere && monitoredCount >= maxLimit) {
+                          notify(
+                            'Limite atingido',
+                            `Máximo de ${maxLimit} grupos monitorados.`,
+                            'error'
+                          );
+                          return;
+                        }
+                        setMonitoringGroups((prev) =>
+                          prev.map((m) => {
+                            if (m.id !== g.id) return m;
+                            const nextMonSegs = toggleGroupSegmentMembership(
+                              getGroupMonitoredSegments(m),
+                              activeSegment,
+                              !monHere
+                            );
+                            return {
+                              ...m,
+                              monitoredSegments: nextMonSegs,
+                              monitored: nextMonSegs.length > 0,
+                            };
+                          })
+                        );
+                        notify(
+                          !monHere
+                            ? `Monitoramento ativado em "${activeSegment}"`
+                            : `Monitoramento pausado em "${activeSegment}"`,
+                          g.name
+                        );
+                      }}
+                      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                        monHere ? 'bg-[#15803D]' : 'bg-slate-200 dark:bg-slate-700'
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                          monHere ? 'translate-x-6' : 'translate-x-1'
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-100 dark:border-slate-800/80 text-xs">
+                    <div className="flex items-center gap-2 text-slate-600 dark:text-slate-300">
+                      <span className="text-slate-400 dark:text-slate-500">Links hoje:</span>
+                      <span className="font-bold tabular-nums text-slate-900 dark:text-white">
+                        {g.capturedToday || 0}
+                      </span>
+                      <span
+                        className={`text-[11px] font-semibold ${
+                          monHere
+                            ? 'text-emerald-700 dark:text-emerald-400'
+                            : 'text-slate-400 dark:text-slate-500'
+                        }`}
+                      >
+                        • {monHere ? 'Ativo' : 'Pausado'}
+                      </span>
+                    </div>
+                    <div className="inline-flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => openMonitoringConfigModal(g)}
+                        aria-label={`Configurar ${g.name}`}
+                        title="Configurar marketplaces e imagem do grupo"
+                        className="p-2 rounded-lg text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                      >
+                        <MoreVertical className="w-4 h-4" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setPendingDeleteGroup({ kind: 'monitoramento', group: g })
+                        }
+                        aria-label={`Excluir ${g.name}`}
+                        title="Excluir grupo do monitoramento"
+                        className="p-2 rounded-lg text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        {/* Desktop table layout */}
+        <div className="hidden md:block overflow-x-auto">
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="border-b border-slate-100 dark:border-slate-800 text-xs font-semibold text-slate-500">
@@ -2695,7 +3741,7 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                 <th className="py-3.5 px-3">Conta</th>
                 <th className="py-3.5 px-3 text-right">Links Hoje</th>
                 <th className="py-3.5 px-3 text-right">Monitorar</th>
-                <th className="py-3.5 px-3 text-right">Config.</th>
+                <th className="py-3.5 px-3 text-right">Ações</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-sm">
@@ -2809,15 +3855,28 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                         </button>
                       </td>
                       <td className="py-3.5 px-3 text-right">
-                        <button
-                          type="button"
-                          onClick={() => openMonitoringConfigModal(g)}
-                          aria-label={`Configurar ${g.name}`}
-                          title="Configurar marketplaces e imagem do grupo"
-                          className="p-2 rounded-lg text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
-                        >
-                          <MoreVertical className="w-4 h-4" />
-                        </button>
+                        <div className="inline-flex items-center justify-end gap-1">
+                          <button
+                            type="button"
+                            onClick={() => openMonitoringConfigModal(g)}
+                            aria-label={`Configurar ${g.name}`}
+                            title="Configurar marketplaces e imagem do grupo"
+                            className="p-2 rounded-lg text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                          >
+                            <MoreVertical className="w-4 h-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setPendingDeleteGroup({ kind: 'monitoramento', group: g })
+                            }
+                            aria-label={`Excluir ${g.name}`}
+                            title="Excluir grupo do monitoramento"
+                            className="p-2 rounded-lg text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );
@@ -2965,6 +4024,8 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
           </div>
         </div>
       )}
+
+      {renderDeleteGroupConfirmModal()}
     </div>
   );
 };
@@ -3135,6 +4196,7 @@ export const DispatchQueuesView: React.FC = () => {
   const [search, setSearch] = useState('');
   const [createOpen, setCreateOpen] = useState(false);
   const [manageQueue, setManageQueue] = useState<DispatchQueue | null>(null);
+  const [runningQueueId, setRunningQueueId] = useState<string | null>(null);
 
   const [newQueueName, setNewQueueName] = useState('');
   const [newQueueInterval, setNewQueueInterval] = useState('15');
@@ -3150,6 +4212,31 @@ export const DispatchQueuesView: React.FC = () => {
     }
     return true;
   });
+
+  const formatNextRunLabel = (q: DispatchQueue): string => {
+    if (q.totalCount === 0 || q.productIds.length === 0) return 'Sem produtos na fila';
+    if (q.sentCount >= q.totalCount) return 'Fila concluída';
+    if (!q.active) return 'Pausada';
+    if (!q.nextRunAt) return 'Pronta para o próximo ciclo automático';
+    const d = new Date(q.nextRunAt);
+    if (Number.isNaN(d.getTime())) return 'Pronta para o próximo ciclo automático';
+    const hhmm = d.toLocaleTimeString('pt-BR', {
+      timeZone: 'America/Sao_Paulo',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+    const nowDay = new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+    const runDay = d.toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+    if (runDay !== nowDay) {
+      const ddmm = d.toLocaleDateString('pt-BR', {
+        timeZone: 'America/Sao_Paulo',
+        day: '2-digit',
+        month: '2-digit',
+      });
+      return `Próximo envio: ${ddmm} às ${hhmm}`;
+    }
+    return `Próximo envio: ${hhmm}`;
+  };
 
   const handleCreateQueue = (e: React.FormEvent) => {
     e.preventDefault();
@@ -3167,26 +4254,94 @@ export const DispatchQueuesView: React.FC = () => {
     setQueues((prev) => [item, ...prev]);
     setNewQueueName('');
     setCreateOpen(false);
-    notify('Fila criada!', item.name);
+    notify('Fila criada!', `${item.name} · intervalo de ${item.intervalMinutes} min.`);
   };
 
-  const triggerNextFromQueue = (q: DispatchQueue) => {
+  const handleResetQueue = (q: DispatchQueue) => {
+    setQueues((prev) =>
+      prev.map((item) =>
+        item.id === q.id
+          ? {
+              ...item,
+              sentCount: 0,
+              lastRunAt: undefined,
+              nextRunAt: undefined,
+            }
+          : item
+      )
+    );
+    notify('Fila reiniciada!', `"${q.name}" voltou para o início (0 de ${q.totalCount}).`);
+  };
+
+  const triggerNextFromQueue = async (q: DispatchQueue) => {
+    if (runningQueueId === q.id) return;
     if (q.productIds.length === 0 || q.sentCount >= q.totalCount) {
-      notify('Fila vazia ou concluída', 'Adicione produtos clicando no ícone de caixa.', 'info');
+      notify('Fila vazia ou concluída', 'Adicione produtos clicando no ícone de caixa ou reinicie a fila.', 'info');
       return;
     }
-    const nextProdId = q.productIds[q.sentCount];
-    const prod = products.find((p) => p.id === nextProdId) || products[0];
-    if (prod) {
-      dispatchOfferNow(prod, [q.segment]);
-      setQueues((prev) =>
-        prev.map((item) =>
-          item.id === q.id
-            ? { ...item, sentCount: Math.min(item.totalCount, item.sentCount + 1) }
-            : item
-        )
-      );
-      notify('Próximo item disparado!', prod.title);
+
+    setRunningQueueId(q.id);
+    try {
+      const res = await runDispatchQueueNextApi(q.id);
+      if (res.ok) {
+        const nowIso = new Date().toISOString();
+        setQueues((prev) =>
+          prev.map((item) => {
+            if (item.id !== q.id) return item;
+            const nextSent = Math.min(item.totalCount, item.sentCount + 1);
+            return {
+              ...item,
+              sentCount: nextSent,
+              lastRunAt: nowIso,
+              nextRunAt: res.nextRunAt,
+              active: res.completed ? false : item.active,
+            };
+          })
+        );
+        notify(
+          'Próximo item da fila disparado!',
+          res.productTitle
+            ? `${res.productTitle} · entregue em ${res.sentCount} grupo(s).`
+            : `Entregue em ${res.sentCount} grupo(s).`
+        );
+        return;
+      }
+
+      // If queue was just created client-side and not yet flushed to server, fallback cleanly once
+      if (res.error && /não encontrada/i.test(res.error)) {
+        const nextProdId = q.productIds[q.sentCount];
+        const prod = products.find((p) => p.id === nextProdId);
+        if (prod) {
+          const delivery = await dispatchOfferNow(prod, [q.segment]);
+          if (delivery.ok) {
+            const nowIso = new Date().toISOString();
+            const nextSent = Math.min(q.totalCount, q.sentCount + 1);
+            setQueues((prev) =>
+              prev.map((item) =>
+                item.id === q.id
+                  ? {
+                      ...item,
+                      sentCount: nextSent,
+                      lastRunAt: nowIso,
+                      nextRunAt:
+                        nextSent < item.totalCount
+                          ? new Date(Date.now() + Math.max(1, item.intervalMinutes) * 60_000).toISOString()
+                          : undefined,
+                      active: nextSent >= item.totalCount ? false : item.active,
+                    }
+                  : item
+              )
+            );
+          }
+          return;
+        }
+      }
+
+      notify('Não foi possível disparar agora', res.error || 'Verifique os grupos ativos e o WhatsApp.', 'error');
+    } catch {
+      notify('Erro ao disparar item da fila', 'Tente novamente em instantes.', 'error');
+    } finally {
+      setRunningQueueId(null);
     }
   };
 
@@ -3201,7 +4356,8 @@ export const DispatchQueuesView: React.FC = () => {
             </h1>
           </div>
           <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
-            Organize seus produtos em filas e programe o disparo automático.
+            Organize produtos em ordem sequencial. Filas ativas disparam automaticamente 24/7 no
+            servidor conforme o intervalo configurado.
           </p>
         </div>
 
@@ -3209,9 +4365,10 @@ export const DispatchQueuesView: React.FC = () => {
           type="button"
           onClick={() => setCreateOpen(true)}
           title="Nova Fila"
-          className="w-11 h-11 rounded-xl bg-[#15803D] hover:bg-emerald-800 text-white flex items-center justify-center shrink-0 shadow-xs"
+          className="px-4 py-2.5 rounded-xl bg-[#15803D] hover:bg-emerald-800 text-white text-xs sm:text-sm font-semibold flex items-center gap-1.5 shrink-0 shadow-xs"
         >
-          <Plus className="w-5 h-5" />
+          <Plus className="w-4 h-4" />
+          <span>Nova Fila</span>
         </button>
       </div>
 
@@ -3238,7 +4395,7 @@ export const DispatchQueuesView: React.FC = () => {
         </div>
         <button
           type="button"
-          onClick={() => notify('Filas atualizadas')}
+          onClick={() => notify('Filas atualizadas', `${filtered.length} fila(s) exibida(s).`, 'info')}
           className="px-4 py-2.5 rounded-xl bg-[#15803D] text-white text-sm font-semibold flex items-center gap-2 shrink-0"
         >
           <Search className="w-4 h-4" />
@@ -3252,100 +4409,155 @@ export const DispatchQueuesView: React.FC = () => {
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="border-b border-slate-100 dark:border-slate-800 text-xs font-semibold text-slate-500">
-                <th className="py-3.5 px-4">Nome</th>
-                <th className="py-3.5 px-4">Envios</th>
+                <th className="py-3.5 px-4">Fila e Programação</th>
+                <th className="py-3.5 px-4">Progresso</th>
                 <th className="py-3.5 px-4">Status</th>
                 <th className="py-3.5 px-4 text-right">Ações</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-sm">
-              {filtered.map((q) => {
-                const pct =
-                  q.totalCount === 0
-                    ? 0
-                    : Math.round((q.sentCount / q.totalCount) * 100);
-                return (
-                  <tr key={q.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
-                    <td className="py-3.5 px-4 font-medium text-slate-900 dark:text-white">
-                      {q.name}
-                    </td>
-                    <td className="py-3.5 px-4 tabular-nums">
-                      <div className="text-xs">
-                        <strong className="text-[#15803D] dark:text-emerald-400">
-                          {q.sentCount}
-                        </strong>{' '}
-                        de {q.totalCount} envios
-                      </div>
-                      <div className="mt-1.5 w-28 h-1.5 rounded-full bg-emerald-100 dark:bg-slate-800 overflow-hidden">
-                        <div
-                          style={{ width: `${pct}%` }}
-                          className="h-full bg-[#15803D] transition-all"
-                        />
-                      </div>
-                    </td>
-                    <td className="py-3.5 px-4">
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={q.active}
-                        onClick={() =>
-                          setQueues((prev) =>
-                            prev.map((item) =>
-                              item.id === q.id ? { ...item, active: !item.active } : item
-                            )
-                          )
-                        }
-                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                          q.active ? 'bg-[#15803D]' : 'bg-slate-200 dark:bg-slate-700'
-                        }`}
-                      >
-                        <span
-                          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                            q.active ? 'translate-x-6' : 'translate-x-1'
-                          }`}
-                        />
-                      </button>
-                    </td>
-                    <td className="py-3.5 px-4 text-right">
-                      <div className="inline-flex items-center gap-1.5">
+              {filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={4} className="py-10 px-4 text-center text-sm text-slate-500">
+                    Nenhuma fila de disparo cadastrada neste segmento. Clique em{' '}
+                    <strong>Nova Fila</strong> para criar sua primeira sequência automática.
+                  </td>
+                </tr>
+              ) : (
+                filtered.map((q) => {
+                  const pct =
+                    q.totalCount === 0
+                      ? 0
+                      : Math.round((q.sentCount / q.totalCount) * 100);
+                  const isRunning = runningQueueId === q.id;
+                  return (
+                    <tr key={q.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
+                      <td className="py-3.5 px-4">
+                        <div className="font-semibold text-slate-900 dark:text-white">
+                          {q.name}
+                        </div>
+                        <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                          <span className="inline-flex items-center gap-1">
+                            <Clock className="w-3.5 h-3.5" />
+                            <span>A cada {Math.max(1, q.intervalMinutes || 15)} min</span>
+                          </span>
+                          <span>·</span>
+                          <span>{formatNextRunLabel(q)}</span>
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-4 tabular-nums">
+                        <div className="text-xs">
+                          <strong className="text-[#15803D] dark:text-emerald-400">
+                            {q.sentCount}
+                          </strong>{' '}
+                          de {q.totalCount} envios
+                        </div>
+                        <div className="mt-1.5 w-28 h-1.5 rounded-full bg-emerald-100 dark:bg-slate-800 overflow-hidden">
+                          <div
+                            style={{ width: `${pct}%` }}
+                            className="h-full bg-[#15803D] transition-all"
+                          />
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-4">
                         <button
                           type="button"
-                          onClick={() => setManageQueue(q)}
-                          title="Gerenciar produtos da fila"
-                          className="p-2 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
-                        >
-                          <Package className="w-4 h-4" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => triggerNextFromQueue(q)}
-                          title="Disparar próximo item agora"
-                          className="p-2 rounded-lg text-[#15803D] dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/50"
-                        >
-                          <Play className="w-4 h-4" />
-                        </button>
-                        <button
-                          type="button"
+                          role="switch"
+                          aria-checked={q.active}
+                          aria-label={`Alternar status da fila ${q.name}`}
                           onClick={() =>
-                            setQueues((prev) => prev.filter((item) => item.id !== q.id))
+                            setQueues((prev) =>
+                              prev.map((item) => {
+                                if (item.id !== q.id) return item;
+                                const nextActive = !item.active;
+                                return {
+                                  ...item,
+                                  active: nextActive,
+                                  nextRunAt: nextActive ? undefined : item.nextRunAt,
+                                };
+                              })
+                            )
                           }
-                          title="Excluir fila"
-                          className="p-2 rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40"
+                          className="inline-flex items-center gap-2 min-h-[36px] rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#15803D]"
                         >
-                          <Trash2 className="w-4 h-4" />
+                          <span
+                            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                              q.active ? 'bg-[#15803D]' : 'bg-slate-200 dark:bg-slate-700'
+                            }`}
+                          >
+                            <span
+                              className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                q.active ? 'translate-x-6' : 'translate-x-1'
+                              }`}
+                            />
+                          </span>
+                          <span
+                            className={`text-xs font-semibold ${
+                              q.active
+                                ? 'text-[#15803D] dark:text-emerald-400'
+                                : 'text-slate-500 dark:text-slate-400'
+                            }`}
+                          >
+                            {q.active ? 'Ativa' : 'Pausada'}
+                          </span>
                         </button>
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
+                      </td>
+                      <td className="py-3.5 px-4 text-right">
+                        <div className="inline-flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setManageQueue(q)}
+                            title="Gerenciar produtos da fila"
+                            className="p-2 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+                          >
+                            <Package className="w-4 h-4" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isRunning}
+                            onClick={() => void triggerNextFromQueue(q)}
+                            title="Disparar próximo item agora"
+                            className="p-2 rounded-lg text-[#15803D] dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/50 disabled:opacity-50"
+                          >
+                            {isRunning ? (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                              <Play className="w-4 h-4" />
+                            )}
+                          </button>
+                          {q.sentCount > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => handleResetQueue(q)}
+                              title="Reiniciar fila do zero"
+                              className="p-2 rounded-lg text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/40"
+                            >
+                              <RotateCcw className="w-4 h-4" />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setQueues((prev) => prev.filter((item) => item.id !== q.id))
+                            }
+                            title="Excluir fila"
+                            className="p-2 rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
             </tbody>
           </table>
         </div>
 
         <div className="px-4 py-3 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-xs text-slate-500 tabular-nums">
           <span>{filtered.length} Resultado(s)</span>
-          <span>Página 1 de 1</span>
+          <span>Motor 24/7 ativo no servidor</span>
         </div>
       </div>
 

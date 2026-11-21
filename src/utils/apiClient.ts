@@ -149,16 +149,53 @@ export async function fetchShopeeCommissionsApi(params: {
   return res.json();
 }
 
-export async function verifyTelegramBotApi(botToken: string): Promise<{
-  ok: boolean;
-  bot?: { id: number; name: string; username: string };
-  discoveredChats?: { id: string; title: string; type: string; username?: string }[];
-  error?: string;
-}> {
+export async function verifyTelegramBotApi(
+  botToken: string,
+  options?: { knownChatIds?: string[]; targetInputs?: string[] }
+): Promise<import('./telegramSync').TelegramSyncResponse> {
   const res = await fetch('/api/telegram/verify', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ botToken }),
+    body: JSON.stringify({
+      botToken,
+      knownChatIds: options?.knownChatIds || [],
+      targetInputs: options?.targetInputs || [],
+    }),
+  });
+  return res.json();
+}
+
+export async function resolveTelegramChatsApi(
+  botToken: string,
+  targets: string[]
+): Promise<import('./telegramSync').TelegramSyncResponse> {
+  const res = await fetch('/api/telegram/resolve-chats', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ botToken, targets }),
+  });
+  return res.json();
+}
+
+export async function cleanupExpiredMlCouponsApi(params?: {
+  maxAgeHours?: number;
+  segment?: string;
+  purgePromobitCoupons?: boolean;
+}): Promise<{
+  ok: boolean;
+  checkedCount: number;
+  removedCount: number;
+  replacedCount: number;
+  keptCount: number;
+  version?: number;
+  products?: any[];
+  coupons?: any[];
+  error?: string;
+}> {
+  const res = await fetch('/api/coupons/mercadolivre/cleanup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params || {}),
   });
   return res.json();
 }
@@ -331,7 +368,9 @@ export async function sendWhatsAppApi(params: {
   message: string;
   imageUrl?: string;
   enableLinkPreview?: boolean;
+  includeLinkPreviewDetails?: boolean;
   mentionAll?: boolean;
+  allowInactiveAccount?: boolean;
 }): Promise<{
   ok: boolean;
   sentCount?: number;
@@ -538,4 +577,122 @@ export async function runAutoDispatchNowApi(segment?: string): Promise<{
     body: JSON.stringify(segment ? { segment } : {}),
   });
   return res.json();
+}
+
+export async function executeAutomationCommandApi(params: {
+  command: string;
+  segment?: string;
+  sendToGroup?: boolean;
+}): Promise<{
+  ok: boolean;
+  commandType: string;
+  replyText: string;
+  previewText?: string;
+  previewImageUrl?: string;
+  version?: number;
+  state?: Record<string, any> | null;
+  error?: string;
+}> {
+  const res = await fetch('/api/automation-group/execute', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  return res.json();
+}
+
+export async function createAutomationGroupApi(params: {
+  segment?: string;
+  accountId?: string;
+}): Promise<{
+  ok: boolean;
+  group?: {
+    id: string;
+    name: string;
+    remoteJid: string;
+    accountId: string;
+    accountName: string;
+    description: string;
+    descriptionApplied: boolean;
+    welcomeSent?: boolean;
+  };
+  version?: number;
+  state?: Record<string, any> | null;
+  error?: string;
+}> {
+  const res = await fetch('/api/automation-group/create', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  return res.json();
+}
+
+export async function sendAutomationGroupWelcomeApi(params: {
+  segment?: string;
+  groupJid?: string;
+  updateDescription?: boolean;
+}): Promise<{
+  ok: boolean;
+  welcomeSent?: boolean;
+  descriptionApplied?: boolean;
+  error?: string;
+}> {
+  const res = await fetch('/api/automation-group/welcome', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  return res.json();
+}
+
+export async function runDispatchQueueNextApi(queueId: string): Promise<{
+  ok: boolean;
+  sentCount: number;
+  productTitle?: string;
+  completed?: boolean;
+  nextRunAt?: string;
+  version?: number;
+  state?: Record<string, any> | null;
+  error?: string;
+}> {
+  const res = await fetch('/api/queues/run-next', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ queueId }),
+  });
+  return res.json();
+}
+
+export interface ExtractedVideoResponse {
+  ok: boolean;
+  platformLabel?: string;
+  title?: string;
+  thumbnailUrl?: string | null;
+  cleanUrl?: string;
+  directMp4Url?: string | null;
+  canDirectDownload?: boolean;
+  fileSizeBytes?: number | null;
+  note?: string;
+  error?: string;
+}
+
+export async function extractVideoApi(url: string): Promise<ExtractedVideoResponse> {
+  const res = await fetch('/api/videos/extract', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url }),
+  });
+  return res.json();
+}
+
+export function buildVideoDownloadUrl(
+  videoUrl: string,
+  filename?: string,
+  inline?: boolean
+): string {
+  const params = new URLSearchParams({ url: videoUrl });
+  if (filename?.trim()) params.set('filename', filename.trim());
+  if (inline) params.set('inline', '1');
+  return `/api/videos/download?${params.toString()}`;
 }

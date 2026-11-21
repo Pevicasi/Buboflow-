@@ -1,3 +1,9 @@
+import {
+  isCouponDateExpired,
+  isFalsePositiveCouponCode,
+  isPartnerExclusiveCouponCode,
+} from './mercadoLivreCoupons.ts';
+
 export function sanitizeShopeeSubIds(rawSubIds?: string[] | null): string[] {
   if (!Array.isArray(rawSubIds)) return [];
   const seen = new Set<string>();
@@ -398,7 +404,10 @@ export function extractCouponFromMessageText(text: string): string | undefined {
   );
   if (!m?.[1]) return undefined;
   const candidate = m[1].toUpperCase();
-  if (/^(AQUI|GRATIS|LINK|SITE|APP|OFF|HOJE|PROMO|DESCONTO)$/.test(candidate)) {
+  if (isFalsePositiveCouponCode(candidate) || isPartnerExclusiveCouponCode(candidate)) {
+    return undefined;
+  }
+  if (isCouponDateExpired(candidate).expired) {
     return undefined;
   }
   return candidate;
@@ -453,6 +462,46 @@ export function buildWhatsAppLinkPreviewMeta(message: string): {
       : `Confira esta oferta em ${domain}`;
 
   return { matchedUrl, domain, title, description };
+}
+
+export function getLinkPreviewStoreTitle(domain: string): string {
+  const lower = String(domain || '').toLowerCase().trim();
+  if (/(?:shopee|shp\.ee)/i.test(lower)) return 'Shopee';
+  if (/(?:meli\.la|mercadolivre|mercadolibre)/i.test(lower)) return 'Mercado Livre';
+  if (/(?:amzn\.to|amazon)/i.test(lower)) return 'Amazon';
+  if (/(?:magalu|magazinevoce|magazineluiza)/i.test(lower)) return 'Magalu';
+  if (/aliexpress/i.test(lower)) return 'AliExpress';
+  if (/netshoes/i.test(lower)) return 'Netshoes';
+  return lower || 'Oferta';
+}
+
+export function buildBaileysLinkPreviewPayload(
+  message: string,
+  includeDetails: boolean = false
+): {
+  'canonical-url': string;
+  'matched-text': string;
+  title: string;
+  description?: string;
+} | null {
+  const meta = buildWhatsAppLinkPreviewMeta(message);
+  if (!meta) return null;
+  if (includeDetails) {
+    return {
+      'canonical-url': meta.matchedUrl,
+      'matched-text': meta.matchedUrl,
+      title: meta.title,
+      description: meta.description,
+    };
+  }
+  // WhatsApp Android/iOS require a non-empty `title` on extendedTextMessage to render the
+  // link preview card and its highQualityThumbnail image. Using only the short store name
+  // keeps the product photo visible without duplicating the product title or prices.
+  return {
+    'canonical-url': meta.matchedUrl,
+    'matched-text': meta.matchedUrl,
+    title: getLinkPreviewStoreTitle(meta.domain),
+  };
 }
 
 export function interleaveOffersByPlatform<T extends { platform?: string }>(
@@ -550,5 +599,29 @@ export function sanitizeShopeeOriginUrl(rawUrl: string): string | null {
     return null;
   }
 }
+
+const WHATSAPP_WORD_JOINER = '\u2060';
+
+/**
+ * Prevents WhatsApp Android from falsely turning Brazilian Real prices (e.g. R$ 495,00,
+ * R$ 150,11, R$ 1.198,18, R$ 2.099,00) into green underlined clickable phone/code links.
+ * Inserts invisible non-breaking Word Joiners (U+2060) between adjacent characters of the
+ * numeric portion after "R$", keeping visible rendering, line wrapping, bold/strikethrough
+ * markers, and URLs completely intact.
+ */
+export function shieldWhatsAppCurrencyNumbers(text: string): string {
+  const input = String(text ?? '');
+  if (!input) return input;
+  return input.replace(
+    /(R\$\s*)(\d(?:[\d.,\u2060]*\d)?)/gi,
+    (_match, prefix: string, rawAmount: string) => {
+      const cleanAmount = rawAmount.replace(/\u2060/g, '');
+      if (cleanAmount.length < 2) return `${prefix}${cleanAmount}`;
+      const shielded = cleanAmount.split('').join(WHATSAPP_WORD_JOINER);
+      return `${prefix}${shielded}`;
+    }
+  );
+}
+
 
 

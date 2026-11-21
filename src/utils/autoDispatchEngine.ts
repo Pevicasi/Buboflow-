@@ -11,6 +11,10 @@ import {
   isGroupActiveInSegment,
   normalizeSegmentName,
 } from './segmentScoping';
+import {
+  DEFAULT_ML_COUPON_MAX_AGE_HOURS,
+  hasFreshValidCapturedCoupon,
+} from './mercadoLivreCoupons';
 
 export function parseTimeToMinutes(hhmm: string, fallbackMinutes = 0): number {
   const match = String(hhmm || '')
@@ -204,12 +208,14 @@ export interface SelectAutoDispatchParams {
   sentLogs?: SentLog[];
   recentAutoProductIds?: string[];
   rng?: () => number;
+  now?: Date;
 }
 
 /**
  * Picks 1..N products from saved Produtos respecting:
  * - minProductsPerRun / maxProductsPerRun
  * - strict proportional platform distribution (smooth deficit + anti-streak: 50/50 strictly alternates!)
+ * - priority for products carrying a fresh, valid coupon so they dispatch before expiring
  * - sendOrder ('Aleatório', 'Mais Recentes', 'Priorizados Primeiro', 'Maior Comissão')
  * - avoiding immediate repeats until all eligible products have cycled
  */
@@ -219,6 +225,7 @@ export function selectProductsForAutoDispatch({
   sentLogs = [],
   recentAutoProductIds = [],
   rng = Math.random,
+  now = new Date(),
 }: SelectAutoDispatchParams): Product[] {
   const validProducts = (products || []).filter(
     (p) => p && p.id && p.title && (p.affiliateUrl || p.originalUrl)
@@ -296,11 +303,30 @@ export function selectProductsForAutoDispatch({
       ? remaining.filter((p) => p.platform === targetPlatform)
       : remaining;
 
-    const sorted = sortCandidatesByOrder(
-      platformCandidates.length > 0 ? platformCandidates : remaining,
-      config.sendOrder,
-      rng
-    );
+    const basePool = platformCandidates.length > 0 ? platformCandidates : remaining;
+    const prioritizeCoupons = config.prioritizeCouponProducts !== false;
+    const maxAgeHours =
+      typeof config.mlCouponMaxAgeHours === 'number'
+        ? config.mlCouponMaxAgeHours
+        : DEFAULT_ML_COUPON_MAX_AGE_HOURS;
+
+    const freshCouponPool = prioritizeCoupons
+      ? basePool.filter((p) => hasFreshValidCapturedCoupon(p, maxAgeHours, now))
+      : [];
+
+    // When products with fresh valid coupons exist, send them first (soonest-to-expire first,
+    // i.e. oldest createdAt among still-valid coupons) so none of them expire waiting in the queue!
+    const sorted =
+      freshCouponPool.length > 0
+        ? [...freshCouponPool].sort((a, b) => {
+            const tA = Date.parse(a.createdAt || '');
+            const tB = Date.parse(b.createdAt || '');
+            if (Number.isFinite(tA) && Number.isFinite(tB) && tA !== tB) {
+              return tA - tB;
+            }
+            return 0;
+          })
+        : sortCandidatesByOrder(basePool, config.sendOrder, rng);
 
     const nextProduct = sorted[0];
     if (nextProduct) {

@@ -19,6 +19,9 @@ import {
   ExternalLink,
   ChevronLeft,
   ChevronRight,
+  Loader2,
+  AlertTriangle,
+  Film,
 } from 'lucide-react';
 import { normalizeGroupJid, useApp } from '../context/AppContext';
 import { MARKETPLACES } from '../data/initialData';
@@ -30,7 +33,10 @@ import {
 import { ProductArtwork } from '../components/ProductArtwork';
 import {
   BaileysMemberEvent,
+  ExtractedVideoResponse,
+  buildVideoDownloadUrl,
   convertLinkApi,
+  extractVideoApi,
   fetchShopeeCommissionsApi,
   getBaileysLiveStatsApi,
 } from '../utils/apiClient';
@@ -52,34 +58,72 @@ import type { DispatchGroup } from '../types';
 /* ============================================================================
  * 1. DOWNLOAD DE VÍDEOS (Telas 43–44)
  * ========================================================================== */
+function formatVideoFileSize(bytes?: number | null): string {
+  if (!bytes || !Number.isFinite(bytes) || bytes <= 0) return '';
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
 export const VideoDownloaderView: React.FC = () => {
   const { notify } = useApp();
   const [videoUrl, setVideoUrl] = useState('');
-  const [readyInfo, setReadyInfo] = useState<{
-    platform: string;
-    cleanUrl: string;
-  } | null>(null);
+  const [extracting, setExtracting] = useState(false);
+  const [extractError, setExtractError] = useState<string | null>(null);
+  const [result, setResult] = useState<ExtractedVideoResponse | null>(null);
 
-  const detectVideoSource = (url: string): string => {
-    const lower = url.toLowerCase();
-    if (lower.includes('shopee') || lower.includes('sv.shopee')) return 'Shopee Video';
-    if (lower.includes('instagram')) return 'Instagram Reels';
-    if (lower.includes('facebook') || lower.includes('fb.watch')) return 'Facebook Video';
-    if (lower.includes('pinterest') || lower.includes('pin.it')) return 'Pinterest Video';
-    return 'Vídeo HD';
-  };
-
-  const handlePrepareDownload = (e: React.FormEvent) => {
+  const handleExtractVideo = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!videoUrl.trim()) return;
-    const source = detectVideoSource(videoUrl);
-    const stripped = videoUrl.trim().split('?')[0];
-    setReadyInfo({
-      platform: source,
-      cleanUrl: stripped,
-    });
-    notify('Link processado!', `${source} pronto para abertura limpa sem parâmetros.`);
+    const trimmed = videoUrl.trim();
+    if (!trimmed || extracting) return;
+
+    setExtracting(true);
+    setExtractError(null);
+    setResult(null);
+
+    try {
+      const res = await extractVideoApi(trimmed);
+      if (!res.ok) {
+        const msg = res.error || 'Não foi possível analisar este link de vídeo.';
+        setExtractError(msg);
+        notify('Não foi possível extrair o vídeo', msg, 'error');
+        return;
+      }
+
+      setResult(res);
+      if (res.canDirectDownload && res.directMp4Url) {
+        notify(
+          'Vídeo pronto para download!',
+          `${res.platformLabel || 'Vídeo'} localizado em MP4.`
+        );
+      } else {
+        notify(
+          'Link analisado',
+          res.note || 'A plataforma restringiu o download direto sem sessão.',
+          'info'
+        );
+      }
+    } catch {
+      const msg = 'Falha de comunicação com o servidor ao analisar o vídeo.';
+      setExtractError(msg);
+      notify('Erro ao extrair vídeo', msg, 'error');
+    } finally {
+      setExtracting(false);
+    }
   };
+
+  const directDownloadHref =
+    result?.canDirectDownload && result.directMp4Url
+      ? buildVideoDownloadUrl(result.directMp4Url, result.title || 'video-oferta', false)
+      : null;
+
+  const inlinePreviewSrc =
+    result?.canDirectDownload && result.directMp4Url
+      ? buildVideoDownloadUrl(result.directMp4Url, result.title || 'video-oferta', true)
+      : null;
+
+  const sizeLabel = formatVideoFileSize(result?.fileSizeBytes);
 
   return (
     <div className="space-y-6 max-w-3xl mx-auto">
@@ -88,14 +132,15 @@ export const VideoDownloaderView: React.FC = () => {
           Download de Vídeos
         </h1>
         <p className="text-sm sm:text-base text-slate-500 dark:text-slate-400 max-w-md mx-auto">
-          Baixe vídeos de qualquer plataforma em alta qualidade sem marca d&apos;água.
+          Cole o link do vídeo para extrair o arquivo MP4 direto pelo servidor, pré-visualizar e
+          baixar pronto para seus grupos.
         </p>
       </div>
 
       {/* Main Input Card */}
       <form
-        onSubmit={handlePrepareDownload}
-        className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 space-y-3"
+        onSubmit={handleExtractVideo}
+        className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 space-y-4"
       >
         <div className="relative">
           <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
@@ -103,87 +148,190 @@ export const VideoDownloaderView: React.FC = () => {
             type="url"
             value={videoUrl}
             onChange={(e) => setVideoUrl(e.target.value)}
-            placeholder="Cole o link do vídeo aqui..."
+            placeholder="Cole o link do vídeo (Shopee, Instagram, Facebook, Pinterest ou .mp4)..."
             className="w-full pl-10 pr-3.5 py-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
           />
         </div>
         <button
           type="submit"
-          disabled={!videoUrl.trim()}
+          disabled={!videoUrl.trim() || extracting}
           className="w-full py-3 rounded-xl bg-[#15803D] hover:bg-emerald-800 disabled:bg-slate-200 dark:disabled:bg-slate-800 disabled:text-slate-400 text-white text-sm font-semibold flex items-center justify-center gap-2 transition-colors"
         >
-          <Download className="w-4 h-4" />
-          <span>Baixar Vídeo</span>
+          {extracting ? (
+            <>
+              <Loader2 className="w-4 h-4 animate-spin" />
+              <span>Analisando vídeo no servidor...</span>
+            </>
+          ) : (
+            <>
+              <Download className="w-4 h-4" />
+              <span>Extrair e Preparar Download</span>
+            </>
+          )}
         </button>
 
-        {readyInfo && (
-          <div className="mt-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="min-w-0">
-              <div className="text-xs font-bold text-[#15803D] dark:text-emerald-400">
-                {readyInfo.platform} detectado (HD · Sem rastreadores)
+        {extractError && (
+          <div className="rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 p-3.5 flex items-start gap-2.5 text-xs sm:text-sm text-rose-800 dark:text-rose-200">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-rose-600 dark:text-rose-400" />
+            <span>{extractError}</span>
+          </div>
+        )}
+
+        {result && result.canDirectDownload && directDownloadHref && inlinePreviewSrc && (
+          <div className="rounded-xl bg-emerald-50/70 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/60 p-4 space-y-3.5">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-xs font-bold text-[#15803D] dark:text-emerald-400">
+                  {result.platformLabel || 'Vídeo MP4'} · Pronto para download
+                  {sizeLabel ? ` (${sizeLabel})` : ''}
+                </div>
+                <div className="text-sm font-semibold text-slate-900 dark:text-white truncate mt-0.5">
+                  {result.title || 'Vídeo extraído'}
+                </div>
               </div>
-              <div className="text-xs font-mono text-slate-600 dark:text-slate-300 truncate mt-0.5">
-                {readyInfo.cleanUrl}
-              </div>
+              <a
+                href={directDownloadHref}
+                download
+                className="px-4 py-2 rounded-xl bg-[#15803D] hover:bg-emerald-800 text-white text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-1.5 shrink-0 whitespace-nowrap"
+              >
+                <Download className="w-4 h-4" />
+                <span>Baixar MP4</span>
+              </a>
             </div>
-            <div className="flex items-center gap-2 shrink-0">
+
+            <div className="rounded-xl overflow-hidden bg-slate-950 border border-slate-200/60 dark:border-slate-800">
+              <video
+                controls
+                playsInline
+                preload="metadata"
+                src={inlinePreviewSrc}
+                className="w-full max-h-80 object-contain mx-auto"
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 onClick={() => {
-                  navigator.clipboard.writeText(readyInfo.cleanUrl);
-                  notify('Link limpo copiado!');
+                  if (result.directMp4Url) {
+                    navigator.clipboard.writeText(result.directMp4Url);
+                    notify('Link MP4 copiado!');
+                  }
                 }}
-                className="px-3 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold flex items-center gap-1"
+                className="px-3 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold inline-flex items-center gap-1.5"
               >
                 <Copy className="w-3.5 h-3.5" />
-                <span>Copiar</span>
+                <span>Copiar link MP4</span>
               </button>
-              <a
-                href={readyInfo.cleanUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="px-3 py-1.5 rounded-lg bg-[#15803D] text-white text-xs font-semibold flex items-center gap-1"
-              >
-                <ExternalLink className="w-3.5 h-3.5" />
-                <span>Abrir Mídia</span>
-              </a>
+              {result.cleanUrl && (
+                <a
+                  href={result.cleanUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-3 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold inline-flex items-center gap-1.5 text-slate-700 dark:text-slate-200"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Abrir original</span>
+                </a>
+              )}
             </div>
+          </div>
+        )}
+
+        {result && !result.canDirectDownload && (
+          <div className="rounded-xl bg-amber-50/80 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 p-4 space-y-3">
+            <div className="flex items-start gap-2.5">
+              <Info className="w-4 h-4 shrink-0 mt-0.5 text-amber-700 dark:text-amber-400" />
+              <div className="min-w-0 space-y-1">
+                <div className="text-xs font-bold text-amber-900 dark:text-amber-200">
+                  {result.platformLabel || 'Plataforma'} · Download direto indisponível para este link
+                </div>
+                <p className="text-xs text-amber-800 dark:text-amber-300 leading-relaxed">
+                  {result.note}
+                </p>
+                {result.cleanUrl && (
+                  <div className="text-xs font-mono text-slate-600 dark:text-slate-300 truncate pt-1">
+                    {result.cleanUrl}
+                  </div>
+                )}
+              </div>
+            </div>
+            {result.cleanUrl && (
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(result.cleanUrl!);
+                    notify('Link limpo copiado!');
+                  }}
+                  className="px-3 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold inline-flex items-center gap-1.5"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>Copiar link limpo</span>
+                </button>
+                <a
+                  href={result.cleanUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-3 py-1.5 rounded-lg bg-[#15803D] hover:bg-emerald-800 text-white text-xs font-semibold inline-flex items-center gap-1.5"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Abrir na plataforma</span>
+                </a>
+              </div>
+            )}
           </div>
         )}
       </form>
 
-      {/* Supported Platforms 2x2 Grid */}
+      {/* Supported Platforms 2x2 Grid (Informational, no bogus URL injection) */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
         {[
-          { name: 'Shopee Video', color: 'text-orange-600 bg-orange-50 dark:bg-orange-950/50' },
-          { name: 'Facebook', color: 'text-sky-600 bg-sky-50 dark:bg-sky-950/50' },
-          { name: 'Instagram', color: 'text-pink-600 bg-pink-50 dark:bg-pink-950/50' },
-          { name: 'Pinterest', color: 'text-rose-600 bg-rose-50 dark:bg-rose-950/50' },
-        ].map((plat) => (
-          <button
-            key={plat.name}
-            type="button"
-            onClick={() =>
-              setVideoUrl(
-                `https://${plat.name.toLowerCase().replace(' ', '')}.com/video/achadinho`
-              )
-            }
-            className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4 flex flex-col items-center justify-center gap-2.5 hover:border-emerald-500/40 transition-colors"
-          >
-            <span
-              className={`w-11 h-11 rounded-full flex items-center justify-center ${plat.color}`}
+          {
+            name: 'Shopee Video',
+            hint: 'sv.shopee / shope.ee',
+            color: 'text-orange-600 bg-orange-50 dark:bg-orange-950/50',
+            icon: ShoppingBag,
+          },
+          {
+            name: 'Facebook',
+            hint: 'fb.watch / reels',
+            color: 'text-sky-600 bg-sky-50 dark:bg-sky-950/50',
+            icon: Film,
+          },
+          {
+            name: 'Instagram',
+            hint: 'Reels públicos',
+            color: 'text-pink-600 bg-pink-50 dark:bg-pink-950/50',
+            icon: ImageIcon,
+          },
+          {
+            name: 'Pinterest / MP4',
+            hint: 'pin.it ou link .mp4',
+            color: 'text-rose-600 bg-rose-50 dark:bg-rose-950/50',
+            icon: Film,
+          },
+        ].map((plat) => {
+          const Icon = plat.icon;
+          return (
+            <div
+              key={plat.name}
+              className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4 flex flex-col items-center justify-center gap-2 text-center"
             >
-              {plat.name === 'Shopee Video' ? (
-                <ShoppingBag className="w-5 h-5" />
-              ) : (
-                <ImageIcon className="w-5 h-5" />
-              )}
-            </span>
-            <span className="text-xs sm:text-sm font-medium text-slate-800 dark:text-slate-100">
-              {plat.name}
-            </span>
-          </button>
-        ))}
+              <span
+                className={`w-11 h-11 rounded-full flex items-center justify-center ${plat.color}`}
+              >
+                <Icon className="w-5 h-5" />
+              </span>
+              <span className="text-xs sm:text-sm font-semibold text-slate-800 dark:text-slate-100">
+                {plat.name}
+              </span>
+              <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                {plat.hint}
+              </span>
+            </div>
+          );
+        })}
       </div>
 
       {/* Vantagens & Instruções */}
@@ -191,12 +339,12 @@ export const VideoDownloaderView: React.FC = () => {
         <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-5 space-y-3">
           <div className="flex items-center gap-2 font-bold text-base text-slate-900 dark:text-white">
             <CheckCircle2 className="w-5 h-5 text-[#15803D] dark:text-emerald-400" />
-            <span>Vantagens</span>
+            <span>Como funciona</span>
           </div>
           <ul className="space-y-2 text-sm text-slate-600 dark:text-slate-300">
-            <li>• Downloads ilimitados para seus grupos de ofertas</li>
-            <li>• Download em alta qualidade para Reels e Status</li>
-            <li>• Remove automaticamente parâmetros e marcas d&apos;água</li>
+            <li>• Extração direta do arquivo MP4 pelo servidor (até 35 MB)</li>
+            <li>• Pré-visualização integrada antes de salvar no aparelho</li>
+            <li>• Também funciona pelo Grupo de Automação usando &ldquo;video: link&rdquo;</li>
           </ul>
         </div>
 
@@ -211,7 +359,7 @@ export const VideoDownloaderView: React.FC = () => {
                 1
               </span>
               <span>
-                <strong>Abra o vídeo</strong> na plataforma original.
+                <strong>Abra o vídeo público</strong> na plataforma original.
               </span>
             </li>
             <li className="flex items-start gap-2.5">
@@ -227,7 +375,7 @@ export const VideoDownloaderView: React.FC = () => {
                 3
               </span>
               <span>
-                <strong>Cole acima</strong> e clique em baixar.
+                <strong>Cole acima</strong>, confira a prévia e clique em <strong>Baixar MP4</strong>.
               </span>
             </li>
           </ol>
