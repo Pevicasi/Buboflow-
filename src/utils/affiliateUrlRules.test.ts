@@ -10,6 +10,9 @@ import {
   extractMercadoLivreProductUrlFromHtml,
   extractShopeeIdsFromUrl,
   interleaveOffersByPlatform,
+  isBlockedOfferForCaptureOrDispatch,
+  isMercadoLivreNonProductSocialOrListUrl,
+  isNonProductGenericTitle,
   isOfficialShortAffiliateLink,
   needsAffiliateReconversion,
   sanitizeShopeeOriginUrl,
@@ -1342,6 +1345,90 @@ test('shieldWhatsAppCurrencyNumbers shields BRL prices with Word Joiners without
 
   // Idempotent when called multiple times
   assert.equal(shieldWhatsAppCurrencyNumbers(shielded), shielded);
+});
+
+test('isMercadoLivreNonProductSocialOrListUrl, isNonProductGenericTitle, and isBlockedOfferForCaptureOrDispatch block ML social profiles/lists while allowing real products', () => {
+  // Exact competitor social/lists URL from user screenshot MUST be flagged as non-product
+  assert.equal(
+    isMercadoLivreNonProductSocialOrListUrl(
+      'https://www.mercadolivre.com.br/social/sabe7011719/lists?matt_tool=vipe6350064&matt_word=vipe6350064'
+    ),
+    true
+  );
+  assert.equal(
+    isMercadoLivreNonProductSocialOrListUrl('https://www.mercadolivre.com.br/social/sabe7011719'),
+    true
+  );
+  assert.equal(
+    isMercadoLivreNonProductSocialOrListUrl('https://www.mercadolivre.com.br/perfil/LOJATESTE'),
+    true
+  );
+  assert.equal(
+    isMercadoLivreNonProductSocialOrListUrl('https://www.mercadolivre.com.br/'),
+    true
+  );
+
+  // Real ML product URLs and official short affiliate links MUST NOT be flagged
+  assert.equal(
+    isMercadoLivreNonProductSocialOrListUrl('https://www.mercadolivre.com.br/lavadora-mondial/p/MLB19603205'),
+    false
+  );
+  assert.equal(
+    isMercadoLivreNonProductSocialOrListUrl('https://meli.la/2b2Fo7z'),
+    false
+  );
+  assert.equal(
+    isMercadoLivreNonProductSocialOrListUrl('https://www.mercadolivre.com.br/sec/2AbCdEf'),
+    false
+  );
+
+  // Generic / profile titles MUST be flagged
+  assert.equal(isNonProductGenericTitle('Perfil social'), true);
+  assert.equal(isNonProductGenericTitle('💥 Perfil social'), true);
+  assert.equal(isNonProductGenericTitle('Perfil social | Mercado Livre'), true);
+  assert.equal(isNonProductGenericTitle('Mercado Livre'), true);
+  assert.equal(isNonProductGenericTitle('Oferta Mercado Livre'), true);
+  assert.equal(isNonProductGenericTitle('Listas'), true);
+  assert.equal(isNonProductGenericTitle('Access Denied'), true);
+  assert.equal(isNonProductGenericTitle('Smart TV Samsung 50" Crystal UHD 4K'), false);
+
+  // Exact broken offer from screenshot MUST be blocked
+  const exactBroken = isBlockedOfferForCaptureOrDispatch({
+    title: 'Perfil social',
+    platform: 'Mercado Livre',
+    originalUrl: 'https://www.mercadolivre.com.br/social/sabe7011719/lists',
+    affiliateUrl:
+      'https://www.mercadolivre.com.br/social/sabe7011719/lists?matt_tool=vipe6350064&matt_word=vipe6350064',
+  });
+  assert.equal(exactBroken.blocked, true);
+
+  // Competitor /social/ link in affiliateUrl MUST be blocked even with a real product title
+  const socialWithRealTitle = isBlockedOfferForCaptureOrDispatch({
+    title: 'Lavadora De Alta Pressão Aqua Power Mondial 1400w',
+    platform: 'Mercado Livre',
+    originalUrl: 'https://www.mercadolivre.com.br/social/spacepechinshow',
+    affiliateUrl:
+      'https://www.mercadolivre.com.br/social/spacepechinshow?matt_tool=vipe6350064&matt_word=vipe6350064',
+  });
+  assert.equal(socialWithRealTitle.blocked, true);
+
+  // Properly unwrapped ML product converted to official short link MUST pass
+  const validMlOffer = isBlockedOfferForCaptureOrDispatch({
+    title: 'Fritadeira Air Fryer Mondial Family 4L Preta',
+    platform: 'Mercado Livre',
+    originalUrl: 'https://www.mercadolivre.com.br/air-fryer-mondial/p/MLB19603205',
+    affiliateUrl: 'https://meli.la/2b2Fo7z',
+  });
+  assert.equal(validMlOffer.blocked, false);
+
+  // Valid Shopee offer MUST pass
+  const validShopeeOffer = isBlockedOfferForCaptureOrDispatch({
+    title: 'Fone Bluetooth TWS Cancelamento de Ruído',
+    platform: 'Shopee',
+    originalUrl: 'https://shopee.com.br/product/123456/789012345',
+    affiliateUrl: 'https://s.shopee.com.br/LouWOMduO',
+  });
+  assert.equal(validShopeeOffer.blocked, false);
 });
 
 

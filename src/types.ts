@@ -9,6 +9,7 @@ export type Marketplace =
 export type NavRoute =
   | 'dashboard'
   | 'whatsapp'
+  | 'teste-status-whatsapp'
   | 'telegram'
   | 'enviar-mensagens'
   | 'produtos'
@@ -131,6 +132,7 @@ export interface MonitoringGroup {
   accountId: string;
   accountName: string;
   remoteJid?: string;
+  username?: string;
   monitored: boolean;
   monitoredSegments?: string[];
   capturedToday: number;
@@ -312,6 +314,29 @@ export interface UserProfile {
   neighborhood: string;
   asaasWalletId: string;
   referralActive: boolean;
+  referralCode?: string;
+}
+
+export interface ReferralEntry {
+  id: string;
+  name: string;
+  email: string;
+  planName: string;
+  planValue: number;
+  monthlyCommission: number;
+  totalCommissionPaid: number;
+  status: 'Ativo' | 'Pendente' | 'Cancelado';
+  createdAt: string;
+  lastPaymentAt?: string;
+  lastPaymentId?: string;
+  source?: 'asaas_webhook' | 'manual';
+}
+
+export interface ReferralProgramData {
+  referralCode: string;
+  clicks: number;
+  referrals: ReferralEntry[];
+  processedPaymentIds?: string[];
 }
 
 export interface ToastMessage {

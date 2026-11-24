@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
 import zlib from 'node:zlib';
+import sharp, { type OverlayOptions } from 'sharp';
 import { fileURLToPath } from 'node:url';
 import {
   makeWASocket,
@@ -25,7 +26,10 @@ import {
   extractMercadoLivrePricingFromHtml,
   extractMercadoLivreProductUrlFromHtml,
   extractShopeeIdsFromUrl,
+  isBlockedOfferForCaptureOrDispatch,
+  isMercadoLivreNonProductSocialOrListUrl,
   isMercadoLivreProductUrl,
+  isNonProductGenericTitle,
   isOfficialShortAffiliateLink,
   needsAffiliateReconversion,
   sanitizeShopeeOriginUrl,
@@ -83,6 +87,16 @@ import {
   sanitizeDownloadFilename,
 } from './src/utils/videoUrlSafety.ts';
 import {
+  derivePinterestMp4CandidatesFromHtml,
+  detectVideoPlatformLabel,
+  extractHtmlRedirectUrl,
+  extractMediaFromHtml,
+  parseInstagramVideoTarget,
+  parseTikTokVideoPath,
+  parseYouTubeVideoId,
+  pickBestCliptoMp4,
+} from './src/utils/videoExtractor.ts';
+import {
   buildAutomationGroupDescription,
   buildAutomationGroupName,
   isBotAutomationReplyText,
@@ -90,6 +104,14 @@ import {
   resolveAutomationGroupJidFromId,
   resolveAutomationSegmentsForGroupJid,
 } from './src/utils/automationCommands.ts';
+import {
+  WHATSAPP_STATUS_THEMES,
+  buildWhatsAppStatusStorySvg,
+  buildWhatsAppStatusTexts,
+  normalizeStatusRecipientJids,
+  type WhatsAppStatusAudienceMode,
+  type WhatsAppStatusFormat,
+} from './src/utils/whatsappStatusLab.ts';
 import {
   INITIAL_AUTO_DISPATCH,
   INITIAL_INTEGRATIONS,
@@ -121,6 +143,31 @@ import {
   isPartnerExclusiveCouponCode,
   resolveEffectiveMlCoupon,
 } from './src/utils/mercadoLivreCoupons.ts';
+import {
+  buildShopeeCommissionAnalytics,
+  normalizeShopeeConversionNode,
+  resolveShopeeCommissionDateRange,
+  summarizeShopeeCommissions,
+  type ShopeeCommissionItem,
+} from './src/utils/shopeeCommissions.ts';
+import {
+  extractTelegramMonitoringMessagesFromUpdates,
+  extractTelegramPublicChannelSubscribers,
+  extractTelegramPublicChannelTitle,
+  normalizeTelegramMonitoringTarget,
+  parseTelegramPublicChannelHtml,
+  type TelegramMonitoredPost,
+} from './src/utils/telegramMonitoring.ts';
+import {
+  REFERRAL_COMMISSION_PERCENT,
+  buildReferralStats,
+  calculateReferralSplit,
+  generateReferralCode,
+  isValidAsaasWalletId,
+  parseAsaasWebhookEvent,
+  sanitizeReferralCode,
+} from './src/utils/referrals.ts';
+import type { ReferralEntry, ReferralProgramData } from './src/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -568,6 +615,14 @@ async function convertMercadoLivreAffiliateLink(
   viaExtension: boolean;
 }> {
   const cleanProductUrl = await resolveCleanMercadoLivreProductUrl(rawUrl, htmlHint);
+  if (isMercadoLivreNonProductSocialOrListUrl(cleanProductUrl)) {
+    return {
+      affiliateUrl: '',
+      cleanProductUrl,
+      officialApi: false,
+      viaExtension: false,
+    };
+  }
   const key = credentials?.mercadoLivre?.extensionKey?.trim();
   const tag = credentials?.mercadoLivre?.etiqueta?.trim();
   const session = resolveMlExtensionSession(key);
@@ -900,8 +955,11 @@ function syncMonitoringGroupCountsFromLiveStats(
   const now = new Date();
   let changed = false;
   const nextMonitoring = state.monitoringGroups.map((m: any) => {
-    if (!m || m.channel !== 'WhatsApp' || !m.remoteJid) return m;
-    const norm = normalizeServerGroupJid(m.remoteJid);
+    if (!m) return m;
+    const rawKey =
+      m.remoteJid || (m.username ? `@${String(m.username).replace(/^@/, '')}` : '');
+    if (!rawKey) return m;
+    const norm = normalizeServerGroupJid(rawKey);
     const canonicalCount = getCanonicalCapturedTodayForGroup(
       norm,
       liveWaStats.capturedByGroupJid,
@@ -953,7 +1011,17 @@ function loadStoredPanelState(): StoredPanelWrapper {
 function stripFictionalFromState(raw: Record<string, any>): Record<string, any> {
   if (!raw || typeof raw !== 'object') return raw;
   const products = Array.isArray(raw.products)
-    ? raw.products.filter((p: any) => p && !FICTIONAL_PRODUCT_IDS.has(String(p.id)))
+    ? raw.products.filter((p: any) => {
+        if (!p || FICTIONAL_PRODUCT_IDS.has(String(p.id))) return false;
+        const check = isBlockedOfferForCaptureOrDispatch(p);
+        if (check.blocked) {
+          console.warn(
+            `[StateSanitizer] Removido item inválido do catálogo (${check.reason}): ${p.title || p.id}`
+          );
+          return false;
+        }
+        return true;
+      })
     : [];
   return { ...raw, products };
 }
@@ -999,10 +1067,15 @@ function saveStoredPanelState(): void {
   }
 }
 
+if (panelStore.hasServerState && panelStore.state) {
+  saveStoredPanelState();
+}
+
 function mergeRealProducts(primary: any[], secondary: any[]): any[] {
   const byKey = new Map<string, any>();
   const addItem = (p: any) => {
     if (!p || FICTIONAL_PRODUCT_IDS.has(String(p.id))) return;
+    if (isBlockedOfferForCaptureOrDispatch(p).blocked) return;
     const segKey = normalizeSegmentName(p.segment).toLowerCase();
     const urlKey = p.originalUrl
       ? `url:${segKey}::${String(p.originalUrl).split('?')[0]}`
@@ -1107,6 +1180,16 @@ interface MonitoredGroupServerConfig {
   allowedMarketplaces: string[] | null;
 }
 
+function matchesMonitoredGroupIdentifier(group: any, normJid: string): boolean {
+  if (!group || !normJid) return false;
+  if (normalizeServerGroupJid(group?.remoteJid) === normJid) return true;
+  if (group?.username) {
+    const handle = `@${String(group.username).replace(/^@/, '').toLowerCase()}`;
+    if (handle === normJid) return true;
+  }
+  return false;
+}
+
 function getMonitoredGroupConfigOnServer(groupJid: string): MonitoredGroupServerConfig {
   const norm = normalizeServerGroupJid(groupJid);
   if (!norm) {
@@ -1117,9 +1200,13 @@ function getMonitoredGroupConfigOnServer(groupJid: string): MonitoredGroupServer
     return { monitored: false, monitoredSegments: [], useGroupImage: false, allowedMarketplaces: null };
   }
 
-  const savedPref = st.savedGroupPrefs?.[`wa:${norm}`];
+  const rawTrim = String(groupJid || '').trim();
+  const savedPref =
+    st.savedGroupPrefs?.[`wa:${norm}`] ||
+    st.savedGroupPrefs?.[`tg:${norm}`] ||
+    (rawTrim ? st.savedGroupPrefs?.[`tg:${rawTrim}`] : undefined);
   const match = Array.isArray(st.monitoringGroups)
-    ? st.monitoringGroups.find((g: any) => normalizeServerGroupJid(g?.remoteJid) === norm)
+    ? st.monitoringGroups.find((g: any) => matchesMonitoredGroupIdentifier(g, norm))
     : null;
 
   const candidateSegments = match
@@ -1311,6 +1398,13 @@ async function processMonitoredGroupMessage(params: {
     try {
       const extracted = await extractOfferFromUrl(targetUrl, credentials, text);
       if (!extracted?.title || !extracted?.affiliateUrl) continue;
+      const monBlockCheck = isBlockedOfferForCaptureOrDispatch(extracted);
+      if (monBlockCheck.blocked) {
+        console.warn(
+          `[Monitoramento] Bloqueado item não-produto (${monBlockCheck.reason}): ${extracted.title} | ${extracted.affiliateUrl}`
+        );
+        continue;
+      }
 
       // Ignore links that do not belong to any supported marketplace (e.g. nike.com.br)
       if (!extracted.knownMarketplace) {
@@ -1489,7 +1583,7 @@ async function processMonitoredGroupMessage(params: {
       const curList = Array.isArray(curState.products) ? curState.products : [];
       const updatedMonitoring = Array.isArray(curState.monitoringGroups)
         ? curState.monitoringGroups.map((m: any) =>
-            normalizeServerGroupJid(m?.remoteJid) === normJid
+            matchesMonitoredGroupIdentifier(m, normJid)
               ? { ...m, capturedToday: todayCount }
               : m
           )
@@ -1516,6 +1610,295 @@ async function processMonitoredGroupMessage(params: {
       console.warn('[Monitoramento] Erro ao capturar oferta:', err?.message || err);
     }
   }
+}
+
+/* ============================================================================
+ * TELEGRAM CHANNEL & GROUP MONITORING ENGINE (Public t.me/s/ + Safe Bot Polling)
+ * ========================================================================== */
+const telegramPublicLastPostId = new Map<string, number>();
+const telegramBotWebhookCache = new Map<string, { checkedAt: number; webhookActive: boolean }>();
+const telegramBotUpdateOffset = new Map<string, number>();
+let telegramMonitorPollRunning = false;
+
+async function fetchTelegramPublicChannelFeed(username: string): Promise<{
+  ok: boolean;
+  title: string;
+  subscribers: number;
+  posts: TelegramMonitoredPost[];
+  error?: string;
+}> {
+  const cleanUser = String(username || '').replace(/^@/, '').trim().toLowerCase();
+  if (!/^[a-z][a-z0-9_]{3,31}$/.test(cleanUser)) {
+    return { ok: false, title: `@${cleanUser}`, subscribers: 0, posts: [], error: 'Username do canal Telegram inválido.' };
+  }
+
+  try {
+    // Hardcoded public Telegram web preview host (prevents arbitrary URL fetching)
+    const feedUrl = `https://t.me/s/${cleanUser}`;
+    const res = await fetch(feedUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+      },
+      signal: AbortSignal.timeout(12000),
+    });
+
+    if (!res.ok) {
+      return {
+        ok: false,
+        title: `@${cleanUser}`,
+        subscribers: 0,
+        posts: [],
+        error: `Não foi possível acessar o canal público @${cleanUser} (HTTP ${res.status}).`,
+      };
+    }
+
+    const html = await res.text();
+    const hasPublicFeed =
+      html.includes('tgme_widget_message_wrap') || html.includes('tgme_channel_info_header_title');
+    if (!hasPublicFeed) {
+      return {
+        ok: false,
+        title: `@${cleanUser}`,
+        subscribers: 0,
+        posts: [],
+        error: `O canal @${cleanUser} não possui visualização pública ativa no Telegram (t.me/s/). Verifique se é um canal público ou informe o Chat ID (-100...) com o bot conectado.`,
+      };
+    }
+
+    return {
+      ok: true,
+      title: extractTelegramPublicChannelTitle(html, cleanUser),
+      subscribers: extractTelegramPublicChannelSubscribers(html),
+      posts: parseTelegramPublicChannelHtml(html, cleanUser),
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      title: `@${cleanUser}`,
+      subscribers: 0,
+      posts: [],
+      error: err?.message || `Falha ao consultar @${cleanUser} no Telegram.`,
+    };
+  }
+}
+
+async function pollMonitoredTelegramChannels(options?: {
+  forceLatestCount?: number;
+}): Promise<{ checkedCount: number; newPostsCount: number }> {
+  if (telegramMonitorPollRunning) return { checkedCount: 0, newPostsCount: 0 };
+  const st = panelStore.state;
+  if (!st || !Array.isArray(st.monitoringGroups)) return { checkedCount: 0, newPostsCount: 0 };
+
+  const activeTelegramTargets = st.monitoringGroups.filter((m: any) => {
+    if (!m || m.channel !== 'Telegram') return false;
+    const key = m.remoteJid || (m.username ? `@${String(m.username).replace(/^@/, '')}` : '');
+    if (!key) return false;
+    return getMonitoredGroupConfigOnServer(key).monitored;
+  });
+
+  if (activeTelegramTargets.length === 0) return { checkedCount: 0, newPostsCount: 0 };
+
+  telegramMonitorPollRunning = true;
+  let checkedCount = 0;
+  let newPostsCount = 0;
+  const forceLatestCount = Math.max(0, Math.min(5, Number(options?.forceLatestCount) || 0));
+
+  try {
+    const publicUsernames = new Set<string>();
+    const numericChatIds = new Set<string>();
+
+    for (const grp of activeTelegramTargets) {
+      const rawKey = String(grp.remoteJid || '').trim();
+      const uname =
+        grp.username
+          ? String(grp.username).replace(/^@/, '').toLowerCase()
+          : rawKey.startsWith('@')
+          ? rawKey.slice(1).toLowerCase()
+          : '';
+      if (uname && /^[a-z][a-z0-9_]{3,31}$/.test(uname)) {
+        publicUsernames.add(uname);
+      } else if (/^-?\d{5,20}$/.test(rawKey)) {
+        numericChatIds.add(rawKey);
+      }
+    }
+
+    // 1. Poll public channels safely via t.me/s/<username> (never touches Bot API webhook)
+    for (const uname of publicUsernames) {
+      checkedCount += 1;
+      const feed = await fetchTelegramPublicChannelFeed(uname);
+      if (!feed.ok || feed.posts.length === 0) continue;
+
+      const channelKey = `@${uname}`;
+      const latestPostId = feed.posts[feed.posts.length - 1].postId;
+      const prevWatermark = telegramPublicLastPostId.get(channelKey);
+
+      let postsToProcess: TelegramMonitoredPost[] = [];
+      if (prevWatermark === undefined) {
+        if (forceLatestCount > 0) {
+          postsToProcess = feed.posts.slice(-forceLatestCount);
+        }
+        telegramPublicLastPostId.set(channelKey, latestPostId);
+      } else {
+        postsToProcess = feed.posts.filter((p) => p.postId > prevWatermark).slice(-10);
+        if (latestPostId > prevWatermark) {
+          telegramPublicLastPostId.set(channelKey, latestPostId);
+        }
+      }
+
+      for (const post of postsToProcess) {
+        newPostsCount += 1;
+        await processMonitoredGroupMessage({
+          groupJid: channelKey,
+          text: post.text,
+          extractedUrls: post.urls,
+          groupImageUrl: post.imageUrl,
+        });
+      }
+    }
+
+    // 2. For numeric -100... Telegram groups, poll getUpdates ONLY if the connected bot has NO external webhook
+    if (numericChatIds.size > 0 && Array.isArray(st.accounts)) {
+      const tgBots = st.accounts.filter(
+        (a: any) => a?.channel === 'Telegram' && a?.connected && String(a?.apiToken || '').trim()
+      );
+      for (const bot of tgBots) {
+        const token = String(bot.apiToken).trim();
+        const cached = telegramBotWebhookCache.get(token);
+        let webhookActive = false;
+        if (cached && Date.now() - cached.checkedAt < 5 * 60_000) {
+          webhookActive = cached.webhookActive;
+        } else {
+          try {
+            const whRes = await fetch(`https://api.telegram.org/bot${token}/getWebhookInfo`, {
+              signal: AbortSignal.timeout(8000),
+            });
+            const whJson = (await whRes.json()) as any;
+            webhookActive = Boolean(whJson?.ok && whJson?.result?.url);
+            telegramBotWebhookCache.set(token, { checkedAt: Date.now(), webhookActive });
+          } catch {
+            webhookActive = true; // Fail safe: avoid conflict if unable to verify
+          }
+        }
+        if (webhookActive) continue;
+
+        try {
+          checkedCount += numericChatIds.size;
+          const offset = telegramBotUpdateOffset.get(token) || 0;
+          const qs = offset > 0 ? `?offset=${offset}&limit=30&timeout=0` : '?limit=30&timeout=0';
+          const upRes = await fetch(`https://api.telegram.org/bot${token}/getUpdates${qs}`, {
+            signal: AbortSignal.timeout(10000),
+          });
+          const upJson = (await upRes.json()) as any;
+          if (!upJson?.ok || !Array.isArray(upJson.result)) continue;
+
+          let maxUpdateId = offset - 1;
+          const incomingMsgs = extractTelegramMonitoringMessagesFromUpdates(upJson.result);
+          for (const rawUpdate of upJson.result) {
+            const uid = Number(rawUpdate?.update_id || 0);
+            if (uid > maxUpdateId) maxUpdateId = uid;
+          }
+          if (maxUpdateId >= offset) {
+            telegramBotUpdateOffset.set(token, maxUpdateId + 1);
+          }
+
+          for (const msg of incomingMsgs) {
+            const targetKey = numericChatIds.has(msg.chatId)
+              ? msg.chatId
+              : msg.chatUsername && getMonitoredGroupConfigOnServer(`@${msg.chatUsername}`).monitored
+              ? `@${msg.chatUsername}`
+              : null;
+            if (!targetKey) continue;
+            newPostsCount += 1;
+            await processMonitoredGroupMessage({
+              groupJid: targetKey,
+              text: msg.text,
+              extractedUrls: msg.urls,
+              groupImageUrl: null,
+            });
+          }
+        } catch {
+          // Ignore transient Bot API polling errors
+        }
+      }
+    }
+  } finally {
+    telegramMonitorPollRunning = false;
+  }
+
+  return { checkedCount, newPostsCount };
+}
+
+/* ============================================================================
+ * ASAAS REFERRAL PROGRAM HELPERS (12% Recurring Split + Verified Webhook)
+ * ========================================================================== */
+function getAsaasApiBaseUrl(): string {
+  const env = String(process.env.ASAAS_ENV || 'production').trim().toLowerCase();
+  return env === 'sandbox' ? 'https://sandbox.asaas.com/api/v3' : 'https://api.asaas.com/api/v3';
+}
+
+function getOrInitReferralData(): ReferralProgramData {
+  if (!panelStore.state || typeof panelStore.state !== 'object') {
+    panelStore.state = {};
+  }
+  const st = panelStore.state;
+  const existing = st.referralData as Partial<ReferralProgramData> | undefined;
+  const profileSeed = st.profile?.referralCode || st.profile?.email || st.profile?.fullName || '';
+  const code =
+    sanitizeReferralCode(existing?.referralCode || st.profile?.referralCode || '') ||
+    generateReferralCode(profileSeed);
+
+  const normalized: ReferralProgramData = {
+    referralCode: code,
+    clicks: Math.max(0, Math.floor(Number(existing?.clicks) || 0)),
+    referrals: Array.isArray(existing?.referrals) ? existing.referrals : [],
+    processedPaymentIds: Array.isArray(existing?.processedPaymentIds)
+      ? existing.processedPaymentIds.slice(-500)
+      : [],
+  };
+
+  st.referralData = normalized;
+  return normalized;
+}
+
+function buildReferralSummaryPayload() {
+  const data = getOrInitReferralData();
+  const profile = panelStore.state?.profile || {};
+  const walletId = String(profile.asaasWalletId || '').trim();
+  const referralActive = Boolean(profile.referralActive && isValidAsaasWalletId(walletId));
+  const asaasEnv =
+    String(process.env.ASAAS_ENV || 'production').trim().toLowerCase() === 'sandbox'
+      ? 'sandbox'
+      : 'production';
+  const splitSample = calculateReferralSplit(100, REFERRAL_COMMISSION_PERCENT, walletId);
+
+  return {
+    ok: true,
+    referralCode: data.referralCode,
+    referralActive,
+    asaasWalletId: walletId,
+    asaasConfigured: Boolean(String(process.env.ASAAS_API_KEY || '').trim()),
+    asaasEnv,
+    webhookConfigured: Boolean(String(process.env.ASAAS_WEBHOOK_TOKEN || '').trim()),
+    commissionPercent: REFERRAL_COMMISSION_PERCENT,
+    clicks: data.clicks,
+    stats: buildReferralStats(data.referrals, data.clicks),
+    referrals: data.referrals,
+    splitConfig: {
+      walletId: walletId || null,
+      percentualValue: REFERRAL_COMMISSION_PERCENT,
+      asaasSplitPayload: splitSample.asaasSplitPayload,
+    },
+  };
+}
+
+function verifyAsaasWebhookToken(providedToken: string, expectedToken: string): boolean {
+  if (!providedToken || !expectedToken) return false;
+  const providedDigest = crypto.createHash('sha256').update(providedToken, 'utf8').digest();
+  const expectedDigest = crypto.createHash('sha256').update(expectedToken, 'utf8').digest();
+  return crypto.timingSafeEqual(providedDigest, expectedDigest);
 }
 
 interface BaileysSessionEntry {
@@ -3844,6 +4227,8 @@ async function extractOfferFromUrl(
   const platform = knownMarketplace || detectMarketplace(finalUrl);
 
   // Unwrap Mercado Livre /social/<competitor> pages to the real clean product URL
+  const landedOnMlSocial =
+    platform === 'Mercado Livre' && isMercadoLivreNonProductSocialOrListUrl(finalUrl);
   let cleanProductUrl = cleanMarketplaceProductUrl(finalUrl, platform);
   if (platform === 'Mercado Livre' && !isMercadoLivreProductUrl(cleanProductUrl) && html) {
     const extractedMlUrl = extractMercadoLivreProductUrlFromHtml(html);
@@ -3852,10 +4237,53 @@ async function extractOfferFromUrl(
     }
   }
 
+  // HARD REJECT: If a Mercado Livre link still points to a /social/, /lists, /perfil, or other
+  // non-product hub after unwrapping, NEVER scrape the competitor's profile avatar or title!
+  if (platform === 'Mercado Livre' && isMercadoLivreNonProductSocialOrListUrl(cleanProductUrl)) {
+    console.warn(
+      `[Extract] Bloqueado link de perfil/lista social do Mercado Livre (sem produto): ${cleanProductUrl}`
+    );
+    return null;
+  }
+
   let title = '';
   let imageUrl = '';
   let discountPrice = 0;
   let originalPrice = 0;
+
+  // If we unwrapped a real product URL out of a competitor's /social/ wrapper page, grab featured
+  // card pricing FIRST, then discard the /social/ HTML and re-fetch the REAL product URL so the
+  // competitor's profile avatar (og:image / D_NQ_NP_...-G.webp) or "Perfil social" og:title NEVER leaks!
+  if (landedOnMlSocial && isMercadoLivreProductUrl(cleanProductUrl)) {
+    if (html) {
+      const socialPricing = extractMercadoLivrePricingFromHtml(html);
+      if (socialPricing.title && !isNonProductGenericTitle(socialPricing.title)) {
+        title = socialPricing.title;
+      }
+      if (socialPricing.discountPrice && socialPricing.discountPrice > 0) {
+        discountPrice = socialPricing.discountPrice;
+      }
+      if (socialPricing.originalPrice && socialPricing.originalPrice > 0) {
+        originalPrice = socialPricing.originalPrice;
+      }
+    }
+    html = '';
+    try {
+      const prodRes = await fetch(cleanProductUrl, {
+        redirect: 'follow',
+        headers: BROWSER_HEADERS,
+        signal: AbortSignal.timeout(7000),
+      });
+      if (prodRes.ok) {
+        const prodLanded = prodRes.url || cleanProductUrl;
+        if (!isMercadoLivreNonProductSocialOrListUrl(prodLanded)) {
+          html = await prodRes.text();
+        }
+      }
+    } catch {
+      // Fall back to ML Items API image lookup & extracted pricing without /social/ HTML
+    }
+  }
 
   const setCandidateImage = (candidate: string) => {
     if (imageUrl) return;
@@ -3869,11 +4297,13 @@ async function extractOfferFromUrl(
     // 0. Mercado Livre structured card extraction (featured card only: clean title, previous_price, current_price, discount_pct)
     if (platform === 'Mercado Livre') {
       const mlPricing = extractMercadoLivrePricingFromHtml(html);
-      if (mlPricing.title) title = mlPricing.title;
-      if (mlPricing.discountPrice && mlPricing.discountPrice > 0) {
+      if (!title && mlPricing.title && !isNonProductGenericTitle(mlPricing.title)) {
+        title = mlPricing.title;
+      }
+      if (!discountPrice && mlPricing.discountPrice && mlPricing.discountPrice > 0) {
         discountPrice = mlPricing.discountPrice;
       }
-      if (mlPricing.originalPrice && mlPricing.originalPrice > 0) {
+      if (!originalPrice && mlPricing.originalPrice && mlPricing.originalPrice > 0) {
         originalPrice = mlPricing.originalPrice;
       }
     }
@@ -4127,6 +4557,19 @@ async function extractOfferFromUrl(
 
   const cleanedTitle = cleanOfferTitle(title) || `Oferta ${platform}`;
   const couponCode = extractCouponFromMessageText(messageTextHint);
+
+  const finalBlockCheck = isBlockedOfferForCaptureOrDispatch({
+    title: cleanedTitle,
+    platform,
+    originalUrl: cleanProductUrl || finalUrl,
+    affiliateUrl,
+  });
+  if (finalBlockCheck.blocked) {
+    console.warn(
+      `[Extract] Oferta bloqueada (${finalBlockCheck.reason}): ${cleanedTitle} | ${affiliateUrl}`
+    );
+    return null;
+  }
 
   return {
     title: cleanedTitle,
@@ -4524,7 +4967,9 @@ async function startServer() {
         const mergedMonitoringGroups = Array.isArray(cur.monitoringGroups) && cur.monitoringGroups.length > 0
           ? cur.monitoringGroups.map((m: any) => {
               const norm = normalizeServerGroupJid(m?.remoteJid);
-              const pref = norm ? mergedPrefs[`wa:${norm}`] : null;
+              const pref = norm
+                ? mergedPrefs[`wa:${norm}`] || mergedPrefs[`tg:${norm}`] || mergedPrefs[`tg:${String(m?.remoteJid || '').trim()}`]
+                : null;
               if (!pref) return m;
               const segs = dedupeSegmentNames([
                 ...getGroupMonitoredSegments(m),
@@ -4638,12 +5083,14 @@ async function startServer() {
         );
       }
 
+      const preservedReferralData = panelStore.state?.referralData;
       panelStore.state = syncMonitoringGroupCountsFromLiveStats(
         reconcilePanelWithActiveMlExtension({
           ...incoming,
           products: finalProducts,
           sentLogs: finalSentLogs,
           totalSentCount: finalTotalSent,
+          ...(preservedReferralData ? { referralData: preservedReferralData } : {}),
         })
       );
       panelStore.hasServerState = true;
@@ -4847,61 +5294,153 @@ async function startServer() {
   });
 
   // --------------------------------------------------------------------------
-  // 1B. SHOPEE OFFICIAL CONVERSION REPORT (Comissões Reais via GraphQL)
+  // 1B. SHOPEE OFFICIAL CONVERSION REPORT (Comissões Reais via GraphQL com Paginação)
   // --------------------------------------------------------------------------
   app.post('/api/platforms/shopee-commissions', async (req, res) => {
     try {
-      const { credentials = {}, days = 7 } = req.body || {};
+      const {
+        credentials = {},
+        period,
+        startDate,
+        endDate,
+        days = 7,
+        maxPages = 10,
+      } = req.body || {};
+
+      const rangeRes = resolveShopeeCommissionDateRange({
+        period: typeof period === 'string' ? period : undefined,
+        startDate: typeof startDate === 'string' ? startDate : undefined,
+        endDate: typeof endDate === 'string' ? endDate : undefined,
+        days: Number(days) || 7,
+      });
+      if (!rangeRes.ok) {
+        return res.status(400).json({ ok: false, error: rangeRes.error });
+      }
+
       const appId = credentials?.shopee?.appId?.trim();
       const secret = credentials?.shopee?.apiSecret?.trim();
       if (!appId || !secret || secret.startsWith('shp_live_98a7')) {
         return res.json({
           ok: false,
+          range: rangeRes.range,
           error:
             'Configure seu App ID e Senha API oficiais da Shopee em Configurações → Plataformas para puxar suas conversões reais.',
         });
       }
 
-      const nowSec = Math.floor(Date.now() / 1000);
-      const startSec = nowSec - Number(days || 7) * 86400;
-      const data = await callShopeeGraphql(appId, secret, {
-        query: `query($start: Int!, $end: Int!) {
-          conversionReport(purchaseTimeStart: $start, purchaseTimeEnd: $end, limit: 25) {
-            nodes {
-              conversionId
-              orderStatus
-              totalCommission
-              orders {
-                orderId
-                items {
-                  itemName
-                  qty
-                  itemCommission
-                }
-              }
+      const safeStart = Math.trunc(rangeRes.range.startSec);
+      const safeEnd = Math.trunc(rangeRes.range.endSec);
+      if (!Number.isSafeInteger(safeStart) || !Number.isSafeInteger(safeEnd)) {
+        return res.status(400).json({ ok: false, error: 'Intervalo de datas inválido.' });
+      }
+
+      const pageCap = Math.max(1, Math.min(10, Number(maxPages) || 10));
+      const allNodes: any[] = [];
+      let scrollId: string | null = null;
+      let hasMore = false;
+      let pagesFetched = 0;
+
+      // Note: Shopee Affiliate GraphQL requires Int64 literals inline for purchaseTimeStart/End
+      // (passing $start as GraphQL Int! or JSON variable triggers code 10010 "wrong type").
+      const selectionFields = `
+        nodes {
+          conversionId
+          conversionStatus
+          purchaseTime
+          netCommission
+          totalCommission
+          shopeeCommissionCapped
+          sellerCommission
+          utmContent
+          orders {
+            orderId
+            orderStatus
+            items {
+              shopId
+              itemId
+              itemName
+              itemPrice
+              actualAmount
+              qty
+              imageUrl
+              itemCommission
+              itemTotalCommission
+              itemShopeeCommissionCapped
+              itemSellerCommission
+              itemShopeeCommissionRate
+              itemSellerCommissionRate
+              globalCategoryLv1Name
+              categoryLv1Name
+              attributionType
+              displayItemStatus
             }
           }
-        }`,
-        variables: { start: startSec, end: nowSec },
-      });
+        }
+        pageInfo {
+          limit
+          hasNextPage
+          scrollId
+        }
+      `;
 
-      const nodes = data?.conversionReport?.nodes || [];
-      const conversions = nodes.map((n: any, idx: number) => {
-        const firstOrder = n.orders?.[0];
-        const firstItem = firstOrder?.items?.[0];
-        return {
-          id: String(n.conversionId || firstOrder?.orderId || `conv-${idx}`),
-          product: firstItem?.itemName || `Pedido Shopee #${firstOrder?.orderId || idx + 1}`,
-          qty: Number(firstItem?.qty || 1),
-          commission: parseFloat(String(n.totalCommission || firstItem?.itemCommission || '0')) || 0,
-          status:
-            String(n.orderStatus).toUpperCase().includes('COMPLETE') ? 'Aprovada' : 'Pendente',
-        };
-      });
+      for (let page = 0; page < pageCap; page += 1) {
+        const queryBody = scrollId
+          ? `query($scrollId: String) {
+              conversionReport(purchaseTimeStart: ${safeStart}, purchaseTimeEnd: ${safeEnd}, limit: 50, scrollId: $scrollId) {
+                ${selectionFields}
+              }
+            }`
+          : `{
+              conversionReport(purchaseTimeStart: ${safeStart}, purchaseTimeEnd: ${safeEnd}, limit: 50) {
+                ${selectionFields}
+              }
+            }`;
 
-      res.json({ ok: true, conversions });
+        const reportData = await callShopeeGraphql(
+          appId,
+          secret,
+          scrollId ? { query: queryBody, variables: { scrollId } } : { query: queryBody }
+        );
+
+        const report = reportData?.conversionReport;
+        const pageNodes = Array.isArray(report?.nodes) ? report.nodes : [];
+        allNodes.push(...pageNodes);
+        pagesFetched += 1;
+
+        const nextScroll = report?.pageInfo?.scrollId ? String(report.pageInfo.scrollId).trim() : null;
+        const pageHasNext = Boolean(report?.pageInfo?.hasNextPage);
+        if (!pageHasNext || !nextScroll || nextScroll === scrollId || pageNodes.length === 0) {
+          hasMore = false;
+          break;
+        }
+        scrollId = nextScroll;
+        hasMore = page === pageCap - 1;
+      }
+
+      // Deduplicate by conversionId/orderId preserving order
+      const seenIds = new Set<string>();
+      const conversions: ShopeeCommissionItem[] = [];
+      for (let i = 0; i < allNodes.length; i += 1) {
+        const item = normalizeShopeeConversionNode(allNodes[i], i);
+        if (seenIds.has(item.id)) continue;
+        seenIds.add(item.id);
+        conversions.push(item);
+      }
+
+      const summary = summarizeShopeeCommissions(conversions);
+      const analytics = buildShopeeCommissionAnalytics(conversions);
+      res.json({
+        ok: true,
+        conversions,
+        summary,
+        analytics,
+        range: rangeRes.range,
+        pagesFetched,
+        hasMore,
+        syncedAt: new Date().toISOString(),
+      });
     } catch (err: any) {
-      res.json({ ok: false, error: err.message });
+      res.json({ ok: false, error: err?.message || 'Erro ao consultar comissões na Shopee.' });
     }
   });
 
@@ -5057,6 +5596,13 @@ async function startServer() {
         return res.status(400).json({ ok: false, error: 'Informe um link válido.' });
       }
       const extracted = await extractOfferFromUrl(url.trim(), credentials);
+      if (!extracted) {
+        return res.status(422).json({
+          ok: false,
+          error:
+            'Este link aponta para um perfil social, lista ou página que não é um produto válido.',
+        });
+      }
       res.json({ ok: true, offer: extracted });
     } catch (err: any) {
       res.status(500).json({
@@ -5094,6 +5640,16 @@ async function startServer() {
       // Mercado Livre: ALWAYS unwrap /sec/, meli.la, and /social/<competitor> to clean product URL BEFORE createLink
       if (initialPlatform === 'Mercado Livre') {
         const mlConv = await convertMercadoLivreAffiliateLink(originalInput, mergedCredentials);
+        if (
+          !mlConv.affiliateUrl ||
+          isMercadoLivreNonProductSocialOrListUrl(mlConv.cleanProductUrl)
+        ) {
+          return res.status(422).json({
+            ok: false,
+            error:
+              'Este link aponta para um perfil social ou lista do Mercado Livre, não para um produto específico.',
+          });
+        }
         return res.json({
           ok: true,
           platform: 'Mercado Livre',
@@ -5120,6 +5676,16 @@ async function startServer() {
 
       if (detected === 'Mercado Livre') {
         const mlConv = await convertMercadoLivreAffiliateLink(resolvedUrl, mergedCredentials);
+        if (
+          !mlConv.affiliateUrl ||
+          isMercadoLivreNonProductSocialOrListUrl(mlConv.cleanProductUrl)
+        ) {
+          return res.status(422).json({
+            ok: false,
+            error:
+              'Este link aponta para um perfil social ou lista do Mercado Livre, não para um produto específico.',
+          });
+        }
         return res.json({
           ok: true,
           platform: 'Mercado Livre',
@@ -5933,6 +6499,434 @@ async function startServer() {
   });
 
   // --------------------------------------------------------------------------
+  // 4B. TELEGRAM MONITORING (Canais Públicos t.me/s/ & Grupos Monitorados)
+  // --------------------------------------------------------------------------
+  app.post('/api/telegram/monitoring/add', async (req, res) => {
+    try {
+      const { target = '', customName = '' } = req.body || {};
+      const parsed = normalizeTelegramMonitoringTarget(String(target || ''));
+      if (!parsed) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            'Informe um canal público válido (@nomedocanal ou https://t.me/nomedocanal) ou um Chat ID numérico (-100...). Links de convite privado (+...) não suportam leitura pública.',
+        });
+      }
+
+      if (parsed.type === 'public_channel' && parsed.username) {
+        const feed = await fetchTelegramPublicChannelFeed(parsed.username);
+        if (!feed.ok) {
+          return res.status(400).json({ ok: false, error: feed.error });
+        }
+        return res.json({
+          ok: true,
+          group: {
+            name: String(customName || '').trim() || feed.title,
+            remoteJid: parsed.remoteJid,
+            username: parsed.username,
+            subscribers: feed.subscribers,
+            sourceType: 'public_channel',
+            previewPostsCount: feed.posts.length,
+          },
+        });
+      }
+
+      // Numeric Chat ID (-100...) — try resolving title via any connected Telegram bot
+      let resolvedTitle = String(customName || '').trim() || `Grupo Telegram ${parsed.remoteJid}`;
+      let resolvedUsername: string | undefined;
+      let resolvedSubscribers = 0;
+
+      const tgAccounts = Array.isArray(panelStore.state?.accounts)
+        ? panelStore.state.accounts.filter(
+            (a: any) => a?.channel === 'Telegram' && a?.connected && String(a?.apiToken || '').trim()
+          )
+        : [];
+
+      for (const acc of tgAccounts) {
+        try {
+          const token = String(acc.apiToken).trim();
+          const chatRes = await fetch(
+            `https://api.telegram.org/bot${token}/getChat?chat_id=${encodeURIComponent(parsed.remoteJid)}`,
+            { signal: AbortSignal.timeout(8000) }
+          );
+          const chatJson = (await chatRes.json()) as any;
+          if (chatJson?.ok && chatJson.result) {
+            if (!String(customName || '').trim() && chatJson.result.title) {
+              resolvedTitle = String(chatJson.result.title);
+            }
+            if (chatJson.result.username) {
+              resolvedUsername = String(chatJson.result.username).toLowerCase();
+            }
+            break;
+          }
+        } catch {
+          // Try next bot if available
+        }
+      }
+
+      res.json({
+        ok: true,
+        group: {
+          name: resolvedTitle,
+          remoteJid: parsed.remoteJid,
+          username: resolvedUsername,
+          subscribers: resolvedSubscribers,
+          sourceType: 'chat_id',
+        },
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Erro ao validar canal do Telegram.' });
+    }
+  });
+
+  app.post('/api/telegram/monitoring/check-now', async (req, res) => {
+    try {
+      const captureRecentCount = Math.max(0, Math.min(5, Number(req.body?.captureRecentCount) || 0));
+      const result = await pollMonitoredTelegramChannels({ forceLatestCount: captureRecentCount });
+      res.json({
+        ok: true,
+        checkedCount: result.checkedCount,
+        newPostsCount: result.newPostsCount,
+        version: panelStore.version,
+        state: panelStore.state,
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Erro ao verificar canais do Telegram.' });
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // 4C. ASAAS REFERRAL PROGRAM (Link de Indicação, Split 12% & Webhook)
+  // --------------------------------------------------------------------------
+  app.get('/r/:code', (req, res) => {
+    const cleanCode = sanitizeReferralCode(String(req.params?.code || ''));
+    if (cleanCode) {
+      const data = getOrInitReferralData();
+      if (
+        panelStore.state?.profile?.referralActive &&
+        data.referralCode.toLowerCase() === cleanCode.toLowerCase()
+      ) {
+        data.clicks = (Number(data.clicks) || 0) + 1;
+        panelStore.hasServerState = true;
+        panelStore.version += 1;
+        panelStore.updatedAt = new Date().toISOString();
+        saveStoredPanelState();
+      }
+      return res.redirect(302, `/?ref=${encodeURIComponent(cleanCode)}`);
+    }
+    return res.redirect(302, '/');
+  });
+
+  app.get('/api/referrals/summary', (_req, res) => {
+    try {
+      res.json(buildReferralSummaryPayload());
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Erro ao carregar indicações.' });
+    }
+  });
+
+  app.post('/api/referrals/activate', async (req, res) => {
+    try {
+      const { walletId = '', referralCode = '', acceptedTerms = false } = req.body || {};
+      const cleanWallet = String(walletId || '').trim();
+      if (!isValidAsaasWalletId(cleanWallet)) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            'Wallet ID Asaas inválido. Use o UUID completo da sua conta Asaas (ex: 123e4567-e89b-12d3-a456-426614174000).',
+        });
+      }
+      if (!acceptedTerms) {
+        return res.status(400).json({
+          ok: false,
+          error: 'É necessário aceitar os Termos do Programa de Indicações antes de ativar.',
+        });
+      }
+
+      const data = getOrInitReferralData();
+      const requestedCode = String(referralCode || '').trim();
+      if (requestedCode) {
+        const sanitized = sanitizeReferralCode(requestedCode);
+        if (sanitized.length < 3) {
+          return res.status(400).json({
+            ok: false,
+            error: 'O código de indicação precisa ter pelo menos 3 caracteres alfanuméricos.',
+          });
+        }
+        data.referralCode = sanitized;
+      }
+
+      let asaasVerified = false;
+      let asaasVerificationNote = '';
+      const apiKey = String(process.env.ASAAS_API_KEY || '').trim();
+      if (apiKey) {
+        try {
+          const checkRes = await fetch(`${getAsaasApiBaseUrl()}/myAccount/status`, {
+            headers: {
+              access_token: apiKey,
+              'User-Agent': 'BuboFlow/1.0',
+            },
+            signal: AbortSignal.timeout(8000),
+          });
+          if (checkRes.ok) {
+            asaasVerified = true;
+            asaasVerificationNote = 'Conexão com a API Asaas confirmada.';
+          } else {
+            asaasVerificationNote = `Chave ASAAS_API_KEY respondeu com HTTP ${checkRes.status}.`;
+          }
+        } catch {
+          asaasVerificationNote = 'Não foi possível validar a conta Asaas agora; configuração salva.';
+        }
+      }
+
+      panelStore.state = {
+        ...(panelStore.state || {}),
+        profile: {
+          ...(panelStore.state?.profile || {}),
+          asaasWalletId: cleanWallet,
+          referralActive: true,
+          referralCode: data.referralCode,
+        },
+        referralData: data,
+      };
+      panelStore.hasServerState = true;
+      panelStore.version += 1;
+      panelStore.updatedAt = new Date().toISOString();
+      saveStoredPanelState();
+
+      res.json({
+        ...buildReferralSummaryPayload(),
+        asaasVerified,
+        asaasVerificationNote,
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Erro ao ativar programa de indicações.' });
+    }
+  });
+
+  app.post('/api/referrals/record', (req, res) => {
+    try {
+      const {
+        id,
+        name = '',
+        email = '',
+        planName = 'Plano Pro',
+        planValue,
+        status = 'Pendente',
+        totalCommissionPaid,
+      } = req.body || {};
+
+      const cleanName = String(name || '').trim().slice(0, 120);
+      if (!cleanName) {
+        return res.status(400).json({ ok: false, error: 'Informe o nome do indicado.' });
+      }
+      const cleanEmail = String(email || '').trim().slice(0, 160);
+      const cleanPlan = String(planName || 'Plano Pro').trim().slice(0, 80) || 'Plano Pro';
+      const numericPlanValue = Number(planValue);
+      if (!Number.isFinite(numericPlanValue) || numericPlanValue <= 0 || numericPlanValue > 100000) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Informe um valor de mensalidade válido (maior que zero).',
+        });
+      }
+      const validStatus: ReferralEntry['status'] =
+        status === 'Ativo' || status === 'Cancelado' ? status : 'Pendente';
+
+      const data = getOrInitReferralData();
+      const monthlyCommission = calculateReferralSplit(
+        numericPlanValue,
+        REFERRAL_COMMISSION_PERCENT
+      ).commissionValue;
+
+      const existingIdx = id
+        ? data.referrals.findIndex((r) => r.id === String(id))
+        : -1;
+
+      const nowIso = new Date().toISOString();
+      if (existingIdx >= 0) {
+        const prev = data.referrals[existingIdx];
+        const becameActive = prev.status !== 'Ativo' && validStatus === 'Ativo';
+        const computedTotalPaid =
+          typeof totalCommissionPaid === 'number' && Number.isFinite(totalCommissionPaid) && totalCommissionPaid >= 0
+            ? Number(totalCommissionPaid.toFixed(2))
+            : becameActive && (Number(prev.totalCommissionPaid) || 0) === 0
+            ? monthlyCommission
+            : Number(prev.totalCommissionPaid) || 0;
+
+        data.referrals[existingIdx] = {
+          ...prev,
+          name: cleanName,
+          email: cleanEmail,
+          planName: cleanPlan,
+          planValue: Number(numericPlanValue.toFixed(2)),
+          monthlyCommission,
+          totalCommissionPaid: computedTotalPaid,
+          status: validStatus,
+          lastPaymentAt: becameActive ? nowIso : prev.lastPaymentAt,
+        };
+      } else {
+        const initialPaid =
+          typeof totalCommissionPaid === 'number' && Number.isFinite(totalCommissionPaid) && totalCommissionPaid >= 0
+            ? Number(totalCommissionPaid.toFixed(2))
+            : validStatus === 'Ativo'
+            ? monthlyCommission
+            : 0;
+        const entry: ReferralEntry = {
+          id: `ref-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          name: cleanName,
+          email: cleanEmail,
+          planName: cleanPlan,
+          planValue: Number(numericPlanValue.toFixed(2)),
+          monthlyCommission,
+          totalCommissionPaid: initialPaid,
+          status: validStatus,
+          createdAt: nowIso,
+          lastPaymentAt: validStatus === 'Ativo' ? nowIso : undefined,
+          source: 'manual',
+        };
+        data.referrals = [entry, ...data.referrals];
+      }
+
+      panelStore.hasServerState = true;
+      panelStore.version += 1;
+      panelStore.updatedAt = nowIso;
+      saveStoredPanelState();
+
+      res.json(buildReferralSummaryPayload());
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Erro ao salvar indicado.' });
+    }
+  });
+
+  app.delete('/api/referrals/record/:id', (req, res) => {
+    try {
+      const targetId = String(req.params?.id || '').trim();
+      if (!targetId) {
+        return res.status(400).json({ ok: false, error: 'ID inválido.' });
+      }
+      const data = getOrInitReferralData();
+      const before = data.referrals.length;
+      data.referrals = data.referrals.filter((r) => r.id !== targetId);
+      if (data.referrals.length !== before) {
+        panelStore.hasServerState = true;
+        panelStore.version += 1;
+        panelStore.updatedAt = new Date().toISOString();
+        saveStoredPanelState();
+      }
+      res.json(buildReferralSummaryPayload());
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Erro ao remover indicado.' });
+    }
+  });
+
+  app.post('/api/referrals/asaas-webhook', (req, res) => {
+    try {
+      const expectedToken = String(process.env.ASAAS_WEBHOOK_TOKEN || '').trim();
+      if (!expectedToken) {
+        return res.status(503).json({
+          ok: false,
+          error:
+            'Webhook Asaas desabilitado: defina a variável de ambiente ASAAS_WEBHOOK_TOKEN no servidor.',
+        });
+      }
+
+      const providedToken = String(req.header('asaas-access-token') || '').trim();
+      if (!verifyAsaasWebhookToken(providedToken, expectedToken)) {
+        return res.status(401).json({ ok: false, error: 'Token de autenticação Asaas inválido.' });
+      }
+
+      const walletId = String(panelStore.state?.profile?.asaasWalletId || '').trim();
+      const parsed = parseAsaasWebhookEvent(req.body, walletId);
+      if (!parsed) {
+        return res.status(400).json({ ok: false, error: 'Payload de evento Asaas inválido.' });
+      }
+
+      const data = getOrInitReferralData();
+      const processedSet = new Set(data.processedPaymentIds || []);
+      const dedupeKey = `${parsed.event}:${parsed.paymentId}`;
+      if (processedSet.has(dedupeKey)) {
+        return res.json({
+          ok: true,
+          processed: false,
+          duplicate: true,
+          paymentId: parsed.paymentId,
+        });
+      }
+
+      const nowIso = new Date().toISOString();
+      const matchIdx = data.referrals.findIndex(
+        (r) =>
+          (parsed.customerEmail &&
+            r.email &&
+            r.email.toLowerCase() === parsed.customerEmail.toLowerCase()) ||
+          (parsed.customerId && r.id === `asaas-${parsed.customerId}`)
+      );
+
+      let commissionCredited = 0;
+      const monthlyCommission =
+        parsed.commissionValue > 0
+          ? parsed.commissionValue
+          : calculateReferralSplit(parsed.paymentValue, REFERRAL_COMMISSION_PERCENT).commissionValue;
+
+      if (matchIdx >= 0) {
+        const cur = data.referrals[matchIdx];
+        if (parsed.shouldCreditCommission) {
+          commissionCredited = monthlyCommission;
+        }
+        data.referrals[matchIdx] = {
+          ...cur,
+          planValue: parsed.paymentValue > 0 ? parsed.paymentValue : cur.planValue,
+          monthlyCommission,
+          totalCommissionPaid: Number(
+            ((Number(cur.totalCommissionPaid) || 0) + commissionCredited).toFixed(2)
+          ),
+          status: parsed.nextStatus,
+          lastPaymentAt: nowIso,
+          lastPaymentId: parsed.paymentId,
+          source: 'asaas_webhook',
+        };
+      } else {
+        if (parsed.shouldCreditCommission) {
+          commissionCredited = monthlyCommission;
+        }
+        const entry: ReferralEntry = {
+          id: parsed.customerId ? `asaas-${parsed.customerId}` : `asaas-${parsed.paymentId}`,
+          name: parsed.customerName || 'Assinante Asaas',
+          email: parsed.customerEmail || '',
+          planName: 'Assinatura Asaas',
+          planValue: parsed.paymentValue,
+          monthlyCommission,
+          totalCommissionPaid: commissionCredited,
+          status: parsed.nextStatus,
+          createdAt: nowIso,
+          lastPaymentAt: nowIso,
+          lastPaymentId: parsed.paymentId,
+          source: 'asaas_webhook',
+        };
+        data.referrals = [entry, ...data.referrals];
+      }
+
+      processedSet.add(dedupeKey);
+      data.processedPaymentIds = Array.from(processedSet).slice(-500);
+
+      panelStore.hasServerState = true;
+      panelStore.version += 1;
+      panelStore.updatedAt = nowIso;
+      saveStoredPanelState();
+
+      res.json({
+        ok: true,
+        processed: true,
+        paymentId: parsed.paymentId,
+        status: parsed.nextStatus,
+        commissionCredited,
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Erro ao processar webhook Asaas.' });
+    }
+  });
+
+  // --------------------------------------------------------------------------
   // 5. WHATSAPP INTEGRATION (Native Baileys QR/Phone Pairing + Evolution/Z-API)
   // --------------------------------------------------------------------------
   app.get('/api/whatsapp/baileys/sessions', (_req, res) => {
@@ -6566,6 +7560,146 @@ async function startServer() {
     };
   }
 
+  async function renderOfferStatusStoryBuffer(params: {
+    title: string;
+    platform?: string;
+    originalPrice?: number;
+    discountPrice: number;
+    discountPercent?: number;
+    couponCode?: string;
+    imageUrl?: string;
+    themeColor?: string;
+    calloutText?: string;
+  }): Promise<Buffer> {
+    let productSquareBuf: Buffer | null = null;
+    if (params.imageUrl) {
+      try {
+        const rawBuf = await loadImageBuffer(String(params.imageUrl));
+        if (rawBuf) {
+          const white = { r: 255, g: 255, b: 255, alpha: 1 };
+          productSquareBuf = await sharp(rawBuf, { failOn: 'none' })
+            .rotate()
+            .flatten({ background: white })
+            .resize({
+              width: 680,
+              height: 680,
+              fit: 'contain',
+              position: 'centre',
+              background: white,
+              withoutEnlargement: false,
+              kernel: sharp.kernel.lanczos3,
+            })
+            .png()
+            .toBuffer();
+        }
+      } catch {
+        productSquareBuf = null;
+      }
+    }
+
+    const svg = buildWhatsAppStatusStorySvg({
+      title: params.title,
+      platform: params.platform,
+      originalPrice: params.originalPrice,
+      discountPrice: params.discountPrice,
+      discountPercent: params.discountPercent,
+      couponCode: params.couponCode,
+      themeColor: params.themeColor,
+      calloutText: params.calloutText,
+      hasProductPhoto: Boolean(productSquareBuf),
+    });
+
+    const baseRaster = await sharp(Buffer.from(svg)).png().toBuffer();
+    const composites: OverlayOptions[] = [];
+
+    if (productSquareBuf) {
+      composites.push({
+        input: productSquareBuf,
+        left: 200,
+        top: 465,
+      });
+    }
+
+    const disc = Number(params.discountPrice) || 0;
+    const orig = Number(params.originalPrice) || 0;
+    const pct =
+      Number(params.discountPercent) > 0
+        ? Math.round(Number(params.discountPercent))
+        : orig > disc && disc > 0
+        ? Math.round(((orig - disc) / orig) * 100)
+        : 0;
+
+    if (pct > 0) {
+      const badgeSvg = `<svg width="240" height="76" xmlns="http://www.w3.org/2000/svg">
+        <rect width="240" height="76" rx="18" fill="#EA580C" />
+        <text x="120" y="50" text-anchor="middle" font-family="Liberation Sans, DejaVu Sans, sans-serif" font-size="36" font-weight="bold" fill="#FFFFFF">${pct}% OFF</text>
+      </svg>`;
+      composites.push({
+        input: await sharp(Buffer.from(badgeSvg)).png().toBuffer(),
+        left: 695,
+        top: 424,
+      });
+    }
+
+    return sharp(baseRaster)
+      .composite(composites)
+      .jpeg({ quality: 88, mozjpeg: true })
+      .toBuffer();
+  }
+
+  async function resolveStatusTestAudienceJids(params: {
+    session: BaileysSessionEntry;
+    audienceMode: WhatsAppStatusAudienceMode;
+    testPhones?: string[];
+    testGroupJid?: string;
+  }): Promise<string[]> {
+    const sock = params.session.sock;
+    const selfJids: string[] = [];
+    if (sock?.user?.id) selfJids.push(String(sock.user.id));
+    if (sock?.user?.lid) selfJids.push(String(sock.user.lid));
+
+    if (params.audienceMode === 'self_and_test') {
+      for (const s of baileysSessions.values()) {
+        if (s.status === 'open' && s.sock?.user?.id) {
+          selfJids.push(String(s.sock.user.id));
+        }
+      }
+      return normalizeStatusRecipientJids({
+        selfJids,
+        rawPhones: params.testPhones || [],
+      });
+    }
+
+    const extraJids: string[] = [];
+    if (params.audienceMode === 'test_group' && params.testGroupJid && sock) {
+      try {
+        const meta = await sock.groupMetadata(params.testGroupJid);
+        for (const p of meta?.participants || []) {
+          if (p?.id) extraJids.push(String(p.id));
+        }
+      } catch {
+        // fallback to selfJids + testPhones
+      }
+    } else if (params.audienceMode === 'all_group_contacts' && sock) {
+      try {
+        const participating = await sock.groupFetchAllParticipating();
+        for (const g of Object.values(participating || {}) as any[]) {
+          for (const p of g?.participants || []) {
+            if (p?.id) extraJids.push(String(p.id));
+          }
+        }
+      } catch {
+        // fallback to selfJids + testPhones
+      }
+    }
+
+    return normalizeStatusRecipientJids({
+      selfJids,
+      rawPhones: params.testPhones || [],
+      extraJids,
+    });
+  }
+
   interface AutoDispatchSegmentRuntime {
     running: boolean;
     nextRunAt: number;
@@ -6777,12 +7911,18 @@ async function startServer() {
             );
             if (
               extracted?.affiliateUrl &&
-              !/mercadolivre\.com\.br\/social\//i.test(extracted.affiliateUrl)
+              !isMercadoLivreNonProductSocialOrListUrl(extracted.affiliateUrl)
             ) {
               prod = {
                 ...prod,
                 affiliateUrl: extracted.affiliateUrl,
                 originalUrl: extracted.originalUrl || prod.originalUrl,
+                ...(extracted.title && !isNonProductGenericTitle(extracted.title) && isNonProductGenericTitle(prod.title)
+                  ? { title: extracted.title }
+                  : {}),
+                ...(extracted.imageUrl && isNonProductGenericTitle(prod.title)
+                  ? { customImageUrl: extracted.imageUrl }
+                  : {}),
               };
               const curProducts = Array.isArray(panelStore.state?.products)
                 ? panelStore.state.products
@@ -6793,8 +7933,28 @@ async function startServer() {
               };
             }
           } catch {
-            // Proceed with existing affiliate link
+            // Proceed to strict pre-dispatch validation gate
           }
+        }
+
+        // HARD PRE-DISPATCH SAFETY GATE: Never send social profiles, lists, or generic non-product items
+        const dispatchBlockCheck = isBlockedOfferForCaptureOrDispatch(prod);
+        if (dispatchBlockCheck.blocked) {
+          console.warn(
+            `[AutoDispatch] Bloqueado e removido item inválido (${dispatchBlockCheck.reason}): ${prod.title} | ${prod.affiliateUrl}`
+          );
+          const curProducts = Array.isArray(panelStore.state?.products)
+            ? panelStore.state.products
+            : [];
+          panelStore.state = {
+            ...panelStore.state,
+            products: curProducts.filter((p: any) => p.id !== prod.id),
+          };
+          panelStore.version += 1;
+          panelStore.updatedAt = new Date().toISOString();
+          saveStoredPanelState();
+          lastError = dispatchBlockCheck.reason;
+          continue;
         }
 
         // Validate & clean expired/invalid Mercado Livre coupons right before rendering
@@ -7044,6 +8204,25 @@ async function startServer() {
     error?: string;
   }> {
     const st = panelStore.state || {};
+    if (params.affiliateUrl || params.platform) {
+      const gate = isBlockedOfferForCaptureOrDispatch({
+        title: params.title,
+        platform: params.platform,
+        affiliateUrl: params.affiliateUrl,
+      });
+      if (gate.blocked || /mercadolivre\.com\.br\/social\//i.test(params.message || '')) {
+        const reason =
+          gate.reason ||
+          'Mensagem bloqueada por conter link de perfil social/lista do Mercado Livre.';
+        console.warn(`[DispatchGate] ${reason} (${params.title})`);
+        return {
+          ok: false,
+          sentCount: 0,
+          deliveredGroupNames: [],
+          error: reason,
+        };
+      }
+    }
     const targetSegment = normalizeSegmentName(params.segment);
     const accounts: any[] = Array.isArray(st.accounts) ? st.accounts : [];
     const openBaileysIds = Array.from(baileysSessions.values())
@@ -7317,19 +8496,7 @@ async function startServer() {
     error?: string;
   }> {
     const shouldDownloadBuffer = options?.downloadBuffer !== false;
-    const lower = rawUrl.toLowerCase();
-    const platformLabel =
-      lower.includes('shopee') || lower.includes('sv.shopee') || lower.includes('shp.ee')
-        ? 'Shopee Video'
-        : lower.includes('instagram')
-        ? 'Instagram Reels'
-        : lower.includes('tiktok')
-        ? 'TikTok'
-        : lower.includes('facebook') || lower.includes('fb.watch')
-        ? 'Facebook Video'
-        : lower.includes('pinterest') || lower.includes('pin.it')
-        ? 'Pinterest Video'
-        : 'Vídeo';
+    const platformLabel = detectVideoPlatformLabel(rawUrl);
 
     let finalUrl = rawUrl.trim();
     let directMp4Url: string | null = /\.(mp4|webm|mov)(\?|$)/i.test(finalUrl) ? finalUrl : null;
@@ -7338,74 +8505,538 @@ async function startServer() {
     let title = '';
     let thumbnailUrl: string | null = null;
 
-    const decodeEscapedUrl = (u: string): string =>
-      u
-        .replace(/\\u002F/gi, '/')
-        .replace(/\\u0026/gi, '&')
-        .replace(/\\\//g, '/')
-        .replace(/&amp;/g, '&')
-        .trim();
+    const MOBILE_UA =
+      'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
+    const BOT_EMBED_UA = 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)';
+    const META_CRAWLER_UA = 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
+
+    const probeDirectStream = async (
+      candidateUrl: string,
+      userAgent: string = BOT_EMBED_UA
+    ): Promise<{ mp4Url: string; sizeBytes: number | null; buffer: Buffer | null } | null> => {
+      try {
+        const { response: r, finalUrl: resolved } = await fetchPublicVideoWithSafeRedirects(
+          candidateUrl,
+          {
+            timeoutMs: 12_000,
+            headers: {
+              'User-Agent': userAgent,
+              Accept: 'video/mp4,video/*,*/*;q=0.8',
+            },
+          }
+        );
+        const ct = String(r.headers.get('content-type') || '').toLowerCase();
+        const len = Number(r.headers.get('content-length') || 0);
+        if (r.ok && (ct.includes('video/') || ct.includes('application/octet-stream'))) {
+          let buf: Buffer | null = null;
+          let actualSize = len > 0 ? len : null;
+          if (shouldDownloadBuffer && (!len || len <= 16 * 1024 * 1024)) {
+            const arr = Buffer.from(await r.arrayBuffer());
+            actualSize = arr.length;
+            if (arr.length > 1000 && arr.length <= 16 * 1024 * 1024) {
+              buf = arr;
+            }
+          } else {
+            try {
+              await r.body?.cancel();
+            } catch {
+              // ignore stream cancel errors
+            }
+          }
+          return { mp4Url: resolved, sizeBytes: actualSize, buffer: buf };
+        }
+        try {
+          await r.body?.cancel();
+        } catch {
+          // ignore
+        }
+      } catch {
+        // Non-fatal fallback
+      }
+      return null;
+    };
+
+    const extractViaClipto = async (
+      targetUrl: string,
+      opts?: { requireAudio?: boolean }
+    ): Promise<{
+      title?: string;
+      thumbnailUrl?: string | null;
+      mp4Url: string;
+      sizeBytes?: number | null;
+    } | null> => {
+      try {
+        const resp = await fetch('https://www.clipto.com/api/youtube', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+          },
+          body: JSON.stringify({ url: targetUrl }),
+          signal: AbortSignal.timeout(12_000),
+        });
+        if (!resp.ok) return null;
+        const json: any = await resp.json();
+        if (!json?.success || !Array.isArray(json.medias)) return null;
+        const best = pickBestCliptoMp4(json.medias, opts);
+        if (!best?.url) return null;
+        await assertSafePublicVideoUrl(best.url);
+        return {
+          title: typeof json.title === 'string' ? json.title.trim().slice(0, 140) : undefined,
+          thumbnailUrl:
+            typeof json.thumbnail === 'string' && /^https?:\/\//i.test(json.thumbnail)
+              ? json.thumbnail
+              : null,
+          mp4Url: best.url,
+          sizeBytes: best.sizeBytes ?? null,
+        };
+      } catch {
+        return null;
+      }
+    };
 
     try {
       await assertSafePublicVideoUrl(finalUrl);
-      const { response: res, finalUrl: resolvedUrl } = await fetchPublicVideoWithSafeRedirects(
-        finalUrl,
-        {
-          timeoutMs: 12_000,
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-            Accept: 'text/html,application/xhtml+xml,video/mp4,*/*;q=0.8',
-            'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
-          },
-        }
-      );
-      finalUrl = resolvedUrl;
-      const contentType = String(res.headers.get('content-type') || '').toLowerCase();
-      const hdrLen = Number(res.headers.get('content-length') || 0);
-      if (hdrLen > 0) fileSizeBytes = hdrLen;
 
-      if (contentType.includes('video/')) {
-        directMp4Url = finalUrl;
-        if (shouldDownloadBuffer && (!hdrLen || hdrLen <= 16 * 1024 * 1024)) {
-          const arr = Buffer.from(await res.arrayBuffer());
-          fileSizeBytes = arr.length;
-          if (arr.length > 500 && arr.length <= 16 * 1024 * 1024) {
-            videoBuffer = arr;
+      // Fast path for YouTube (watch, Shorts, youtu.be, m.youtube.com)
+      const ytId = platformLabel === 'YouTube' ? parseYouTubeVideoId(finalUrl) : null;
+      if (ytId) {
+        const canonicalYtUrl = `https://www.youtube.com/watch?v=${ytId}`;
+        finalUrl = canonicalYtUrl;
+
+        // 1. Fetch clean title & thumbnail via YouTube oEmbed
+        try {
+          const oe = await fetch(
+            `https://www.youtube.com/oembed?url=${encodeURIComponent(canonicalYtUrl)}&format=json`,
+            {
+              headers: { 'User-Agent': MOBILE_UA },
+              signal: AbortSignal.timeout(6_000),
+            }
+          );
+          if (oe.ok) {
+            const oj: any = await oe.json();
+            if (typeof oj?.title === 'string' && oj.title.trim()) {
+              title = oj.title.trim().slice(0, 140);
+            }
+            if (typeof oj?.thumbnail_url === 'string' && /^https?:\/\//i.test(oj.thumbnail_url)) {
+              thumbnailUrl = oj.thumbnail_url;
+            }
+          }
+        } catch {
+          // Non-fatal
+        }
+
+        // 2. Primary: YouTube Innertube ANDROID_VR direct progressive MP4 (fast when allowed)
+        try {
+          const ytVrUa =
+            'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip';
+          const yr = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'User-Agent': ytVrUa,
+            },
+            body: JSON.stringify({
+              videoId: ytId,
+              context: {
+                client: {
+                  clientName: 'ANDROID_VR',
+                  clientVersion: '1.65.10',
+                  deviceMake: 'Oculus',
+                  deviceModel: 'Quest 3',
+                  osName: 'Android',
+                  osVersion: '12L',
+                  androidSdkVersion: 32,
+                  hl: 'pt',
+                  gl: 'BR',
+                },
+              },
+              contentCheckOk: true,
+              racyCheckOk: true,
+            }),
+            signal: AbortSignal.timeout(8_000),
+          });
+          if (yr.ok) {
+            const yj: any = await yr.json();
+            if (!title && typeof yj?.videoDetails?.title === 'string') {
+              title = yj.videoDetails.title.trim().slice(0, 140);
+            }
+            const fmts = Array.isArray(yj?.streamingData?.formats) ? yj.streamingData.formats : [];
+            const bestFmt = fmts
+              .filter((f: any) => f?.url && String(f.mimeType || '').includes('video/mp4'))
+              .sort((a: any, b: any) => (Number(b.height) || 0) - (Number(a.height) || 0))[0];
+            if (bestFmt?.url) {
+              const verified = await probeDirectStream(bestFmt.url, ytVrUa);
+              if (verified) {
+                directMp4Url = verified.mp4Url;
+                if (verified.sizeBytes) fileSizeBytes = verified.sizeBytes;
+                else if (Number(bestFmt.contentLength) > 0) {
+                  fileSizeBytes = Number(bestFmt.contentLength);
+                }
+                if (verified.buffer) videoBuffer = verified.buffer;
+              }
+            }
+          }
+        } catch {
+          // Continue to converter fallback
+        }
+
+        // 3. Fallback: cnvmp3 server-side MP4 resolver (bypasses datacenter IP bot checks)
+        if (!directMp4Url) {
+          try {
+            const desktopUa =
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+            const homeRes = await fetch('https://cnvmp3.com/', {
+              headers: { 'User-Agent': desktopUa },
+              redirect: 'follow',
+              signal: AbortSignal.timeout(7_000),
+            });
+            const refererUrl = homeRes.url || 'https://cnvmp3.com/';
+            try {
+              await homeRes.body?.cancel();
+            } catch {
+              // ignore
+            }
+            const cnvOrigin = new URL(refererUrl).origin;
+            const cnvBase = refererUrl.endsWith('/')
+              ? refererUrl
+              : refererUrl.replace(/\/[^/]*$/, '/');
+
+            for (const q of [720, 360]) {
+              const dlResp = await fetch(`${cnvBase}download_video_ucep.php`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Origin: cnvOrigin,
+                  Referer: refererUrl,
+                  'User-Agent': desktopUa,
+                },
+                body: JSON.stringify({
+                  url: canonicalYtUrl,
+                  quality: q,
+                  title: title || `youtube-${ytId}`,
+                  formatValue: 0,
+                }),
+                signal: AbortSignal.timeout(18_000),
+              });
+              if (!dlResp.ok) continue;
+              const dlJson: any = await dlResp.json().catch(() => null);
+              if (dlJson?.success && typeof dlJson.download_link === 'string' && dlJson.download_link) {
+                const encodedLink = encodeURI(dlJson.download_link.trim());
+                await assertSafePublicVideoUrl(encodedLink);
+                directMp4Url = encodedLink;
+                break;
+              }
+            }
+          } catch {
+            // Non-fatal
           }
         }
       } else {
-        const html = (await res.text()).slice(0, 450_000);
-        const ogTitle =
-          html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)?.[1] ||
-          html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i)?.[1] ||
-          html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1];
-        if (ogTitle) {
-          title = ogTitle.replace(/\s+/g, ' ').trim().slice(0, 140);
+        // Fast path for Instagram Reels / Posts / TV (avoids datacenter login walls)
+        let igTarget = parseInstagramVideoTarget(finalUrl);
+        if (platformLabel === 'Instagram Reels' && !igTarget) {
+          // Resolve Instagram /share/reel/... short links to canonical /reel/<shortcode>/
+          try {
+            const { response: shareRes, finalUrl: resolvedShare } =
+              await fetchPublicVideoWithSafeRedirects(finalUrl, {
+                timeoutMs: 10_000,
+                headers: {
+                  'User-Agent': META_CRAWLER_UA,
+                  Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+                },
+              });
+            finalUrl = resolvedShare;
+            igTarget = parseInstagramVideoTarget(resolvedShare);
+            try {
+              await shareRes.body?.cancel();
+            } catch {
+              // ignore
+            }
+          } catch {
+            // Continue to standard flow
+          }
         }
 
-        const ogImage =
-          html.match(/<meta[^>]+property=["']og:image(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i)?.[1] ||
-          html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image(?::secure_url)?["']/i)?.[1];
-        if (ogImage && /^https?:\/\//i.test(ogImage)) {
-          thumbnailUrl = decodeEscapedUrl(ogImage);
-        }
+        if (igTarget) {
+          finalUrl = `https://www.instagram.com/${igTarget.kind}/${igTarget.shortcode}/`;
 
-        const mp4Patterns: RegExp[] = [
-          /<meta[^>]+property=["']og:video(?::secure_url)?["'][^>]+content=["'](https?:[^"']+)["']/i,
-          /<meta[^>]+content=["'](https?:[^"']+)["'][^>]+property=["']og:video(?::secure_url)?["']/i,
-          /"(?:watermark_free_url|no_watermark_url|playable_url_quality_hd|browser_native_hd_url|browser_native_sd_url|playable_url|downloadAddr|playAddr|video_url|play_url|mp4Url|contentUrl)"\s*:\s*"(https?:[^"\\]+(?:\.mp4|video)[^"]*)"/i,
-          /"V_720P"\s*:\s*\{[^}]*"url"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"/i,
-          /(https?:\/\/[^"'\\\s<>]+\.mp4(?:\?[^"'\\\s<>]*)?)/i,
-        ];
+          // Fetch clean title/thumbnail + resolve direct Meta CDN MP4 in parallel
+          const [metaRes, primaryStream] = await Promise.all([
+            fetchPublicVideoWithSafeRedirects(finalUrl, {
+              timeoutMs: 9_000,
+              headers: {
+                'User-Agent': META_CRAWLER_UA,
+                Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+                'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+              },
+            })
+              .then(async ({ response }) => {
+                const html = response.ok ? await response.text() : '';
+                return extractMediaFromHtml(html, finalUrl);
+              })
+              .catch(() => null),
+            probeDirectStream(
+              `https://www.kkinstagram.com/${igTarget.kind}/${igTarget.shortcode}/`,
+              BOT_EMBED_UA
+            ),
+          ]);
 
-        for (const rx of mp4Patterns) {
-          const m = html.match(rx)?.[1];
-          if (m) {
-            const candidate = decodeEscapedUrl(m);
-            if (/^https?:\/\//i.test(candidate)) {
-              directMp4Url = candidate;
+          if (metaRes) {
+            if (metaRes.title && !/^instagram$/i.test(metaRes.title)) title = metaRes.title;
+            if (metaRes.thumbnailUrl) thumbnailUrl = metaRes.thumbnailUrl;
+            if (metaRes.directMp4Url && !directMp4Url) directMp4Url = metaRes.directMp4Url;
+          }
+
+          if (primaryStream) {
+            directMp4Url = primaryStream.mp4Url;
+            if (primaryStream.sizeBytes) fileSizeBytes = primaryStream.sizeBytes;
+            if (primaryStream.buffer) videoBuffer = primaryStream.buffer;
+          }
+
+          // Secondary fallback via eeinstagram stream resolver
+          if (!directMp4Url) {
+            try {
+              const eeUrl = `https://www.eeinstagram.com/${igTarget.kind}/${igTarget.shortcode}/`;
+              const { response: eeRes, finalUrl: eeFinal } = await fetchPublicVideoWithSafeRedirects(
+                eeUrl,
+                {
+                  timeoutMs: 9_000,
+                  headers: {
+                    'User-Agent': BOT_EMBED_UA,
+                    Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+                  },
+                }
+              );
+              if (eeRes.ok) {
+                const eeHtml = await eeRes.text();
+                const parsedEe = extractMediaFromHtml(eeHtml, eeFinal);
+                if (!title && parsedEe.title) title = parsedEe.title;
+                if (!thumbnailUrl && parsedEe.thumbnailUrl) thumbnailUrl = parsedEe.thumbnailUrl;
+                const streamCandidate = parsedEe.directMp4Url || parsedEe.streamPathUrl;
+                if (streamCandidate) {
+                  const resolvedStream = await probeDirectStream(streamCandidate, BOT_EMBED_UA);
+                  if (resolvedStream) {
+                    directMp4Url = resolvedStream.mp4Url;
+                    if (resolvedStream.sizeBytes) fileSizeBytes = resolvedStream.sizeBytes;
+                    if (resolvedStream.buffer) videoBuffer = resolvedStream.buffer;
+                  }
+                }
+              }
+            } catch {
+              // Non-fatal
+            }
+          }
+
+          // Tertiary fallback via Clipto
+          if (!directMp4Url) {
+            const cliptoRes = await extractViaClipto(finalUrl);
+            if (cliptoRes) {
+              directMp4Url = cliptoRes.mp4Url;
+              if (!title && cliptoRes.title) title = cliptoRes.title;
+              if (!thumbnailUrl && cliptoRes.thumbnailUrl) thumbnailUrl = cliptoRes.thumbnailUrl;
+              if (cliptoRes.sizeBytes) fileSizeBytes = cliptoRes.sizeBytes;
+            }
+          }
+        } else if (platformLabel === 'TikTok') {
+          // Resolve short links (vm.tiktok.com / vt.tiktok.com) to canonical tiktok.com pathname
+          let tkPath = parseTikTokVideoPath(finalUrl);
+          if (!tkPath) {
+            try {
+              const { response: tkRes, finalUrl: tkResolved } =
+                await fetchPublicVideoWithSafeRedirects(finalUrl, {
+                  timeoutMs: 10_000,
+                  headers: {
+                    'User-Agent': MOBILE_UA,
+                    Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+                  },
+                });
+              finalUrl = tkResolved;
+              tkPath = parseTikTokVideoPath(tkResolved);
+              if (tkRes.ok && !tkPath) {
+                const html = await tkRes.text();
+                const parsed = extractMediaFromHtml(html, tkResolved);
+                if (parsed.title) title = parsed.title;
+                if (parsed.thumbnailUrl) thumbnailUrl = parsed.thumbnailUrl;
+                if (parsed.directMp4Url) directMp4Url = parsed.directMp4Url;
+              } else {
+                try {
+                  await tkRes.body?.cancel();
+                } catch {
+                  // ignore
+                }
+              }
+            } catch {
+              // Non-fatal
+            }
+          }
+
+          if (tkPath && !directMp4Url) {
+            const [tkMeta, tkStream] = await Promise.all([
+              fetchPublicVideoWithSafeRedirects(`https://www.tnktok.com${tkPath}`, {
+                timeoutMs: 8_000,
+                headers: {
+                  'User-Agent': BOT_EMBED_UA,
+                  Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+                },
+              })
+                .then(async ({ response, finalUrl: u }) =>
+                  response.ok ? extractMediaFromHtml(await response.text(), u) : null
+                )
+                .catch(() => null),
+              probeDirectStream(`https://d.tnktok.com${tkPath}`, BOT_EMBED_UA),
+            ]);
+
+            if (tkMeta) {
+              if (tkMeta.title) title = tkMeta.title;
+              if (tkMeta.thumbnailUrl) thumbnailUrl = tkMeta.thumbnailUrl;
+              if (tkMeta.directMp4Url) directMp4Url = tkMeta.directMp4Url;
+            }
+            if (tkStream) {
+              directMp4Url = tkStream.mp4Url;
+              if (tkStream.sizeBytes) fileSizeBytes = tkStream.sizeBytes;
+              if (tkStream.buffer) videoBuffer = tkStream.buffer;
+            }
+          }
+
+          if (!directMp4Url) {
+            const cliptoRes = await extractViaClipto(finalUrl);
+            if (cliptoRes) {
+              directMp4Url = cliptoRes.mp4Url;
+              if (!title && cliptoRes.title) title = cliptoRes.title;
+              if (!thumbnailUrl && cliptoRes.thumbnailUrl) thumbnailUrl = cliptoRes.thumbnailUrl;
+              if (cliptoRes.sizeBytes) fileSizeBytes = cliptoRes.sizeBytes;
+            }
+          }
+        } else {
+          // General extraction for Shopee Video, Facebook, Pinterest, and direct MP4 URLs
+          // Automatically follows up to 4 JS/HTML transfer pages (e.g. br.shp.ee -> sv.shopee.com.br/share-video/...)
+          let currentFetchUrl = finalUrl;
+          let lastHtml = '';
+          const visitedUrls = new Set<string>();
+
+          for (let hop = 0; hop < 4 && !directMp4Url; hop += 1) {
+            if (visitedUrls.has(currentFetchUrl)) break;
+            visitedUrls.add(currentFetchUrl);
+
+            const { response: res, finalUrl: resolvedUrl } = await fetchPublicVideoWithSafeRedirects(
+              currentFetchUrl,
+              {
+                timeoutMs: 12_000,
+                headers: {
+                  'User-Agent': MOBILE_UA,
+                  Accept: 'text/html,application/xhtml+xml,video/mp4,*/*;q=0.8',
+                  'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+                },
+              }
+            );
+            finalUrl = resolvedUrl;
+            const contentType = String(res.headers.get('content-type') || '').toLowerCase();
+            const hdrLen = Number(res.headers.get('content-length') || 0);
+            if (hdrLen > 0) fileSizeBytes = hdrLen;
+
+            if (contentType.includes('video/')) {
+              directMp4Url = finalUrl;
+              if (shouldDownloadBuffer && (!hdrLen || hdrLen <= 16 * 1024 * 1024)) {
+                const arr = Buffer.from(await res.arrayBuffer());
+                fileSizeBytes = arr.length;
+                if (arr.length > 500 && arr.length <= 16 * 1024 * 1024) {
+                  videoBuffer = arr;
+                }
+              } else {
+                try {
+                  await res.body?.cancel();
+                } catch {
+                  // ignore
+                }
+              }
               break;
+            }
+
+            const html = await res.text();
+            lastHtml = html;
+            const parsed = extractMediaFromHtml(html, finalUrl);
+            if (
+              parsed.title &&
+              !/^shopee brasil \| ofertas/i.test(parsed.title) &&
+              !/^log in or sign up/i.test(parsed.title)
+            ) {
+              title = parsed.title;
+            }
+            if (parsed.thumbnailUrl) thumbnailUrl = parsed.thumbnailUrl;
+            if (parsed.directMp4Url) {
+              directMp4Url = parsed.directMp4Url;
+              break;
+            }
+
+            // Follow JS/meta transfer redirect (Shopee br.shp.ee CONFIG.httpUrl, pin.it, etc.)
+            const nextHopUrl = extractHtmlRedirectUrl(html, finalUrl);
+            if (nextHopUrl && !visitedUrls.has(nextHopUrl)) {
+              try {
+                await assertSafePublicVideoUrl(nextHopUrl);
+                currentFetchUrl = nextHopUrl;
+                continue;
+              } catch {
+                break;
+              }
+            }
+            break;
+          }
+
+          // Pinterest specialized extraction (V_720P + HLS-to-MP4 verified candidates + Clipto)
+          if (!directMp4Url && platformLabel === 'Pinterest Video') {
+            const pinCandidates = derivePinterestMp4CandidatesFromHtml(lastHtml);
+            for (const cand of pinCandidates.slice(0, 4)) {
+              const verified = await probeDirectStream(cand, MOBILE_UA);
+              if (verified) {
+                directMp4Url = verified.mp4Url;
+                if (verified.sizeBytes) fileSizeBytes = verified.sizeBytes;
+                if (verified.buffer) videoBuffer = verified.buffer;
+                break;
+              }
+            }
+            if (!directMp4Url) {
+              const cliptoRes = await extractViaClipto(finalUrl);
+              if (cliptoRes) {
+                directMp4Url = cliptoRes.mp4Url;
+                if (!title && cliptoRes.title) title = cliptoRes.title;
+                if (!thumbnailUrl && cliptoRes.thumbnailUrl) thumbnailUrl = cliptoRes.thumbnailUrl;
+                if (cliptoRes.sizeBytes) fileSizeBytes = cliptoRes.sizeBytes;
+              }
+            }
+          }
+
+          // Facebook specialized fallback: Meta crawler UA + Clipto HD resolver
+          if (!directMp4Url && platformLabel === 'Facebook Video') {
+            try {
+              const { response: fbRes, finalUrl: fbFinal } =
+                await fetchPublicVideoWithSafeRedirects(finalUrl, {
+                  timeoutMs: 10_000,
+                  headers: {
+                    'User-Agent': META_CRAWLER_UA,
+                    Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+                    'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+                  },
+                });
+              if (fbRes.ok) {
+                const fbParsed = extractMediaFromHtml(await fbRes.text(), fbFinal);
+                if (!title && fbParsed.title) title = fbParsed.title;
+                if (!thumbnailUrl && fbParsed.thumbnailUrl) thumbnailUrl = fbParsed.thumbnailUrl;
+                if (fbParsed.directMp4Url) directMp4Url = fbParsed.directMp4Url;
+              }
+            } catch {
+              // Non-fatal
+            }
+
+            if (!directMp4Url) {
+              const cliptoRes = await extractViaClipto(finalUrl);
+              if (cliptoRes) {
+                directMp4Url = cliptoRes.mp4Url;
+                if (!title && cliptoRes.title) title = cliptoRes.title;
+                if (!thumbnailUrl && cliptoRes.thumbnailUrl) thumbnailUrl = cliptoRes.thumbnailUrl;
+                if (cliptoRes.sizeBytes) fileSizeBytes = cliptoRes.sizeBytes;
+              }
             }
           }
         }
@@ -7426,10 +9057,10 @@ async function startServer() {
     if (directMp4Url && shouldDownloadBuffer && !videoBuffer) {
       try {
         const { response: vr } = await fetchPublicVideoWithSafeRedirects(directMp4Url, {
-          timeoutMs: 12_000,
+          timeoutMs: 15_000,
           headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+            'User-Agent': MOBILE_UA,
+            Accept: 'video/mp4,video/*,*/*;q=0.8',
           },
         });
         if (vr.ok) {
@@ -7440,6 +9071,12 @@ async function startServer() {
             fileSizeBytes = buf.length;
             if (buf.length > 1000 && buf.length <= 16 * 1024 * 1024) {
               videoBuffer = buf;
+            }
+          } else {
+            try {
+              await vr.body?.cancel();
+            } catch {
+              // ignore
             }
           }
         }
@@ -7454,8 +9091,7 @@ async function startServer() {
           redirect: 'manual',
           signal: AbortSignal.timeout(5000),
           headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+            'User-Agent': MOBILE_UA,
           },
         });
         const len = Number(headRes.headers.get('content-length') || 0);
@@ -8549,6 +10185,48 @@ async function startServer() {
           ? segmentTemplates
           : INITIAL_TEMPLATES;
       const prod = resolved.product;
+      const queueBlockCheck = isBlockedOfferForCaptureOrDispatch(prod);
+      if (queueBlockCheck.blocked) {
+        console.warn(
+          `[DispatchQueue] Bloqueado e removido item inválido (${queueBlockCheck.reason}): ${prod.title} | ${prod.affiliateUrl}`
+        );
+        const nowMs = Date.now();
+        const nowIso = new Date(nowMs).toISOString();
+        const totalIds = Array.isArray(queue.productIds) ? queue.productIds.length : 0;
+        const completed = resolved.nextIndex >= totalIds;
+        const nextRunAt = completed
+          ? undefined
+          : computeQueueNextRunIso(queue.intervalMinutes, nowMs);
+        const curState = panelStore.state || {};
+        const curQueues: any[] = Array.isArray(curState.queues) ? curState.queues : [];
+        const curProducts: any[] = Array.isArray(curState.products) ? curState.products : [];
+        panelStore.state = {
+          ...curState,
+          products: curProducts.filter((p: any) => p.id !== prod.id),
+          queues: curQueues.map((q) =>
+            q?.id === queueId
+              ? {
+                  ...q,
+                  sentCount: resolved.nextIndex,
+                  totalCount: totalIds,
+                  active: completed ? false : q.active,
+                  lastRunAt: nowIso,
+                  nextRunAt,
+                }
+              : q
+          ),
+        };
+        panelStore.version += 1;
+        panelStore.updatedAt = nowIso;
+        saveStoredPanelState();
+        return {
+          ok: false,
+          sentCount: 0,
+          completed,
+          nextRunAt,
+          error: queueBlockCheck.reason || 'Item inválido bloqueado antes do disparo.',
+        };
+      }
       const tpl =
         templates.find((t: any) => t.platform === prod.platform) ||
         templates[0] ||
@@ -8712,56 +10390,411 @@ async function startServer() {
         return res.status(400).json({ ok: false, error: 'Parâmetro url ausente.' });
       }
 
+      let validatedUrl: URL;
       try {
-        await assertSafePublicVideoUrl(rawUrl);
+        validatedUrl = await assertSafePublicVideoUrl(rawUrl);
       } catch (safeErr: any) {
         return res.status(400).json({ ok: false, error: safeErr?.message || 'URL bloqueada.' });
       }
 
+      const upstreamHeaders: Record<string, string> = {
+        'User-Agent':
+          'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+        Accept: 'video/mp4,video/*,*/*;q=0.8',
+      };
+      if (validatedUrl.hostname.toLowerCase().endsWith('.minecnv.com')) {
+        upstreamHeaders.Referer = 'https://cnvmp3.com/';
+      }
+      const reqRange = typeof req.headers.range === 'string' ? req.headers.range.trim() : '';
+      if (inline && /^bytes=\d*-\d*$/i.test(reqRange)) {
+        upstreamHeaders.Range = reqRange;
+      }
+
       const { response: upstream } = await fetchPublicVideoWithSafeRedirects(rawUrl, {
-        timeoutMs: 20_000,
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-          Accept: 'video/mp4,video/*,*/*;q=0.8',
-        },
+        timeoutMs: 35_000,
+        headers: upstreamHeaders,
       });
 
-      if (!upstream.ok) {
+      if (!upstream.ok && upstream.status !== 206) {
         return res.status(502).json({
           ok: false,
           error: `A origem recusou o download do vídeo (HTTP ${upstream.status}).`,
         });
       }
 
-      const maxBytes = 35 * 1024 * 1024;
+      const contentType = String(upstream.headers.get('content-type') || 'video/mp4').toLowerCase();
+      if (
+        contentType.includes('text/html') ||
+        contentType.includes('application/javascript') ||
+        contentType.includes('text/javascript')
+      ) {
+        try {
+          await upstream.body?.cancel();
+        } catch {
+          // ignore
+        }
+        return res.status(502).json({
+          ok: false,
+          error: 'O link de mídia expirou ou retornou página inválida. Extraia o vídeo novamente.',
+        });
+      }
+
+      const maxBytes = 60 * 1024 * 1024;
       const contentLength = Number(upstream.headers.get('content-length') || 0);
       if (contentLength > maxBytes) {
+        try {
+          await upstream.body?.cancel();
+        } catch {
+          // ignore
+        }
         return res.status(413).json({
           ok: false,
-          error: 'Vídeo acima do limite de 35 MB suportado para download direto.',
+          error: 'Vídeo acima do limite de 60 MB suportado para download direto.',
         });
       }
 
-      const contentType = String(upstream.headers.get('content-type') || 'video/mp4');
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      if (buf.length === 0 || buf.length > maxBytes) {
-        return res.status(413).json({
-          ok: false,
-          error: 'Arquivo de vídeo vazio ou acima do limite de 35 MB.',
-        });
+      const outType = contentType.includes('video/') ? contentType.split(';')[0] : 'video/mp4';
+      res.status(upstream.status === 206 ? 206 : 200);
+      res.setHeader('Content-Type', outType);
+      res.setHeader('Accept-Ranges', 'bytes');
+      if (contentLength > 0) {
+        res.setHeader('Content-Length', String(contentLength));
       }
-
-      res.setHeader('Content-Type', contentType.includes('video/') ? contentType : 'video/mp4');
-      res.setHeader('Content-Length', String(buf.length));
+      const contentRange = upstream.headers.get('content-range');
+      if (contentRange) {
+        res.setHeader('Content-Range', contentRange);
+      }
       res.setHeader(
         'Content-Disposition',
         `${inline ? 'inline' : 'attachment'}; filename="${filename}"`
       );
       res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.send(buf);
+      res.setHeader('Cache-Control', 'private, max-age=300');
+
+      if (!upstream.body) {
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        if (buf.length === 0 || buf.length > maxBytes) {
+          return res.status(413).end();
+        }
+        return res.send(buf);
+      }
+
+      const reader = upstream.body.getReader();
+      let streamedBytes = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value || value.byteLength === 0) continue;
+          streamedBytes += value.byteLength;
+          if (streamedBytes > maxBytes) {
+            await reader.cancel();
+            res.destroy();
+            return;
+          }
+          if (!res.write(Buffer.from(value))) {
+            await new Promise<void>((resolve) => res.once('drain', resolve));
+          }
+        }
+        res.end();
+      } catch {
+        try {
+          await reader.cancel();
+        } catch {
+          // ignore
+        }
+        if (!res.headersSent) {
+          res.status(502).json({ ok: false, error: 'Conexão interrompida ao transferir vídeo.' });
+        } else {
+          res.end();
+        }
+      }
     } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || 'Falha ao baixar vídeo.' });
+      if (!res.headersSent) {
+        res.status(500).json({ ok: false, error: err?.message || 'Falha ao baixar vídeo.' });
+      }
+    }
+  });
+
+  app.post('/api/whatsapp/status/preview-card', async (req, res) => {
+    try {
+      const {
+        title = 'Oferta Teste',
+        platform = 'Mercado Livre',
+        originalPrice = 0,
+        discountPrice = 0,
+        discountPercent = 0,
+        couponCode = '',
+        imageUrl = '',
+        themeColor = 'emerald',
+        calloutText = 'Link clicável no próximo Status ->',
+      } = req.body || {};
+
+      const buf = await renderOfferStatusStoryBuffer({
+        title: String(title),
+        platform: String(platform),
+        originalPrice: Number(originalPrice) || 0,
+        discountPrice: Number(discountPrice) || 0,
+        discountPercent: Number(discountPercent) || 0,
+        couponCode: String(couponCode || ''),
+        imageUrl: String(imageUrl || ''),
+        themeColor: String(themeColor || 'emerald'),
+        calloutText: String(calloutText || ''),
+      });
+
+      res.json({
+        ok: true,
+        imageDataUrl: `data:image/jpeg;base64,${buf.toString('base64')}`,
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        ok: false,
+        error: err?.message || 'Falha ao gerar prévia do card de Status.',
+      });
+    }
+  });
+
+  app.post('/api/whatsapp/status/test', async (req, res) => {
+    try {
+      const {
+        accountId = 'acc-wa-1',
+        format = 'combo-card-then-link',
+        audienceMode = 'self_and_test',
+        testPhones = [],
+        testGroupJid = '',
+        themeColor = 'emerald',
+        fontStyle = 0,
+        title = '',
+        platform = 'Mercado Livre',
+        originalPrice = 0,
+        discountPrice = 0,
+        discountPercent = 0,
+        couponCode = '',
+        affiliateUrl = '',
+        imageUrl = '',
+        videoUrl = '',
+      } = req.body || {};
+
+      const safeAccountId = sanitizeAccountId(String(accountId || 'acc-wa-1'));
+      const exactSession = baileysSessions.get(safeAccountId);
+      const session =
+        exactSession && exactSession.status === 'open' && exactSession.sock
+          ? exactSession
+          : Array.from(baileysSessions.values()).find((s) => s.status === 'open' && s.sock);
+
+      if (!session || session.status !== 'open' || !session.sock) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Nenhuma conta WhatsApp conectada no momento para postar o Status.',
+        });
+      }
+
+      const cleanTitle = String(title || '').trim();
+      const cleanUrl = String(affiliateUrl || '').trim();
+      if (!cleanTitle || !cleanUrl) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Informe o título da oferta e o link de afiliado para testar no Status.',
+        });
+      }
+
+      const selectedFormat = String(format) as WhatsAppStatusFormat;
+      const selectedAudience = String(audienceMode) as WhatsAppStatusAudienceMode;
+      const theme =
+        WHATSAPP_STATUS_THEMES.find((t) => t.id === themeColor) || WHATSAPP_STATUS_THEMES[0];
+      const safeFont = Number.isFinite(Number(fontStyle)) ? Number(fontStyle) : 0;
+
+      const statusJidList = await resolveStatusTestAudienceJids({
+        session,
+        audienceMode: selectedAudience,
+        testPhones: Array.isArray(testPhones) ? testPhones.map((p) => String(p)) : [],
+        testGroupJid: String(testGroupJid || '').trim(),
+      });
+
+      if (statusJidList.length === 0) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Nenhum destinatário válido resolvido para visualizar este Status.',
+        });
+      }
+
+      const texts = buildWhatsAppStatusTexts({
+        title: cleanTitle,
+        platform: String(platform),
+        originalPrice: Number(originalPrice) || 0,
+        discountPrice: Number(discountPrice) || 0,
+        discountPercent: Number(discountPercent) || 0,
+        couponCode: String(couponCode || ''),
+        affiliateUrl: cleanUrl,
+      });
+
+      const postedSteps: string[] = [];
+
+      const sendClickableLinkStatus = async () => {
+        const basePreview = buildBaileysLinkPreviewPayload(texts.clickableLinkStatusText, false);
+        let richPreview: any = basePreview ? { ...basePreview } : undefined;
+        if (richPreview && imageUrl) {
+          try {
+            const std = await loadStandardizedProductImage(String(imageUrl));
+            if (std && typeof (session.sock as any).waUploadToServer === 'function') {
+              const prepared = await prepareWAMessageMedia(
+                { image: std.buffer, mimetype: 'image/jpeg' },
+                {
+                  upload: (session.sock as any).waUploadToServer,
+                  mediaTypeOverride: 'thumbnail-link',
+                }
+              );
+              if (prepared?.imageMessage) {
+                prepared.imageMessage.width = std.width;
+                prepared.imageMessage.height = std.height;
+                richPreview.highQualityThumbnail = prepared.imageMessage;
+              }
+              richPreview.jpegThumbnail = std.smallThumbBuffer;
+            }
+          } catch {
+            // Keep basic link preview even if thumbnail upload fails
+          }
+        }
+
+        const sent = await session.sock!.sendMessage(
+          'status@broadcast',
+          {
+            text: texts.clickableLinkStatusText,
+            ...(richPreview ? { linkPreview: richPreview } : {}),
+          },
+          {
+            statusJidList,
+            backgroundColor: theme.bgHex,
+            font: safeFont,
+          }
+        );
+        markRecentOutgoingWaMsgId(sent?.key?.id);
+        postedSteps.push('Status de Link Clicável (fundo colorido + prévia)');
+      };
+
+      const sendStoryCardPhotoStatus = async (calloutText: string, caption: string) => {
+        const storyBuf = await renderOfferStatusStoryBuffer({
+          title: cleanTitle,
+          platform: String(platform),
+          originalPrice: Number(originalPrice) || 0,
+          discountPrice: Number(discountPrice) || 0,
+          discountPercent: Number(discountPercent) || 0,
+          couponCode: String(couponCode || ''),
+          imageUrl: String(imageUrl || ''),
+          themeColor: theme.id,
+          calloutText,
+        });
+        const sent = await session.sock!.sendMessage(
+          'status@broadcast',
+          {
+            image: storyBuf,
+            mimetype: 'image/jpeg',
+            caption,
+            width: 1080,
+            height: 1920,
+          },
+          { statusJidList }
+        );
+        markRecentOutgoingWaMsgId(sent?.key?.id);
+        postedSteps.push('Status Card Visual 9:16 (1080×1920)');
+      };
+
+      const sendRawPhotoStatus = async (caption: string) => {
+        const std = imageUrl ? await loadStandardizedProductImage(String(imageUrl)) : null;
+        if (!std) {
+          throw new Error('Não foi possível baixar a imagem do produto para este formato.');
+        }
+        const sent = await session.sock!.sendMessage(
+          'status@broadcast',
+          {
+            image: std.buffer,
+            mimetype: 'image/jpeg',
+            caption,
+            width: std.width,
+            height: std.height,
+          },
+          { statusJidList }
+        );
+        markRecentOutgoingWaMsgId(sent?.key?.id);
+        postedSteps.push('Status Foto Original do Produto + Legenda');
+      };
+
+      if (selectedFormat === 'story-card-photo') {
+        await sendStoryCardPhotoStatus('Confira o link abaixo na legenda', texts.cardCaption);
+      } else if (selectedFormat === 'raw-photo-caption') {
+        await sendRawPhotoStatus(texts.fullCaption);
+      } else if (selectedFormat === 'link-text-card') {
+        await sendClickableLinkStatus();
+      } else if (selectedFormat === 'combo-card-then-link') {
+        await sendStoryCardPhotoStatus(
+          'Link clicável no próximo Status ->',
+          texts.shortCalloutCaption
+        );
+        await new Promise((r) => setTimeout(r, 1800));
+        await sendClickableLinkStatus();
+      } else if (selectedFormat === 'combo-raw-then-link') {
+        await sendRawPhotoStatus(texts.shortCalloutCaption);
+        await new Promise((r) => setTimeout(r, 1800));
+        await sendClickableLinkStatus();
+      } else if (selectedFormat === 'video-plus-link') {
+        const rawVideoUrl = String(videoUrl || '').trim();
+        if (!rawVideoUrl) {
+          return res.status(400).json({
+            ok: false,
+            error: 'Cole um link de vídeo (Instagram, Shopee Vídeo, TikTok ou MP4) para testar esta opção.',
+          });
+        }
+        await assertSafePublicVideoUrl(rawVideoUrl);
+        const extractedVideo = await extractDirectVideoInfo(rawVideoUrl, { downloadBuffer: true });
+        if (!extractedVideo.videoBuffer || extractedVideo.videoBuffer.length < 1000) {
+          return res.status(422).json({
+            ok: false,
+            error:
+              extractedVideo.error ||
+              'Não foi possível baixar o MP4 desse vídeo para publicar no Status.',
+          });
+        }
+        const sentVideo = await session.sock.sendMessage(
+          'status@broadcast',
+          {
+            video: extractedVideo.videoBuffer,
+            mimetype: 'video/mp4',
+            caption: texts.shortCalloutCaption,
+          },
+          { statusJidList }
+        );
+        markRecentOutgoingWaMsgId(sentVideo?.key?.id);
+        postedSteps.push('Status de Vídeo MP4');
+        await new Promise((r) => setTimeout(r, 1800));
+        await sendClickableLinkStatus();
+      } else {
+        return res.status(400).json({ ok: false, error: 'Formato de Status inválido.' });
+      }
+
+      const recipientPreview = statusJidList
+        .slice(0, 6)
+        .map((j) => j.split('@')[0]);
+
+      res.json({
+        ok: true,
+        format: selectedFormat,
+        accountId: session.accountId,
+        accountName: session.connectedName || session.connectedPhone || session.accountId,
+        recipientCount: statusJidList.length,
+        recipientPreview,
+        postedSteps,
+        sentAt: new Date().toLocaleTimeString('pt-BR', {
+          timeZone: 'America/Sao_Paulo',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        }),
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        ok: false,
+        error: err?.message || 'Erro ao publicar teste no Status do WhatsApp.',
+      });
     }
   });
 
@@ -8987,6 +11020,13 @@ async function startServer() {
       });
     }
   }, 15_000);
+
+  // Automatic Telegram monitored channels/groups polling every 45 seconds
+  setInterval(() => {
+    void pollMonitoredTelegramChannels().catch((err: any) => {
+      console.warn('[Monitoramento Telegram] Erro na verificação periódica:', err?.message || err);
+    });
+  }, 45_000);
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on http://0.0.0.0:${PORT}`);

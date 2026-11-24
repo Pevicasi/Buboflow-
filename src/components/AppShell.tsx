@@ -30,6 +30,7 @@ import {
   AlertCircle,
   Layers,
   User,
+  Smartphone,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { NavRoute } from '../types';
@@ -44,6 +45,7 @@ interface NavItemDef {
 const NAV_ITEMS: NavItemDef[] = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutGrid, section: 'top' },
   { id: 'whatsapp', label: 'WhatsApp', icon: MessageCircle, section: 'essencial' },
+  { id: 'teste-status-whatsapp', label: 'Teste Status WhatsApp', icon: Smartphone, section: 'essencial' },
   { id: 'telegram', label: 'Telegram', icon: MessageCircle, section: 'essencial' },
   { id: 'enviar-mensagens', label: 'Enviar Mensagens', icon: Send, section: 'essencial' },
   { id: 'produtos', label: 'Produtos', icon: Package, section: 'essencial' },

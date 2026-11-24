@@ -50,6 +50,8 @@ import {
 import { WhatsAppMockup } from '../components/WhatsAppMockup';
 import { renderProductMessage } from '../utils/templateEngine';
 import {
+  addTelegramMonitoringTargetApi,
+  checkTelegramMonitoringNowApi,
   connectBaileysApi,
   getBaileysStatusApi,
   getWhatsAppQrApi,
@@ -2617,6 +2619,12 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
   const [addGroupBusy, setAddGroupBusy] = useState(false);
   const [addGroupError, setAddGroupError] = useState<string | null>(null);
   const [syncingGroups, setSyncingGroups] = useState(false);
+  const [addTgMonModal, setAddTgMonModal] = useState(false);
+  const [tgMonTarget, setTgMonTarget] = useState('');
+  const [tgMonCustomName, setTgMonCustomName] = useState('');
+  const [tgMonBusy, setTgMonBusy] = useState(false);
+  const [tgMonError, setTgMonError] = useState<string | null>(null);
+  const [checkingTgMon, setCheckingTgMon] = useState(false);
   const [pendingDeleteGroup, setPendingDeleteGroup] = useState<
     | { kind: 'envio'; group: DispatchGroup }
     | { kind: 'monitoramento'; group: MonitoringGroup }
@@ -3459,6 +3467,7 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
   const monitoredCount = monitoringGroups.filter((g) =>
     isGroupMonitoredInSegment(g, activeSegment)
   ).length;
+  const hasTelegramMonitoringGroups = monitoringGroups.some((g) => g.channel === 'Telegram');
   const filteredMon = monitoringGroups.filter((g) => {
     const monHere = isGroupMonitoredInSegment(g, activeSegment);
     if (statusFilter === 'Monitorados' && !monHere) return false;
@@ -3475,6 +3484,112 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
     return true;
   });
 
+  const handleAddTelegramMonitoringChannel = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setTgMonError(null);
+    const cleanTarget = tgMonTarget.trim();
+    if (!cleanTarget) {
+      setTgMonError('Informe um @canal público, link https://t.me/canal ou Chat ID (-100...).');
+      return;
+    }
+    setTgMonBusy(true);
+    try {
+      const res = await addTelegramMonitoringTargetApi({
+        target: cleanTarget,
+        customName: tgMonCustomName.trim(),
+      });
+      if (!res.ok || !res.group) {
+        setTgMonError(res.error || 'Não foi possível validar esse canal do Telegram.');
+        return;
+      }
+
+      const resolved = res.group;
+      const tgAcc = accounts.find((a) => a.channel === 'Telegram');
+      const seg = normalizeSegmentName(activeSegment);
+      const canActivate = monitoredCount < maxLimit;
+
+      setMonitoringGroups((prev) => {
+        const normKey = resolved.remoteJid.trim().toLowerCase();
+        const existingIdx = prev.findIndex(
+          (m) =>
+            m.channel === 'Telegram' &&
+            (String(m.remoteJid || '').trim().toLowerCase() === normKey ||
+              (resolved.username &&
+                String(m.username || '').replace(/^@/, '').toLowerCase() === resolved.username))
+        );
+        if (existingIdx >= 0) {
+          return prev.map((m, idx) => {
+            if (idx !== existingIdx) return m;
+            const nextSegs = canActivate
+              ? toggleGroupSegmentMembership(getGroupMonitoredSegments(m), seg, true)
+              : getGroupMonitoredSegments(m);
+            return {
+              ...m,
+              name: resolved.name || m.name,
+              remoteJid: resolved.remoteJid,
+              username: resolved.username || m.username,
+              monitoredSegments: nextSegs,
+              monitored: nextSegs.length > 0,
+            };
+          });
+        }
+        const newEntry: MonitoringGroup = {
+          id: `mon-tg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          name: resolved.name,
+          channel: 'Telegram',
+          accountId: tgAcc?.id || 'tg-public',
+          accountName:
+            resolved.sourceType === 'public_channel'
+              ? 'Telegram Público'
+              : tgAcc?.name || 'Telegram Bot',
+          remoteJid: resolved.remoteJid,
+          username: resolved.username,
+          monitored: canActivate,
+          monitoredSegments: canActivate ? [seg] : [],
+          capturedToday: 0,
+          useGroupImage: false,
+          allowedMarketplaces: [...MONITORING_MARKETPLACES],
+        };
+        return [newEntry, ...prev];
+      });
+
+      setTgMonTarget('');
+      setTgMonCustomName('');
+      setAddTgMonModal(false);
+      notify(
+        canActivate ? 'Canal Telegram adicionado e monitorado!' : 'Canal Telegram adicionado!',
+        canActivate
+          ? `${resolved.name} (${resolved.remoteJid}) já está sendo monitorado automaticamente a cada 45s.`
+          : `${resolved.name} salvo. Pause outro grupo para ativar o monitoramento (limite ${maxLimit}).`
+      );
+    } catch (err: any) {
+      setTgMonError(err?.message || 'Erro de rede ao validar canal do Telegram.');
+    } finally {
+      setTgMonBusy(false);
+    }
+  };
+
+  const handleCheckTelegramMonitoringNow = async () => {
+    setCheckingTgMon(true);
+    try {
+      const res = await checkTelegramMonitoringNowApi({ captureRecentCount: 3 });
+      if (res.ok) {
+        notify(
+          'Verificação do Telegram concluída!',
+          res.checkedCount && res.checkedCount > 0
+            ? `${res.checkedCount} canal(is) verificado(s) • ${res.newPostsCount || 0} postagem(ns) analisada(s).`
+            : 'Ative o monitoramento em pelo menos um canal Telegram para capturar ofertas.'
+        );
+      } else {
+        notify('Erro ao verificar Telegram', res.error, 'error');
+      }
+    } catch {
+      notify('Erro ao verificar canais do Telegram', undefined, 'error');
+    } finally {
+      setCheckingTgMon(false);
+    }
+  };
+
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -3487,15 +3602,39 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
             {activeSegment}
           </span>
         </div>
-        <button
-          type="button"
-          disabled={syncingGroups}
-          onClick={() => void syncAllConnectedChannels()}
-          className="px-3.5 py-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs sm:text-sm font-medium text-slate-700 dark:text-slate-200 flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800 shrink-0"
-        >
-          <RefreshCw className={`w-4 h-4 ${syncingGroups ? 'animate-spin text-[#15803D]' : ''}`} />
-          <span>Sincronizar</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              setTgMonError(null);
+              setAddTgMonModal(true);
+            }}
+            className="px-3.5 py-2 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-xs sm:text-sm font-semibold flex items-center gap-1.5 shrink-0"
+          >
+            <Plus className="w-4 h-4" />
+            <span>Canal Telegram</span>
+          </button>
+          {hasTelegramMonitoringGroups && (
+            <button
+              type="button"
+              disabled={checkingTgMon}
+              onClick={() => void handleCheckTelegramMonitoringNow()}
+              className="px-3.5 py-2 rounded-xl bg-white dark:bg-slate-900 border border-sky-200 dark:border-sky-800 text-xs sm:text-sm font-medium text-sky-700 dark:text-sky-300 flex items-center gap-1.5 hover:bg-sky-50 dark:hover:bg-sky-950/40 shrink-0 disabled:opacity-50"
+            >
+              <Send className={`w-3.5 h-3.5 ${checkingTgMon ? 'animate-pulse' : ''}`} />
+              <span>{checkingTgMon ? 'Verificando...' : 'Verificar Telegram'}</span>
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={syncingGroups}
+            onClick={() => void syncAllConnectedChannels()}
+            className="px-3.5 py-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs sm:text-sm font-medium text-slate-700 dark:text-slate-200 flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800 shrink-0"
+          >
+            <RefreshCw className={`w-4 h-4 ${syncingGroups ? 'animate-spin text-[#15803D]' : ''}`} />
+            <span>Sincronizar</span>
+          </button>
+        </div>
       </div>
 
       {/* KPIs */}
@@ -3624,9 +3763,18 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                       </div>
                       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-1 text-[11px] text-slate-500 dark:text-slate-400">
                         <span className="inline-flex items-center gap-1 font-mono text-slate-600 dark:text-slate-300">
-                          <MessageCircle className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                          {g.channel === 'Telegram' ? (
+                            <Send className="w-3.5 h-3.5 text-sky-500 shrink-0" />
+                          ) : (
+                            <MessageCircle className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                          )}
                           {g.accountName}
                         </span>
+                        {g.channel === 'Telegram' && g.remoteJid && (
+                          <span className="font-mono text-sky-600 dark:text-sky-400">
+                            • {g.username ? `@${g.username}` : g.remoteJid}
+                          </span>
+                        )}
                         <span>• {marketSummary}</span>
                         {g.useGroupImage && (
                           <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
@@ -3793,13 +3941,27 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
                           )}
                         </div>
                         {g.remoteJid && (
-                          <div className="text-[11px] font-mono text-emerald-700/80 dark:text-emerald-400/80 mt-0.5">
-                            ID: {g.remoteJid}
+                          <div
+                            className={`text-[11px] font-mono mt-0.5 ${
+                              g.channel === 'Telegram'
+                                ? 'text-sky-600/90 dark:text-sky-400/90'
+                                : 'text-emerald-700/80 dark:text-emerald-400/80'
+                            }`}
+                          >
+                            {g.channel === 'Telegram'
+                              ? g.username
+                                ? `@${g.username}`
+                                : `Chat ID: ${g.remoteJid}`
+                              : `ID: ${g.remoteJid}`}
                           </div>
                         )}
                       </td>
                       <td className="py-3.5 px-3">
-                        <MessageCircle className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
+                        {g.channel === 'Telegram' ? (
+                          <Send className="w-5 h-5 text-sky-500" />
+                        ) : (
+                          <MessageCircle className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
+                        )}
                       </td>
                       <td className="py-3.5 px-3 font-mono text-xs text-slate-600 dark:text-slate-300 whitespace-nowrap">
                         {g.accountName}
@@ -3891,6 +4053,105 @@ export const GroupsManagementView: React.FC<{ mode: 'envio' | 'monitoramento' }>
           <span>Página 1 de 1</span>
         </div>
       </div>
+
+      {/* Modal: Adicionar Canal/Grupo Telegram para Monitoramento */}
+      {addTgMonModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs overflow-y-auto"
+          onClick={() => setAddTgMonModal(false)}
+        >
+          <form
+            onSubmit={handleAddTelegramMonitoringChannel}
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 shadow-2xl space-y-4 my-auto"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-sky-50 dark:bg-sky-950/70 text-sky-600 dark:text-sky-400 flex items-center justify-center shrink-0">
+                  <Send className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-base text-slate-900 dark:text-white">
+                    Monitorar Canal ou Grupo Telegram
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                    Funciona em qualquer canal público — mesmo sem seu bot como admin.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAddTgMonModal(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1">
+                  @username do canal, link t.me/canal ou Chat ID (-100...) *
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={tgMonTarget}
+                  onChange={(e) => {
+                    setTgMonTarget(e.target.value);
+                    if (tgMonError) setTgMonError(null);
+                  }}
+                  placeholder="Ex: @ofertasbrasil ou https://t.me/ofertasbrasil"
+                  className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3.5 py-2.5 text-sm font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-200 mb-1">
+                  Nome personalizado (opcional)
+                </label>
+                <input
+                  type="text"
+                  value={tgMonCustomName}
+                  onChange={(e) => setTgMonCustomName(e.target.value)}
+                  placeholder="Deixe vazio para puxar o nome oficial do canal"
+                  className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3.5 py-2 text-sm"
+                />
+              </div>
+
+              <div className="rounded-xl bg-sky-50/70 dark:bg-sky-950/30 border border-sky-200/70 dark:border-sky-800/50 p-3 text-[11px] text-sky-900 dark:text-sky-200 leading-relaxed">
+                O sistema verifica os canais públicos monitorados automaticamente a cada 45 segundos,
+                reconvertendo links de Shopee, Mercado Livre, Amazon, Magalu, Netshoes e AliExpress
+                para o seu link de afiliado — sem interferir no webhook do seu bot.
+              </div>
+
+              {tgMonError && (
+                <div className="rounded-xl border border-rose-200 dark:border-rose-900/60 bg-rose-50/70 dark:bg-rose-950/30 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+                  {tgMonError}
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+              <button
+                type="button"
+                onClick={() => setAddTgMonModal(false)}
+                className="px-4 py-2 rounded-xl text-sm text-slate-600 dark:text-slate-300"
+              >
+                Cancelar
+              </button>
+              <button
+                type="submit"
+                disabled={tgMonBusy}
+                className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-sm font-semibold flex items-center gap-1.5 disabled:opacity-60"
+              >
+                {tgMonBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>Validar e Monitorar</span>
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {/* Modal: Configurar Grupo Monitorado */}
       {editingMonGroup && (

@@ -623,5 +623,179 @@ export function shieldWhatsAppCurrencyNumbers(text: string): string {
   );
 }
 
+/**
+ * Detects Mercado Livre non-product pages (competitor affiliate social profiles,
+ * social lists, profile pages, home/offers/login hubs) that must NEVER be captured
+ * or dispatched as product offers.
+ */
+export function isMercadoLivreNonProductSocialOrListUrl(url: string): boolean {
+  const trimmed = String(url || '').trim();
+  if (!trimmed) return false;
+  try {
+    const u = new URL(trimmed);
+    if (!/(?:^|\.)mercadolivre\.com\.br$|(?:^|\.)mercadolibre\.com$/i.test(u.hostname)) {
+      return false;
+    }
+    const p = u.pathname.toLowerCase();
+    // Official short affiliate links (/sec/...) and real product pages are valid
+    if (/^\/sec\/[a-z0-9_-]+/i.test(p)) return false;
+    if (isMercadoLivreProductUrl(trimmed)) return false;
+
+    if (
+      /^\/social(?:\/|$)/i.test(p) ||
+      /^\/perfil(?:\/|$)/i.test(p) ||
+      /^\/profile(?:\/|$)/i.test(p) ||
+      /\/lists(?:\/|$)/i.test(p) ||
+      /\/listas(?:\/|$)/i.test(p) ||
+      /^\/favoritos(?:\/|$)/i.test(p) ||
+      /^\/bookmarks(?:\/|$)/i.test(p) ||
+      /^\/gz\/home(?:\/|$)/i.test(p) ||
+      /^\/ofertas(?:\/|$)/i.test(p) ||
+      /^\/cupons(?:\/|$)/i.test(p) ||
+      /^\/my-account(?:\/|$)/i.test(p) ||
+      /^\/login(?:\/|$)/i.test(p) ||
+      /^\/navigation(?:\/|$)/i.test(p) ||
+      p === '/' ||
+      p === ''
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return /mercadolivre\.com\.br\/social\//i.test(trimmed);
+  }
+}
+
+/**
+ * Detects generic/non-product titles scraped from affiliate profiles, lists,
+ * marketplace homepages, login walls, or error pages (e.g. "Perfil social").
+ */
+export function isNonProductGenericTitle(rawTitle: string): boolean {
+  const cleaned = cleanOfferTitle(String(rawTitle || ''))
+    .replace(/^[^\p{L}\p{N}]+/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned || cleaned.length < 3) return true;
+
+  const normalized = cleaned
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+
+  const exactBlocked = new Set([
+    'perfil social',
+    'perfil',
+    'perfil do afiliado',
+    'perfil de afiliado',
+    'social',
+    'lista',
+    'listas',
+    'minha lista',
+    'minhas listas',
+    'lista de desejos',
+    'favoritos',
+    'mercado livre',
+    'mercado livre brasil',
+    'mercadolivre',
+    'mercado libre',
+    'shopee',
+    'shopee brasil',
+    'amazon',
+    'amazon.com.br',
+    'magalu',
+    'magazine luiza',
+    'netshoes',
+    'aliexpress',
+    'oferta',
+    'ofertas',
+    'oferta mercado livre',
+    'oferta shopee',
+    'oferta amazon',
+    'oferta magalu',
+    'oferta netshoes',
+    'oferta aliexpress',
+    'ofertas do dia',
+    'cupons',
+    'pagina nao encontrada',
+    'page not found',
+    'erro 404',
+    '404',
+    'access denied',
+    'acesso negado',
+    'faca login',
+    'entrar',
+    'login',
+    'cadastre-se',
+    'verificacao',
+    'captcha',
+    'robot check',
+  ]);
+  if (exactBlocked.has(normalized)) return true;
+
+  if (
+    /^perfil social\b/i.test(normalized) ||
+    /^listas? de [a-z0-9_.-]+$/i.test(normalized) ||
+    /^(?:access denied|acesso negado|robot check|verifique que voce)/i.test(normalized)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Hard safety gate enforced across extraction, monitoring capture, state loading,
+ * auto-dispatch, dispatch queues, and manual/automation dispatches.
+ */
+export function isBlockedOfferForCaptureOrDispatch(offer: {
+  title?: string;
+  platform?: string;
+  originalUrl?: string;
+  affiliateUrl?: string;
+}): { blocked: boolean; reason?: string } {
+  const title = String(offer?.title || '').trim();
+  const platform = String(offer?.platform || '').trim();
+  const originalUrl = String(offer?.originalUrl || '').trim();
+  const affiliateUrl = String(offer?.affiliateUrl || '').trim();
+
+  if (affiliateUrl && isMercadoLivreNonProductSocialOrListUrl(affiliateUrl)) {
+    return {
+      blocked: true,
+      reason: 'Link de afiliado aponta para perfil social ou lista do Mercado Livre (não é produto).',
+    };
+  }
+
+  if (originalUrl && isMercadoLivreNonProductSocialOrListUrl(originalUrl)) {
+    const hasValidMlProductAffiliate =
+      isOfficialShortAffiliateLink(affiliateUrl, 'Mercado Livre') ||
+      isMercadoLivreProductUrl(affiliateUrl);
+    if (!hasValidMlProductAffiliate) {
+      return {
+        blocked: true,
+        reason: 'Link original aponta para perfil social/lista do Mercado Livre sem produto válido.',
+      };
+    }
+  }
+
+  if (isNonProductGenericTitle(title)) {
+    return {
+      blocked: true,
+      reason: `Título inválido ou de página não-produto ("${title || 'vazio'}").`,
+    };
+  }
+
+  if (
+    (platform === 'Shopee' || /shopee\.com\.br/i.test(affiliateUrl)) &&
+    /shopee\.com\.br\/(?:buyer\/login|verify|error)/i.test(affiliateUrl)
+  ) {
+    return {
+      blocked: true,
+      reason: 'Link aponta para tela de login/verificação da Shopee (não é produto).',
+    };
+  }
+
+  return { blocked: false };
+}
+
 
 

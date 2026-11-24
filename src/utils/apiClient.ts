@@ -1,5 +1,12 @@
-import { Marketplace, PlatformIntegrations } from '../types';
+import { Marketplace, PlatformIntegrations, ReferralEntry } from '../types';
 import { PlatformCategory } from './catalogCategories';
+import type {
+  ResolvedDateRange,
+  ShopeeCommissionAnalytics,
+  ShopeeCommissionItem,
+  ShopeeCommissionSummary,
+} from './shopeeCommissions';
+import type { ReferralStats } from './referrals';
 
 export interface LiveOfferResult {
   id: string;
@@ -129,16 +136,20 @@ export async function reconvertProductAffiliatesApi(productId?: string): Promise
 
 export async function fetchShopeeCommissionsApi(params: {
   credentials: PlatformIntegrations;
+  period?: string;
+  startDate?: string;
+  endDate?: string;
   days?: number;
+  maxPages?: number;
 }): Promise<{
   ok: boolean;
-  conversions?: {
-    id: string;
-    product: string;
-    qty: number;
-    commission: number;
-    status: string;
-  }[];
+  conversions?: ShopeeCommissionItem[];
+  summary?: ShopeeCommissionSummary;
+  analytics?: ShopeeCommissionAnalytics;
+  range?: ResolvedDateRange;
+  pagesFetched?: number;
+  hasMore?: boolean;
+  syncedAt?: string;
   error?: string;
 }> {
   const res = await fetch('/api/platforms/shopee-commissions', {
@@ -696,3 +707,164 @@ export function buildVideoDownloadUrl(
   if (inline) params.set('inline', '1');
   return `/api/videos/download?${params.toString()}`;
 }
+
+export async function addTelegramMonitoringTargetApi(params: {
+  target: string;
+  customName?: string;
+}): Promise<{
+  ok: boolean;
+  group?: {
+    name: string;
+    remoteJid: string;
+    username?: string;
+    subscribers?: number;
+    sourceType: 'public_channel' | 'chat_id';
+    previewPostsCount?: number;
+  };
+  error?: string;
+}> {
+  const res = await fetch('/api/telegram/monitoring/add', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  return res.json();
+}
+
+export async function checkTelegramMonitoringNowApi(params?: {
+  captureRecentCount?: number;
+}): Promise<{
+  ok: boolean;
+  checkedCount?: number;
+  newPostsCount?: number;
+  version?: number;
+  state?: Record<string, any> | null;
+  error?: string;
+}> {
+  const res = await fetch('/api/telegram/monitoring/check-now', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params || {}),
+  });
+  return res.json();
+}
+
+export interface ReferralSummaryResponse {
+  ok: boolean;
+  referralCode?: string;
+  referralActive?: boolean;
+  asaasWalletId?: string;
+  asaasConfigured?: boolean;
+  asaasEnv?: 'production' | 'sandbox';
+  webhookConfigured?: boolean;
+  commissionPercent?: number;
+  clicks?: number;
+  stats?: ReferralStats;
+  referrals?: ReferralEntry[];
+  splitConfig?: {
+    walletId: string | null;
+    percentualValue: number;
+    asaasSplitPayload: { walletId: string; percentualValue: number }[];
+  };
+  asaasVerified?: boolean;
+  asaasVerificationNote?: string;
+  error?: string;
+}
+
+export async function getReferralsSummaryApi(): Promise<ReferralSummaryResponse> {
+  const res = await fetch('/api/referrals/summary', { cache: 'no-store' });
+  return res.json();
+}
+
+export async function activateReferralsApi(params: {
+  walletId: string;
+  referralCode?: string;
+  acceptedTerms: boolean;
+}): Promise<ReferralSummaryResponse> {
+  const res = await fetch('/api/referrals/activate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  return res.json();
+}
+
+export async function saveReferralRecordApi(params: {
+  id?: string;
+  name: string;
+  email?: string;
+  planName?: string;
+  planValue: number;
+  status: 'Ativo' | 'Pendente' | 'Cancelado';
+  totalCommissionPaid?: number;
+}): Promise<ReferralSummaryResponse> {
+  const res = await fetch('/api/referrals/record', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  return res.json();
+}
+
+export async function deleteReferralRecordApi(id: string): Promise<ReferralSummaryResponse> {
+  const res = await fetch(`/api/referrals/record/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+  return res.json();
+}
+
+export async function previewWhatsAppStatusCardApi(params: {
+  title: string;
+  platform?: string;
+  originalPrice?: number;
+  discountPrice: number;
+  discountPercent?: number;
+  couponCode?: string;
+  imageUrl?: string;
+  themeColor?: string;
+  calloutText?: string;
+}): Promise<{ ok: boolean; imageDataUrl?: string; error?: string }> {
+  const res = await fetch('/api/whatsapp/status/preview-card', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  return res.json();
+}
+
+export async function sendWhatsAppStatusTestApi(params: {
+  accountId: string;
+  format: import('./whatsappStatusLab').WhatsAppStatusFormat;
+  audienceMode: import('./whatsappStatusLab').WhatsAppStatusAudienceMode;
+  testPhones?: string[];
+  testGroupJid?: string;
+  themeColor?: string;
+  fontStyle?: number;
+  title: string;
+  platform: string;
+  originalPrice?: number;
+  discountPrice: number;
+  discountPercent?: number;
+  couponCode?: string;
+  affiliateUrl: string;
+  imageUrl?: string;
+  videoUrl?: string;
+}): Promise<{
+  ok: boolean;
+  format?: string;
+  accountId?: string;
+  accountName?: string;
+  recipientCount?: number;
+  recipientPreview?: string[];
+  postedSteps?: string[];
+  sentAt?: string;
+  error?: string;
+}> {
+  const res = await fetch('/api/whatsapp/status/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  return res.json();
+}
+

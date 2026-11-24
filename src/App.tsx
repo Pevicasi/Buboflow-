@@ -22,6 +22,7 @@ import {
   SentLogsView,
   VideoDownloaderView,
 } from './views/ToolsAndReportsViews';
+import { WhatsAppStatusTestView } from './views/WhatsAppStatusTestView';
 import {
   SiteCaptureConfigView,
   TemplatesConfigView,
@@ -46,6 +47,8 @@ const RouterViewport: React.FC = () => {
       return <DashboardView />;
     case 'whatsapp':
       return <ChannelAccountsView channel="WhatsApp" />;
+    case 'teste-status-whatsapp':
+      return <WhatsAppStatusTestView />;
     case 'telegram':
       return <ChannelAccountsView channel="Telegram" />;
     case 'enviar-mensagens':

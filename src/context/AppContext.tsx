@@ -134,7 +134,8 @@ function canonicalGroupKey(channel: 'WhatsApp' | 'Telegram', remoteJid?: string)
     const norm = normalizeGroupJid(remoteJid);
     return norm ? `wa:${norm}` : '';
   }
-  return `tg:${remoteJid.trim()}`;
+  const cleanTg = remoteJid.trim();
+  return `tg:${cleanTg.startsWith('@') ? cleanTg.toLowerCase() : cleanTg}`;
 }
 
 function dedupeDispatchGroups(list: DispatchGroup[]): DispatchGroup[] {
